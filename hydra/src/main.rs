@@ -286,7 +286,6 @@ impl Hydra {
                 let fp = if mk>=bk.ba||rng.gen::<f64>()<FILL_PROB { mk } else if left<=45 { bk.ba+SLIP } else { continue };
                 if fp>MAX_ENTRY { continue; }
                 let sh = STAKE_1/fp;
-                st.cap -= STAKE_1;
                 st.active.insert(w.slug.clone(), PT { id, slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
                     dir:dir.into(), px:fp, shares:sh, dir2:String::new(), px2:0.0, sh2:0.0,
                     end_ts:w.end_ts, sl:fp*SL_PCT, dumped:false, dump_px:0.0, wsold:false, wpx:0.0,
@@ -305,7 +304,6 @@ impl Hydra {
                     let fp = if mk>=bk.ba||rng.gen::<f64>()<FILL_PROB { mk } else if left<=45 { bk.ba+SLIP } else { continue };
                     if fp>MAX_ENTRY { continue; }
                     let sh = STAKE_1/fp;
-                    st.cap -= STAKE_1;
                     st.active.insert(w.slug.clone(), PT { id, slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
                         dir:dir.into(), px:fp, shares:sh, dir2:String::new(), px2:0.0, sh2:0.0,
                         end_ts:w.end_ts, sl:fp*SL_PCT, dumped:false, dump_px:0.0, wsold:false, wpx:0.0,
@@ -328,7 +326,6 @@ impl Hydra {
             let (dir,ask) = if bu.ba<=bd.ba && bu.ba<=0.40 { ("UP",bu.ba) }
                 else if bd.ba<=0.40 { ("DOWN",bd.ba) } else { continue };
             let fp = ask+SLIP; let sh = STAKE_1/fp;
-            st.cap -= STAKE_1;
             st.active.insert(w.slug.clone(), PT { id:"S2", slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
                 dir:dir.into(), px:fp, shares:sh, dir2:String::new(), px2:0.0, sh2:0.0,
                 end_ts:w.end_ts, sl:fp*SL_PCT, dumped:false, dump_px:0.0, wsold:false, wpx:0.0,
@@ -348,8 +345,6 @@ impl Hydra {
             if !bu.ha||!bd.ha { continue; }
             if bu.ba+bd.ba >= 0.98 { continue; }
             let sh = (STAKE_1/bu.ba).min(STAKE_1/bd.ba);
-            let cost = sh*bu.ba + sh*bd.ba;
-            st.cap -= cost;
             st.active.insert(w.slug.clone(), PT { id:"S3a", slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
                 dir:"UP".into(), px:bu.ba, shares:sh, dir2:"DOWN".into(), px2:bd.ba, sh2:sh,
                 end_ts:w.end_ts, sl:0.0, dumped:false, dump_px:0.0, wsold:false, wpx:0.0,
@@ -371,8 +366,6 @@ impl Hydra {
                 if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_2 { continue; }
                 let up = bu.ba+SLIP; let dn = bd.ba+SLIP;
                 let ush = STAKE_1/up; let dsh = STAKE_1/dn;
-                let uf = fee(up)*ush; let df = fee(dn)*dsh;
-                st.cap -= STAKE_2 + uf + df;
                 st.active.insert(w.slug.clone(), PT { id, slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
                     dir:"UP".into(), px:up, shares:ush, dir2:"DOWN".into(), px2:dn, sh2:dsh,
                     end_ts:w.end_ts, sl:0.0, dumped:false, dump_px:0.0, wsold:false, wpx:0.0,
@@ -404,7 +397,6 @@ impl Hydra {
             let fp = if rng.gen::<f64>()<FILL_PROB { mk } else { bk.ba+SLIP };
             if fp>MAX_ENTRY { continue; }
             let sh = STAKE_1/fp;
-            st.cap -= STAKE_1;
             st.active.insert(w.slug.clone(), PT { id:"S4", slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
                 dir:dir.into(), px:fp, shares:sh, dir2:String::new(), px2:0.0, sh2:0.0,
                 end_ts:w.end_ts, sl:fp*SL_PCT, dumped:false, dump_px:0.0, wsold:false, wpx:0.0,
@@ -507,26 +499,27 @@ impl Hydra {
                     let actual = if cc>=co {"UP"} else {"DOWN"};
                     let (up_pay, dn_pay) = if actual=="UP" {(1.0,0.0)} else {(0.0,1.0)};
 
+                    let entry_fees = fee(t.px)*t.shares + fee(t.px2)*t.sh2;
                     let pnl = if st.id=="S3a" {
-                        t.shares * 1.0 - (t.px*t.shares + t.px2*t.sh2)
+                        t.shares * 1.0 - (t.px*t.shares + t.px2*t.sh2) - entry_fees
                     } else if st.id=="S3E" && t.wsold {
                         let lr = if up_winning {t.sh2} else {t.shares};
                         let wr = if up_winning {t.shares} else {t.sh2};
                         let lrec = lr * t.dump_px;
                         let wrec = wr * t.wpx;
-                        lrec + wrec - STAKE_2 - fee(t.dump_px)*lr - fee(t.wpx)*wr
+                        lrec + wrec - STAKE_2 - entry_fees - fee(t.dump_px)*lr - fee(t.wpx)*wr
                     } else if t.dumped {
                         let lr = if up_winning {t.sh2} else {t.shares};
                         let wr = if up_winning {t.shares} else {t.sh2};
                         // Check reversal
                         let loser_was_right = (!up_winning && actual=="UP")||(up_winning && actual=="DOWN");
                         if loser_was_right {
-                            lr*t.dump_px + 0.0 - STAKE_2 - fee(t.dump_px)*lr // catastrophic
+                            lr*t.dump_px - STAKE_2 - entry_fees - fee(t.dump_px)*lr // catastrophic
                         } else {
-                            lr*t.dump_px + wr*1.0 - STAKE_2 - fee(t.dump_px)*lr
+                            lr*t.dump_px + wr*1.0 - STAKE_2 - entry_fees - fee(t.dump_px)*lr
                         }
                     } else {
-                        t.shares*up_pay + t.sh2*dn_pay - STAKE_2
+                        t.shares*up_pay + t.sh2*dn_pay - STAKE_2 - entry_fees
                     };
 
                     let tag = if pnl>0.0 {"WIN"} else {"LOSS"};
@@ -589,5 +582,144 @@ async fn main() -> Result<()> {
             info!("─── {} | {:.1}h | {} ───", px.join(" "), hydra.start.elapsed().as_secs_f64()/3600.0, hydra.status());
             ls = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(a: f64, b: f64, label: &str) {
+        assert!((a - b).abs() < 0.0001, "{}: expected {:.4}, got {:.4}", label, b, a);
+    }
+
+    #[test]
+    fn test_single_side_win() {
+        let mut st = Strat::new("A02");
+        let cap0 = st.cap; // 100.0
+        let entry_px = 0.90;
+        let shares = STAKE_1 / entry_px; // 5/0.9 = 5.5556
+        // No cap subtraction at entry (fixed)
+        let pnl = shares * 1.0 - STAKE_1; // 5.5556 - 5 = 0.5556
+        st.rec(true, pnl);
+        assert_close(st.cap, cap0 + pnl, "single win cap");
+        assert_close(st.pnl, pnl, "single win pnl");
+        assert_eq!(st.w, 1);
+        assert_eq!(st.l, 0);
+        assert!(pnl > 0.0, "winning trade must be profitable");
+    }
+
+    #[test]
+    fn test_single_side_loss() {
+        let mut st = Strat::new("A02");
+        let cap0 = st.cap;
+        let pnl = -STAKE_1; // -5.0
+        st.rec(false, pnl);
+        assert_close(st.cap, cap0 - STAKE_1, "single loss cap");
+        assert_close(st.pnl, -STAKE_1, "single loss pnl");
+        assert_eq!(st.w, 0);
+        assert_eq!(st.l, 1);
+    }
+
+    #[test]
+    fn test_sl_exit() {
+        let mut st = Strat::new("A02");
+        let cap0 = st.cap;
+        let entry_px = 0.90;
+        let shares = STAKE_1 / entry_px;
+        let sl_px = entry_px * SL_PCT; // 0.45
+        let rec = shares * sl_px; // = STAKE_1 * SL_PCT = 2.50
+        let f = fee(sl_px) * shares;
+        let pnl = rec - STAKE_1 - f;
+        st.rec(false, pnl);
+        assert_close(st.cap, cap0 + pnl, "SL cap");
+        assert!(pnl < 0.0, "SL must be a loss");
+        assert_close(rec, STAKE_1 * SL_PCT, "SL recovery amount");
+    }
+
+    #[test]
+    fn test_s3a_arb() {
+        let mut st = Strat::new("S3a");
+        let cap0 = st.cap;
+        let up_ask = 0.47;
+        let dn_ask = 0.48;
+        let sh = (STAKE_1 / up_ask).min(STAKE_1 / dn_ask); // 5/0.48 = 10.4167
+        let cost = sh * up_ask + sh * dn_ask;
+        let entry_fees = fee(up_ask) * sh + fee(dn_ask) * sh;
+        // One side always wins -> payout = sh * 1.0
+        let pnl = sh * 1.0 - cost - entry_fees;
+        st.rec(pnl > 0.0, pnl);
+        assert_close(st.cap, cap0 + pnl, "S3a cap");
+        assert!(sh * 1.0 - cost > 0.0, "arb gross must be positive");
+    }
+
+    #[test]
+    fn test_both_sides_dumped_normal() {
+        let mut st = Strat::new("S3b");
+        let cap0 = st.cap;
+        let up_px = 0.50 + SLIP;
+        let dn_px = 0.50 + SLIP;
+        let ush = STAKE_1 / up_px;
+        let dsh = STAKE_1 / dn_px;
+        let entry_fees = fee(up_px) * ush + fee(dn_px) * dsh;
+        // UP wins: dump DN at 0.05, UP resolves $1
+        let dump_px = 0.05;
+        let lr = dsh;
+        let wr = ush;
+        let pnl = lr * dump_px + wr * 1.0 - STAKE_2 - entry_fees - fee(dump_px) * lr;
+        st.rec(pnl > 0.0, pnl);
+        assert_close(st.cap, cap0 + pnl, "S3b dumped cap");
+        assert_close(st.cap - cap0, pnl, "S3b cap delta = pnl");
+    }
+
+    #[test]
+    fn test_both_sides_dumped_reversal() {
+        let mut st = Strat::new("S3b");
+        let cap0 = st.cap;
+        let up_px = 0.50 + SLIP;
+        let dn_px = 0.50 + SLIP;
+        let ush = STAKE_1 / up_px;
+        let dsh = STAKE_1 / dn_px;
+        let entry_fees = fee(up_px) * ush + fee(dn_px) * dsh;
+        let dump_px = 0.05;
+        let lr = dsh;
+        // Reversal: dumped side was right, held side worthless
+        let pnl = lr * dump_px - STAKE_2 - entry_fees - fee(dump_px) * lr;
+        st.rec(false, pnl);
+        assert_close(st.cap, cap0 + pnl, "S3b reversal cap");
+        assert!(pnl < -STAKE_2 * 0.5, "reversal must be a big loss");
+    }
+
+    #[test]
+    fn test_multi_trade_sequence() {
+        let mut st = Strat::new("TEST");
+        let cap0 = st.cap;
+        let px = 0.90;
+        let sh = STAKE_1 / px;
+
+        let pnl1 = sh * 1.0 - STAKE_1;
+        st.rec(true, pnl1);
+        assert_close(st.cap, cap0 + pnl1, "after trade 1");
+
+        let pnl2 = -STAKE_1;
+        st.rec(false, pnl2);
+        assert_close(st.cap, cap0 + pnl1 + pnl2, "after trade 2");
+
+        let px3 = 0.85;
+        let sh3 = STAKE_1 / px3;
+        let pnl3 = sh3 * 1.0 - STAKE_1;
+        st.rec(true, pnl3);
+        assert_close(st.cap, cap0 + pnl1 + pnl2 + pnl3, "after trade 3");
+        assert_close(st.pnl, pnl1 + pnl2 + pnl3, "cumulative pnl");
+        assert_eq!(st.w, 2);
+        assert_eq!(st.l, 1);
+    }
+
+    #[test]
+    fn test_fee_function() {
+        assert_close(fee(0.50), 0.50 * 0.50 * 0.0625, "fee at 0.50");
+        assert_close(fee(0.90), 0.90 * 0.10 * 0.0625, "fee at 0.90");
+        assert_close(fee(0.0), 0.0, "fee at 0.0");
+        assert_close(fee(1.0), 0.0, "fee at 1.0");
     }
 }
