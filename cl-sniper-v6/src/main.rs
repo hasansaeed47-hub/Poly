@@ -617,8 +617,9 @@ struct Engine {
     active: HashMap<String, ActiveTrade>,
     traded: HashSet<String>,
     cl_opens: HashMap<String, f64>,
-    cl_open_ts: HashMap<String, i64>,       // FIX #2: track when CL open was captured
-    cl_closes: HashMap<String, f64>,        // FIX #3: first CL after end_ts
+    cl_open_ts: HashMap<String, i64>,       // snap timestamp used for open (closest to start_ts)
+    cl_closes: HashMap<String, f64>,
+    cl_close_ts: HashMap<String, i64>,      // snap timestamp used for close (closest to end_ts)
     wins: u32,
     losses: u32,
     sl_count: u32,
@@ -632,7 +633,8 @@ impl Engine {
         Engine {
             state, scanner, books, exe,
             active: HashMap::new(), traded: HashSet::new(),
-            cl_opens: HashMap::new(), cl_open_ts: HashMap::new(), cl_closes: HashMap::new(),
+            cl_opens: HashMap::new(), cl_open_ts: HashMap::new(),
+            cl_closes: HashMap::new(), cl_close_ts: HashMap::new(),
             wins: 0, losses: 0, sl_count: 0, start: Instant::now(),
             paper_10: PaperTracker::new("P10"),
             paper_15: PaperTracker::new("P15"),
@@ -677,45 +679,62 @@ impl Engine {
         Ok(())
     }
 
-    /// FIX #2: CL open snap on arrival — immediate, current price
+    /// CL open — continuously updated to the snap closest to start_ts
     async fn record_opens(&mut self, windows: &[Window]) {
         let s = self.state.read().await;
-        let now = Utc::now().timestamp();
         for w in windows {
-            if self.cl_opens.contains_key(&w.slug) { continue; }
-            // Only record if we're within the window's lifetime
-            if now < w.start_ts || now > w.end_ts { continue; }
-            if let Some(&px) = s.cl_px.get(w.asset) {
-                if px > 0.0 {
-                    self.cl_opens.insert(w.slug.clone(), px);
-                    self.cl_open_ts.insert(w.slug.clone(), now);
+            if let Some(snap) = s.cl_snap.get(w.asset) {
+                // Find the CL snap entry closest to this window's start_ts
+                if let Some((&best_ts, &best_px)) = snap.iter()
+                    .min_by_key(|(&ts, _)| (ts - w.start_ts).abs())
+                {
+                    if best_px <= 0.0 { continue; }
+                    let new_dist = (best_ts - w.start_ts).abs();
+                    let prev_dist = self.cl_open_ts.get(&w.slug)
+                        .map(|&ts| (ts - w.start_ts).abs())
+                        .unwrap_or(i64::MAX);
+                    if new_dist < prev_dist {
+                        self.cl_opens.insert(w.slug.clone(), best_px);
+                        self.cl_open_ts.insert(w.slug.clone(), best_ts);
+                    }
                 }
             }
         }
     }
 
-    /// FIX #3: CL close — first CL price after end_ts
+    /// CL close — continuously updated to the snap closest to end_ts (only after window ends)
     async fn record_closes(&mut self, windows: &[Window]) {
         let s = self.state.read().await;
         let now = Utc::now().timestamp();
+
+        // Collect all (slug, asset, end_ts) pairs that need close prices
+        let mut targets: Vec<(String, &'static str, i64)> = Vec::new();
         for w in windows {
-            if self.cl_closes.contains_key(&w.slug) { continue; }
-            if now <= w.end_ts { continue; } // Window hasn't ended yet
-            if let Some(&px) = s.cl_px.get(w.asset) {
-                if px > 0.0 {
-                    self.cl_closes.insert(w.slug.clone(), px);
-                }
+            if now > w.end_ts {
+                targets.push((w.slug.clone(), w.asset, w.end_ts));
             }
         }
-        // Also check active trades that have ended
-        let slugs: Vec<String> = self.active.keys()
-            .filter(|s| !self.cl_closes.contains_key(*s))
-            .cloned().collect();
-        for slug in slugs {
-            if let Some(t) = self.active.get(&slug) {
-                if now > t.end_ts {
-                    if let Some(&px) = s.cl_px.get(t.asset) {
-                        if px > 0.0 { self.cl_closes.insert(slug, px); }
+        // Also check active trades whose windows have ended
+        for (slug, t) in &self.active {
+            if now > t.end_ts {
+                targets.push((slug.clone(), t.asset, t.end_ts));
+            }
+        }
+
+        for (slug, asset, end_ts) in targets {
+            if let Some(snap) = s.cl_snap.get(asset) {
+                // Find the CL snap entry closest to this window's end_ts
+                if let Some((&best_ts, &best_px)) = snap.iter()
+                    .min_by_key(|(&ts, _)| (ts - end_ts).abs())
+                {
+                    if best_px <= 0.0 { continue; }
+                    let new_dist = (best_ts - end_ts).abs();
+                    let prev_dist = self.cl_close_ts.get(&slug)
+                        .map(|&ts| (ts - end_ts).abs())
+                        .unwrap_or(i64::MAX);
+                    if new_dist < prev_dist {
+                        self.cl_closes.insert(slug.clone(), best_px);
+                        self.cl_close_ts.insert(slug, best_ts);
                     }
                 }
             }
@@ -902,7 +921,9 @@ impl Engine {
                 continue;
             }
 
-            // === FILLED: FIX #5 — SL dual confirmation ===
+            // === FILLED: SL dual confirmation ===
+            // Skip if SL already triggered (taker sell already executed)
+            if t.sl_triggered { continue; }
             // Condition 1: CL direction flipped against us
             // Condition 2: Best bid of our token <= 50% of fill_px
             if let Some(&cl_open) = self.cl_opens.get(&slug) {
@@ -1034,6 +1055,7 @@ impl Engine {
         self.cl_opens.retain(|s, _| s.rsplit('-').next().and_then(|v| v.parse::<i64>().ok()).map(|t| t > cut).unwrap_or(false));
         self.cl_open_ts.retain(|s, _| s.rsplit('-').next().and_then(|v| v.parse::<i64>().ok()).map(|t| t > cut).unwrap_or(false));
         self.cl_closes.retain(|s, _| s.rsplit('-').next().and_then(|v| v.parse::<i64>().ok()).map(|t| t > cut).unwrap_or(false));
+        self.cl_close_ts.retain(|s, _| s.rsplit('-').next().and_then(|v| v.parse::<i64>().ok()).map(|t| t > cut).unwrap_or(false));
         self.traded.retain(|s| s.rsplit('-').next().and_then(|v| v.parse::<i64>().ok()).map(|t| t > cut).unwrap_or(false));
     }
 }
