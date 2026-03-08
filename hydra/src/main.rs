@@ -722,4 +722,157 @@ mod tests {
         assert_close(fee(0.0), 0.0, "fee at 0.0");
         assert_close(fee(1.0), 0.0, "fee at 1.0");
     }
+
+    #[test]
+    fn test_full_capital_trace() {
+        println!("\n{}", "=".repeat(60));
+        println!("  HYDRA CAPITAL TRACE SIMULATION");
+        println!("  START_CAP=${:.2}  STAKE_1=${:.2}  STAKE_2=${:.2}", START_CAP, STAKE_1, STAKE_2);
+        println!("{}\n", "=".repeat(60));
+
+        // === A02: Single-side WIN ===
+        let mut a02 = Strat::new("A02");
+        let px = 0.90;
+        let sh = STAKE_1 / px;
+        let pnl = sh * 1.0 - STAKE_1;
+        println!("--- A02 Single-Side WIN ---");
+        println!("  Entry:  buy {} shares @${:.4}", sh, px);
+        println!("  Cap before: ${:.4}", a02.cap);
+        a02.rec(true, pnl);
+        println!("  Settle: {} shares * $1.00 = ${:.4}", sh, sh);
+        println!("  PnL:    ${:.4} - ${:.4} = ${:+.4}", sh, STAKE_1, pnl);
+        println!("  Cap after:  ${:.4}  (delta=${:+.4})", a02.cap, a02.cap - START_CAP);
+        assert_close(a02.cap, START_CAP + pnl, "A02 win cap");
+        println!("  PASS\n");
+
+        // === A02: Single-side LOSS ===
+        let mut a02l = Strat::new("A02");
+        let pnl_l = -STAKE_1;
+        println!("--- A02 Single-Side LOSS ---");
+        println!("  Entry:  buy {} shares @${:.4}", sh, px);
+        println!("  Cap before: ${:.4}", a02l.cap);
+        a02l.rec(false, pnl_l);
+        println!("  Settle: wrong side, shares worth $0");
+        println!("  PnL:    $0.00 - ${:.4} = ${:+.4}", STAKE_1, pnl_l);
+        println!("  Cap after:  ${:.4}  (delta=${:+.4})", a02l.cap, a02l.cap - START_CAP);
+        assert_close(a02l.cap, START_CAP - STAKE_1, "A02 loss cap");
+        println!("  PASS\n");
+
+        // === A02: SL EXIT ===
+        let mut a02s = Strat::new("A02");
+        let sl_px = px * SL_PCT;
+        let rec = sh * sl_px;
+        let sl_fee = fee(sl_px) * sh;
+        let pnl_sl = rec - STAKE_1 - sl_fee;
+        println!("--- A02 Stop-Loss EXIT ---");
+        println!("  Entry:  {} shares @${:.4},  SL @${:.4}", sh, px, sl_px);
+        println!("  Cap before: ${:.4}", a02s.cap);
+        a02s.rec(false, pnl_sl);
+        println!("  SL hit: sell {} shares @${:.4} = ${:.4}", sh, sl_px, rec);
+        println!("  Fee:    ${:.4}", sl_fee);
+        println!("  PnL:    ${:.4} - ${:.4} - ${:.4} = ${:+.4}", rec, STAKE_1, sl_fee, pnl_sl);
+        println!("  Cap after:  ${:.4}  (delta=${:+.4})", a02s.cap, a02s.cap - START_CAP);
+        assert_close(a02s.cap, START_CAP + pnl_sl, "A02 SL cap");
+        println!("  PASS\n");
+
+        // === S3a: Arb ===
+        let mut s3a = Strat::new("S3a");
+        let ua = 0.47; let da = 0.48;
+        let sh3 = (STAKE_1 / ua).min(STAKE_1 / da);
+        let cost3 = sh3 * ua + sh3 * da;
+        let ef3 = fee(ua) * sh3 + fee(da) * sh3;
+        let payout3 = sh3 * 1.0;
+        let pnl3 = payout3 - cost3 - ef3;
+        println!("--- S3a Arb (sum < $0.98) ---");
+        println!("  Entry:  {} shares each @UP=${:.4} DN=${:.4}", sh3, ua, da);
+        println!("  Cost:   ${:.4} + fees ${:.4} = ${:.4}", cost3, ef3, cost3 + ef3);
+        println!("  Cap before: ${:.4}", s3a.cap);
+        s3a.rec(pnl3 > 0.0, pnl3);
+        println!("  Settle: winner pays {} * $1.00 = ${:.4}", sh3, payout3);
+        println!("  PnL:    ${:.4} - ${:.4} - ${:.4} = ${:+.4}", payout3, cost3, ef3, pnl3);
+        println!("  Cap after:  ${:.4}  (delta=${:+.4})", s3a.cap, s3a.cap - START_CAP);
+        assert_close(s3a.cap, START_CAP + pnl3, "S3a cap");
+        println!("  PASS\n");
+
+        // === S3b: Both-sides dump loser, winner resolves ===
+        let mut s3b = Strat::new("S3b");
+        let bpx = 0.505; // 0.50 + SLIP
+        let bsh = STAKE_1 / bpx;
+        let bef = fee(bpx) * bsh * 2.0; // same price both sides
+        let dp = 0.05;
+        let dump_fee = fee(dp) * bsh;
+        let pnl_b = bsh * dp + bsh * 1.0 - STAKE_2 - bef - dump_fee;
+        println!("--- S3b Both-Sides DUMP (normal) ---");
+        println!("  Entry:  {} shares UP + DN @${:.4} each", bsh, bpx);
+        println!("  Entry fees: ${:.4}", bef);
+        println!("  Cap before: ${:.4}", s3b.cap);
+        s3b.rec(pnl_b > 0.0, pnl_b);
+        println!("  Dump loser:  {} shares @${:.4} = ${:.4} (fee ${:.4})", bsh, dp, bsh * dp, dump_fee);
+        println!("  Winner pays: {} * $1.00 = ${:.4}", bsh, bsh);
+        println!("  PnL:    ${:.4} + ${:.4} - ${:.4} - ${:.4} - ${:.4} = ${:+.4}",
+            bsh * dp, bsh, STAKE_2, bef, dump_fee, pnl_b);
+        println!("  Cap after:  ${:.4}  (delta=${:+.4})", s3b.cap, s3b.cap - START_CAP);
+        assert_close(s3b.cap, START_CAP + pnl_b, "S3b cap");
+        println!("  PASS\n");
+
+        // === S3b: Reversal (catastrophic) ===
+        let mut s3br = Strat::new("S3b");
+        let pnl_rev = bsh * dp - STAKE_2 - bef - dump_fee;
+        println!("--- S3b Both-Sides REVERSAL (catastrophic) ---");
+        println!("  Same entry as above, but market reverses after dump");
+        println!("  Cap before: ${:.4}", s3br.cap);
+        s3br.rec(false, pnl_rev);
+        println!("  Dumped loser:  ${:.4}", bsh * dp);
+        println!("  Held winner:   resolves $0 (reversal!)");
+        println!("  PnL:    ${:.4} - ${:.4} - ${:.4} - ${:.4} = ${:+.4}",
+            bsh * dp, STAKE_2, bef, dump_fee, pnl_rev);
+        println!("  Cap after:  ${:.4}  (delta=${:+.4})", s3br.cap, s3br.cap - START_CAP);
+        assert_close(s3br.cap, START_CAP + pnl_rev, "S3b reversal cap");
+        println!("  PASS\n");
+
+        // === S3E: Dump loser + sell winner ===
+        let mut s3e = Strat::new("S3E");
+        let wpx = 0.945; // winner sell price (0.95 - SLIP)
+        let wfee = fee(wpx) * bsh;
+        let pnl_e = bsh * dp + bsh * wpx - STAKE_2 - bef - dump_fee - wfee;
+        println!("--- S3E Dump Loser + Sell Winner ---");
+        println!("  Same entry, dump loser @${:.4}, sell winner @${:.4}", dp, wpx);
+        println!("  Cap before: ${:.4}", s3e.cap);
+        s3e.rec(pnl_e > 0.0, pnl_e);
+        println!("  Loser dump:  ${:.4} (fee ${:.4})", bsh * dp, dump_fee);
+        println!("  Winner sell: ${:.4} (fee ${:.4})", bsh * wpx, wfee);
+        println!("  PnL:    ${:+.4}", pnl_e);
+        println!("  Cap after:  ${:.4}  (delta=${:+.4})", s3e.cap, s3e.cap - START_CAP);
+        assert_close(s3e.cap, START_CAP + pnl_e, "S3E cap");
+        println!("  PASS\n");
+
+        // === Multi-trade sequence: 10 trades ===
+        println!("--- Multi-Trade Sequence (10 trades) ---");
+        let mut ms = Strat::new("SEQ");
+        let scenarios: Vec<(&str, f64, bool)> = vec![
+            ("A02 win",  0.90, true),  ("A02 loss", 0.90, false),
+            ("A05 win",  0.92, true),  ("A10 win",  0.88, true),
+            ("S2  loss", 0.35, false), ("A02 win",  0.95, true),
+            ("A02 loss", 0.91, false), ("A05 win",  0.87, true),
+            ("S4  win",  0.93, true),  ("A10 loss", 0.89, false),
+        ];
+        let mut cum_pnl = 0.0;
+        for (i, (label, entry, won)) in scenarios.iter().enumerate() {
+            let sh = STAKE_1 / entry;
+            let pnl = if *won { sh * 1.0 - STAKE_1 } else { -STAKE_1 };
+            cum_pnl += pnl;
+            ms.rec(*won, pnl);
+            println!("  Trade {}: {} @${:.2} → {} PnL=${:+.4}  Cap=${:.4}",
+                i + 1, label, entry, if *won {"WIN "} else {"LOSS"}, pnl, ms.cap);
+            assert_close(ms.cap, START_CAP + cum_pnl, &format!("trade {} cap", i + 1));
+        }
+        println!("  Final:  {}W/{}L  PnL=${:+.4}  Cap=${:.4}", ms.w, ms.l, ms.pnl, ms.cap);
+        assert_close(ms.pnl, cum_pnl, "cumulative pnl");
+        assert_close(ms.cap, START_CAP + cum_pnl, "final cap");
+        println!("  PASS\n");
+
+        println!("{}", "=".repeat(60));
+        println!("  ALL CAPITAL TRACES VERIFIED");
+        println!("{}", "=".repeat(60));
+    }
 }
