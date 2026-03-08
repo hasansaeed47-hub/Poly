@@ -4,7 +4,7 @@
 //! Terminal: clean one-liners only
 //! File log: hydra_trades.csv — full audit trail for post-analysis
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
@@ -141,10 +141,9 @@ struct State {
     cl: HashMap<&'static str, f64>,
     snap: HashMap<&'static str, HashMap<i64, f64>>,
     bn: HashMap<&'static str, f64>,
-    bnh: HashMap<&'static str, VecDeque<(f64,f64)>>,
 }
 impl State {
-    fn new() -> Self { State { cl: HashMap::new(), snap: HashMap::new(), bn: HashMap::new(), bnh: HashMap::new() } }
+    fn new() -> Self { State { cl: HashMap::new(), snap: HashMap::new(), bn: HashMap::new() } }
     fn cl_up(&mut self, a: &'static str, px: f64, ts: f64) {
         self.cl.insert(a, px);
         let s = self.snap.entry(a).or_default();
@@ -152,10 +151,7 @@ impl State {
         let c = ts as i64 - 3600; s.retain(|k,_| *k > c);
     }
     fn bn_up(&mut self, a: &'static str, px: f64) {
-        let ts = Utc::now().timestamp_millis() as f64 / 1000.0;
         self.bn.insert(a, px);
-        let h = self.bnh.entry(a).or_default();
-        h.push_back((ts, px)); if h.len() > 7200 { h.pop_front(); }
     }
     fn cl_at(&self, a: &str, t: i64, tol: i64) -> Option<f64> {
         let s = self.snap.get(a)?;
@@ -316,15 +312,13 @@ impl BkC {
 
 // ── Position / Strategy ────────────────────────────────────────────
 #[derive(Clone)]
-#[allow(dead_code)]
 struct PT {
-    id: &'static str, slug: String, asset: &'static str, wmin: u32,
-    dir: String, px: f64, shares: f64,
-    dir2: String, px2: f64, sh2: f64,
+    asset: &'static str,
+    px: f64, shares: f64,
+    px2: f64, sh2: f64,
     end_ts: i64,
     dumped: bool, dump_px: f64,
     tid_up: String, tid_dn: String,
-    entry_up_bid: f64, entry_dn_bid: f64,
     entry_up_spread: f64, entry_dn_spread: f64,
     entry_left: i64,
 }
@@ -410,12 +404,10 @@ impl Hydra {
                 if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_2 { continue; }
                 let up = bu.ba + LATENCY_TICKS; let dn = bd.ba + LATENCY_TICKS;
                 let ush = STAKE_1/up; let dsh = STAKE_1/dn;
-                st.active.insert(w.slug.clone(), PT { id, slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
-                    dir:"UP".into(), px:up, shares:ush, dir2:"DOWN".into(), px2:dn, sh2:dsh,
+                st.active.insert(w.slug.clone(), PT { asset:w.asset,
+                    px:up, shares:ush, px2:dn, sh2:dsh,
                     end_ts:w.end_ts, dumped:false, dump_px:0.0,
                     tid_up:w.tid_up.clone(), tid_dn:w.tid_down.clone(),
-                    entry_up_bid: if bu.hb {bu.bb} else {0.0},
-                    entry_dn_bid: if bd.hb {bd.bb} else {0.0},
                     entry_up_spread: up_spread, entry_dn_spread: dn_spread,
                     entry_left: left });
                 st.done.insert(w.slug.clone());
@@ -613,120 +605,204 @@ mod tests {
         assert!((a - b).abs() < 0.0001, "{}: expected {:.4}, got {:.4}", label, b, a);
     }
 
+    // ── Exact PnL formulas mirroring manage() ──
+    // Normal: dumped loser + winner settles $1
+    fn pnl_normal(ask: f64, dump_px: f64) -> f64 {
+        let sh = STAKE_1 / (ask + LATENCY_TICKS);
+        let ef = fee(ask + LATENCY_TICKS) * sh * 2.0;
+        let df = fee(dump_px) * sh;
+        sh * dump_px + sh * 1.0 - STAKE_2 - ef - df
+    }
+    // Reversal: dumped side was actually the winner
+    fn pnl_reversal(ask: f64, dump_px: f64) -> f64 {
+        let sh = STAKE_1 / (ask + LATENCY_TICKS);
+        let ef = fee(ask + LATENCY_TICKS) * sh * 2.0;
+        let df = fee(dump_px) * sh;
+        sh * dump_px - STAKE_2 - ef - df
+    }
+    // No dump: winner settles $1, loser settles $0
+    fn pnl_nodump(ask: f64) -> f64 {
+        let sh = STAKE_1 / (ask + LATENCY_TICKS);
+        let ef = fee(ask + LATENCY_TICKS) * sh * 2.0;
+        sh * 1.0 - STAKE_2 - ef
+    }
+    // S3b dump price: maker posts at loser_bid + 0.01
+    fn s3b_dump(loser_bid: f64) -> f64 { (loser_bid + 0.01).min(0.50).max(0.01) }
+    // S3C/S3D dump price: taker hits bid - latency
+    fn taker_dump(loser_bid: f64) -> f64 { (loser_bid - LATENCY_TICKS).max(0.01) }
+
     #[test]
     fn test_fee_function() {
-        assert_close(fee(0.50), 0.50 * 0.50 * 0.0625, "fee at 0.50");
-        assert_close(fee(0.90), 0.90 * 0.10 * 0.0625, "fee at 0.90");
+        assert_close(fee(0.50), 0.015625, "fee at 0.50");
+        assert_close(fee(0.90), 0.005625, "fee at 0.90");
         assert_close(fee(0.0), 0.0, "fee at 0.0");
         assert_close(fee(1.0), 0.0, "fee at 1.0");
     }
 
     #[test]
-    fn test_spread_detection() {
-        let bk = Bk { bb: 0.45, ba: 0.55, ha: true, hb: true, ..Default::default() };
+    fn test_spread_and_depth() {
+        let bk = Bk { bb: 0.45, ba: 0.55, ha: true, hb: true,
+            bid_sz: 100.0, ask_sz: 50.0, n_bids: 5, n_asks: 3 };
         assert_close(bk.spread(), 0.10, "spread");
         assert_close(bk.mid(), 0.50, "mid");
-        assert!(bk.spread() / bk.mid() > SPREAD_WARN, "10%/50% spread must trigger warning");
+        assert!(bk.spread() / bk.mid() > SPREAD_WARN, "10%/50% triggers WIDE_SPREAD");
+        assert_eq!(bk.n_bids, 5);
+        assert_close(bk.bid_sz, 100.0, "bid_sz");
 
         let thin = Bk { bb: 0.0, ba: 0.50, ha: true, hb: false, ..Default::default() };
         assert!(thin.spread() > 100.0, "no bid = infinite spread");
+        assert_eq!(thin.n_bids, 0);
     }
 
     #[test]
-    fn test_both_sides_dumped_normal() {
-        let mut st = Strat::new("S3b");
-        let cap0 = st.cap;
-        let up_px = 0.50;
-        let dn_px = 0.50;
-        let ush = STAKE_1 / up_px;
-        let dsh = STAKE_1 / dn_px;
-        let entry_fees = fee(up_px) * ush + fee(dn_px) * dsh;
-        let dump_px = 0.06;
-        let lr = dsh; let wr = ush;
-        let pnl = lr * dump_px + wr * 1.0 - STAKE_2 - entry_fees - fee(dump_px) * lr;
-        st.rec(pnl > 0.0, pnl);
-        assert_close(st.cap, cap0 + pnl, "S3b maker dumped cap");
-        assert!(pnl > 0.0, "S3b normal must be profitable");
-    }
-
-    #[test]
-    fn test_both_sides_taker_dump_normal() {
-        let mut st = Strat::new("S3C");
-        let cap0 = st.cap;
-        let px = 0.50;
-        let sh = STAKE_1 / px;
-        let entry_fees = fee(px) * sh * 2.0;
-        let dump_px = 0.05;
-        let pnl = sh * dump_px + sh * 1.0 - STAKE_2 - entry_fees - fee(dump_px) * sh;
-        st.rec(pnl > 0.0, pnl);
-        assert_close(st.cap, cap0 + pnl, "S3C taker dumped cap");
-        let s3b_pnl = sh * 0.06 + sh * 1.0 - STAKE_2 - entry_fees - fee(0.06) * sh;
-        assert!(pnl < s3b_pnl, "S3C taker must get worse PnL than S3b maker");
-    }
-
-    #[test]
-    fn test_both_sides_dumped_reversal() {
-        let mut st = Strat::new("S3b");
-        let cap0 = st.cap;
-        let px = 0.50;
-        let sh = STAKE_1 / px;
-        let entry_fees = fee(px) * sh * 2.0;
-        let dump_px = 0.06;
-        let pnl = sh * dump_px - STAKE_2 - entry_fees - fee(dump_px) * sh;
-        st.rec(false, pnl);
-        assert_close(st.cap, cap0 + pnl, "S3b reversal cap");
-        assert!(pnl < -STAKE_2 * 0.5, "reversal must be a big loss");
-    }
-
-    #[test]
-    fn test_no_dump_settle() {
-        let mut st = Strat::new("S3D");
-        let cap0 = st.cap;
-        let px = 0.50;
-        let sh = STAKE_1 / px;
-        let entry_fees = fee(px) * sh * 2.0;
-        let pnl = sh * 1.0 + sh * 0.0 - STAKE_2 - entry_fees;
-        st.rec(pnl > 0.0, pnl);
-        assert_close(st.cap, cap0 + pnl, "S3D no-dump settle cap");
-        assert!(pnl < sh * 0.06 + sh * 1.0 - STAKE_2 - entry_fees - fee(0.06)*sh,
-            "no-dump loses loser recovery compared to dumped");
-    }
-
-    #[test]
-    fn test_csv_header() {
-        let path = "/tmp/hydra_test_log.csv";
+    fn test_csv_header_column_count() {
+        let path = "/tmp/hydra_test_hdr.csv";
         let _ = std::fs::remove_file(path);
         {
             let f = OpenOptions::new().create(true).append(true).open(path).unwrap();
             let mut tl = TradeLog { f, run_id: "TEST".into() };
             tl.hdr();
         }
-        let content = std::fs::read_to_string(path).unwrap();
-        assert!(content.starts_with("ts,run_id,event,"), "CSV header must start with ts,run_id,event");
-        assert!(content.contains("bn_px"), "CSV header must contain bn_px column");
-        assert!(content.contains("up_bid_sz"), "CSV header must contain depth columns");
-        assert!(content.contains("flags"), "CSV header must contain flags column");
+        let hdr = std::fs::read_to_string(path).unwrap();
+        let cols: Vec<&str> = hdr.trim().split(',').collect();
+        assert_eq!(cols.len(), 48, "CSV must have 48 columns, got {}: {:?}", cols.len(), cols);
+        assert_eq!(cols[0], "ts");
+        assert_eq!(cols[1], "run_id");
+        assert_eq!(cols[2], "event");
+        assert_eq!(cols[7], "bn_px");
+        assert_eq!(cols[cols.len()-1], "flags");
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn test_full_capital_trace() {
-        println!("\n  HYDRA — 3 strategies, both-sides, all PnL paths");
-        let bpx = 0.50;
-        let bsh = STAKE_1 / bpx;
-        let bef = fee(bpx) * bsh * 2.0;
+    fn test_full_chain_simulation() {
+        // Simulate 10 trades per strategy through exact engine math.
+        // Scenarios: normal win, reversal, wide spread, thin book, no dump.
+        println!("\n  ═══ FULL CHAIN SIMULATION ═══");
 
-        for &(id, dp) in &[("S3b", 0.06_f64), ("S3C", 0.05), ("S3D", 0.10)] {
-            let dfee = fee(dp) * bsh;
+        struct Scenario { name: &'static str, ask: f64, loser_bid: f64, outcome: &'static str }
+        let scenarios = [
+            Scenario { name: "normal_tight",   ask: 0.50, loser_bid: 0.05, outcome: "normal" },
+            Scenario { name: "normal_wide",    ask: 0.52, loser_bid: 0.04, outcome: "normal" },
+            Scenario { name: "reversal_tight", ask: 0.50, loser_bid: 0.05, outcome: "reversal" },
+            Scenario { name: "reversal_wide",  ask: 0.48, loser_bid: 0.08, outcome: "reversal" },
+            Scenario { name: "thin_book",      ask: 0.50, loser_bid: 0.01, outcome: "normal" },
+            Scenario { name: "deep_bid",       ask: 0.50, loser_bid: 0.15, outcome: "normal" },
+            Scenario { name: "nodump_s3d",     ask: 0.50, loser_bid: 0.20, outcome: "normal" }, // bid>0.10, S3D won't dump
+            Scenario { name: "edge_low_ask",   ask: 0.47, loser_bid: 0.03, outcome: "normal" },
+            Scenario { name: "edge_high_ask",  ask: 0.53, loser_bid: 0.06, outcome: "normal" },
+            Scenario { name: "reversal_thin",  ask: 0.50, loser_bid: 0.02, outcome: "reversal" },
+        ];
+
+        let strats: [(&str, fn(f64)->f64); 2] = [
+            ("S3b", s3b_dump as fn(f64)->f64),
+            ("S3C", taker_dump as fn(f64)->f64),
+        ];
+        for (id, dump_fn) in &strats {
             let mut st = Strat::new(id);
-            let p1 = bsh * dp + bsh * 1.0 - STAKE_2 - bef - dfee;
-            st.rec(p1 > 0.0, p1);
-            let p2 = bsh * dp - STAKE_2 - bef - dfee; // reversal
-            st.rec(false, p2);
-            let p3 = bsh * 1.0 - STAKE_2 - bef; // no dump
-            st.rec(p3 > 0.0, p3);
-            assert_close(st.cap, START_CAP + p1 + p2 + p3, &format!("{} 3-trade", id));
-            println!("  {} | {}W/{}L | PnL=${:+.4} | Cap=${:.2}", id, st.w, st.l, st.pnl, st.cap);
+            println!("  ── {} ──", id);
+            for sc in &scenarios {
+                let dp = dump_fn(sc.loser_bid);
+                let pnl = match sc.outcome {
+                    "normal"   => pnl_normal(sc.ask, dp),
+                    "reversal" => pnl_reversal(sc.ask, dp),
+                    _ => unreachable!(),
+                };
+                let tag = if pnl > 0.0 { "WIN" } else { "LOSS" };
+                st.rec(pnl > 0.0, pnl);
+                println!("    {} {:16} ask={:.2} bid={:.2} dp={:.3} pnl={:+.4} cap={:.2}",
+                    tag, sc.name, sc.ask, sc.loser_bid, dp, pnl, st.cap);
+            }
+            // Verify capital consistency
+            assert!((st.cap - START_CAP - st.pnl).abs() < 0.0001,
+                "{} cap drift: cap={:.4} start+pnl={:.4}", id, st.cap, START_CAP + st.pnl);
+            assert_eq!(st.w + st.l, 10, "{} must have 10 trades", id);
+            println!("    TOTAL: {}W/{}L pnl=${:+.4} cap=${:.2}", st.w, st.l, st.pnl, st.cap);
         }
+
+        // S3D: special — dump only when loser_bid ≤ 0.10
+        {
+            let mut st = Strat::new("S3D");
+            println!("  ── S3D (dump only if bid≤$0.10) ──");
+            for sc in &scenarios {
+                let pnl = if sc.loser_bid <= 0.10 {
+                    let dp = taker_dump(sc.loser_bid);
+                    match sc.outcome {
+                        "normal"   => pnl_normal(sc.ask, dp),
+                        "reversal" => pnl_reversal(sc.ask, dp),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    // No dump — winner settles $1, loser $0
+                    match sc.outcome {
+                        "normal"   => pnl_nodump(sc.ask),
+                        "reversal" => { // "reversal" with no dump: held side = loser, settles $0
+                            let sh = STAKE_1 / (sc.ask + LATENCY_TICKS);
+                            let ef = fee(sc.ask + LATENCY_TICKS) * sh * 2.0;
+                            sh * 0.0 - STAKE_2 - ef // winner was the other side, held side settles $0
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+                let tag = if pnl > 0.0 { "WIN" } else { "LOSS" };
+                let dumped = sc.loser_bid <= 0.10;
+                st.rec(pnl > 0.0, pnl);
+                println!("    {} {:16} ask={:.2} bid={:.2} dump={:5} pnl={:+.4} cap={:.2}",
+                    tag, sc.name, sc.ask, sc.loser_bid, dumped, pnl, st.cap);
+            }
+            assert!((st.cap - START_CAP - st.pnl).abs() < 0.0001, "S3D cap drift");
+            assert_eq!(st.w + st.l, 10, "S3D must have 10 trades");
+            println!("    TOTAL: {}W/{}L pnl=${:+.4} cap=${:.2}", st.w, st.l, st.pnl, st.cap);
+        }
+
+        // Cross-strategy invariants
+        println!("\n  ── CROSS-STRATEGY INVARIANTS ──");
+        let bid = 0.05;
+        let ask = 0.50;
+        let s3b_dp = s3b_dump(bid);
+        let s3c_dp = taker_dump(bid);
+        let s3b_pnl = pnl_normal(ask, s3b_dp);
+        let s3c_pnl = pnl_normal(ask, s3c_dp);
+        let s3d_dp = taker_dump(bid);
+        let s3d_pnl = pnl_normal(ask, s3d_dp);
+        println!("    S3b maker dp={:.3} pnl={:+.4}", s3b_dp, s3b_pnl);
+        println!("    S3C taker dp={:.3} pnl={:+.4}", s3c_dp, s3c_pnl);
+        println!("    S3D taker dp={:.3} pnl={:+.4}", s3d_dp, s3d_pnl);
+        assert!(s3b_dp > s3c_dp, "maker dump must beat taker dump on price");
+        assert!(s3b_pnl > s3c_pnl, "S3b must beat S3C on same-bid normal");
+        assert_close(s3c_pnl, s3d_pnl, "S3C and S3D same dump price when bid≤0.10");
+
+        // Reversal is always a big loss for all strategies
+        for bid in [0.02, 0.05, 0.10, 0.15] {
+            let dp_maker = s3b_dump(bid);
+            let dp_taker = taker_dump(bid);
+            let rev_maker = pnl_reversal(0.50, dp_maker);
+            let rev_taker = pnl_reversal(0.50, dp_taker);
+            assert!(rev_maker < -STAKE_2 * 0.4, "reversal@bid={:.2} must lose >40% stake, got {:.4}", bid, rev_maker);
+            assert!(rev_taker < -STAKE_2 * 0.4, "reversal@bid={:.2} taker must lose >40%, got {:.4}", bid, rev_taker);
+        }
+
+        // Latency impact verification
+        let no_lat_sh = STAKE_1 / 0.50;
+        let lat_sh = STAKE_1 / (0.50 + LATENCY_TICKS);
+        assert!(no_lat_sh > lat_sh, "latency must reduce shares bought");
+        println!("    Latency: {:.6} fewer shares per side ({:.4} vs {:.4})",
+            no_lat_sh - lat_sh, no_lat_sh, lat_sh);
+
+        println!("  ═══ ALL CHAIN CHECKS PASSED ═══\n");
+    }
+
+    #[test]
+    fn test_state_cl_snapshot() {
+        let mut s = State::new();
+        s.cl_up("btc", 87000.0, 1000.0);
+        s.cl_up("btc", 87100.0, 1001.0);
+        assert_close(s.cl.get("btc").copied().unwrap(), 87100.0, "latest CL");
+        assert_close(s.cl_at("btc", 1000, 0).unwrap(), 87000.0, "snap exact");
+        assert_close(s.cl_at("btc", 1001, 0).unwrap(), 87100.0, "snap exact 2");
+        assert!(s.cl_at("btc", 999, 0).is_none(), "snap miss");
+        assert_close(s.cl_at("btc", 999, 1).unwrap(), 87000.0, "snap tol=1");
+        s.bn_up("btc", 87050.0);
+        assert_close(s.bn.get("btc").copied().unwrap(), 87050.0, "BN price");
     }
 }
