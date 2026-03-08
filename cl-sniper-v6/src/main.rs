@@ -535,6 +535,33 @@ impl Executor {
         }
     }
 
+    /// SL exit: taker sell at bid to recover partial value
+    async fn taker_sell(&mut self, client: &AuthClient, tid: &str, shares: f64, bid_price: f64) -> Result<f64> {
+        if self.paper {
+            let recovery = (bid_price - 0.005).max(0.0);
+            return Ok(recovery);
+        }
+        let signer = LocalSigner::from_str(&self.private_key)?.with_chain_id(Some(POLYGON));
+        let shares_dec = Decimal::from_str(&format!("{:.0}", shares.max(1.0)))?;
+        let order = client.market_order()
+            .token_id(tid.parse().context("U256")?)
+            .amount(Amount::shares(shares_dec)?).side(PolySide::Sell)
+            .order_type(PolyOrderType::FAK)
+            .build().await?;
+        let signed = client.sign(&signer, order).await?;
+        match client.post_order(signed).await {
+            Ok(r) if r.success => {
+                info!("[LIVE] SL SELL @~{:.3}", bid_price);
+                Ok((bid_price - 0.005).max(0.0))
+            }
+            Ok(r) => {
+                warn!("[LIVE] SL sell zero fill: {:?}", r.error_msg);
+                Ok(0.0)
+            }
+            Err(e) => { error!("[LIVE] SL sell: {}", e); Ok(0.0) }
+        }
+    }
+
     async fn cancel(&mut self, client: &AuthClient, oid: &str) {
         if !self.paper {
             if let Some(clob_id) = self.clob_ids.get(oid).cloned() {
@@ -560,6 +587,7 @@ struct ActiveTrade {
     end_ts: i64,
     filled: bool,
     sl_triggered: bool,
+    sl_recovery: f64,
     phase: String,
 }
 
@@ -781,7 +809,7 @@ impl Engine {
             self.active.insert(w.slug.clone(), ActiveTrade {
                 oid, tid: tid.to_string(), dir: dir.to_string(), asset: w.asset,
                 wmin: w.wmin, entry_px: entry_price, fill_px: 0.0,
-                end_ts: w.end_ts, filled: false, sl_triggered: false, phase: "maker".to_string(),
+                end_ts: w.end_ts, filled: false, sl_triggered: false, sl_recovery: 0.0, phase: "maker".to_string(),
             });
             self.traded.insert(w.slug.clone());
         }
@@ -892,9 +920,20 @@ impl Engine {
                         let dir = t.dir.clone();
                         let asset = t.asset;
                         let fp = t.fill_px;
-                        if let Some(t_mut) = self.active.get_mut(&slug) { t_mut.sl_triggered = true; }
-                        info!("[SL] {} {} bid={:.3} <= {:.3}(50% of {:.3})",
-                              dir, asset.to_uppercase(), book.bb, fp * SL_BID_PCT, fp);
+                        let tid = t.tid.clone();
+                        let shares = (STAKE / fp).max(1.0);
+                        // Immediate taker sell at bid
+                        let recovery = if let Some(ref c) = client {
+                            self.exe.taker_sell(c, &tid, shares, book.bb).await.unwrap_or(0.0)
+                        } else {
+                            (book.bb - 0.005).max(0.0)
+                        };
+                        if let Some(t_mut) = self.active.get_mut(&slug) {
+                            t_mut.sl_triggered = true;
+                            t_mut.sl_recovery = recovery;
+                        }
+                        info!("[SL] {} {} bid={:.3} <= {:.3}(50% of {:.3}) recovery={:.3}",
+                              dir, asset.to_uppercase(), book.bb, fp * SL_BID_PCT, fp, recovery);
                     }
                 }
             }
@@ -937,11 +976,9 @@ impl Engine {
                 let shares = STAKE / t.fill_px;
                 shares * 1.0 - STAKE
             } else if t.sl_triggered {
-                // SL: recover at bid - slippage (already triggered when bid <= 50% of fill)
-                let book = self.books.get(&t.tid);
-                let recovery = if book.has_bids { book.bb - 0.005 } else { 0.0 };
+                // SL: use recovery price captured at trigger time (taker sell already executed)
                 let shares = STAKE / t.fill_px;
-                (shares * recovery.max(0.0)) - STAKE
+                (shares * t.sl_recovery) - STAKE
             } else {
                 -STAKE
             };
