@@ -1,5 +1,5 @@
-//! Hydra — 13-strategy paper tracker for Polymarket 5m/15m markets
-//! A02/A05/A10: CL favorite | S2: Contrarian | S3a-3E: Both-sides | S4: 5m→15m
+//! Hydra — 10-strategy paper tracker for Polymarket 5m/15m markets
+//! HV02/HV05/HV10: CL δ (no BN) | HV1_02/05/10: +BN contra | S3b/3C/3D: Both-sides | S4: 5m→15m
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -226,7 +226,7 @@ struct Hydra { st: SS, scan: Scan, bk: BkC, s: HashMap<&'static str, Strat>,
 impl Hydra {
     fn new(st: SS, scan: Scan, bk: BkC) -> Self {
         let mut s = HashMap::new();
-        for id in ["A02","A05","A10","A1_02","A1_05","A1_10","S2","S3a","S3b","S3C","S3D","S3E","S4"] { s.insert(id, Strat::new(id)); }
+        for id in ["HV02","HV05","HV10","HV1_02","HV1_05","HV1_10","S3b","S3C","S3D","S4"] { s.insert(id, Strat::new(id)); }
         Hydra { st, scan, bk, s, cl_o: HashMap::new(), sub_r: HashMap::new(), start: Instant::now() }
     }
 
@@ -253,9 +253,7 @@ impl Hydra {
           }}
         }
 
-        self.eval_a(&wins).await;
-        self.eval_s2(&wins).await;
-        self.eval_s3a(&wins).await;
+        self.eval_hv(&wins).await;
         self.eval_s3(&wins).await;
         self.eval_s4(&wins).await;
         self.manage().await;
@@ -267,7 +265,7 @@ impl Hydra {
         for st in self.s.values_mut() { st.done.retain(|k| k.rsplit('-').next().and_then(|s|s.parse::<i64>().ok()).map(|t|t>c).unwrap_or(false)); }
     }
 
-    async fn eval_a(&mut self, wins: &[Win]) {
+    async fn eval_hv(&mut self, wins: &[Win]) {
         let s = self.st.read().await;
         for w in wins {
             if w.wmin != 5 { continue; }
@@ -286,14 +284,14 @@ impl Hydra {
             let fp = bk.ba + LATENCY_TICKS;
             if fp > MAX_ENTRY { continue; }
 
-            // BN contra (for A1 variants)
+            // BN contra (for HV1 variants)
             let bn = s.bn_trend(w.asset, 15);
             let bn_ok = if let Some(bt) = bn {
                 !((dir=="UP" && bt < -0.02) || (dir=="DOWN" && bt > 0.02))
             } else { true };
 
-            // A02/A05/A10: NO BN filter
-            for (id,th) in [("A02",0.02),("A05",0.05),("A10",0.10)] {
+            // HV02/HV05/HV10: NO BN filter
+            for (id,th) in [("HV02",0.02),("HV05",0.05),("HV10",0.10)] {
                 if ad < th*sc { continue; }
                 let st = self.s.get_mut(id).expect("s");
                 if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_1 { continue; }
@@ -306,9 +304,9 @@ impl Hydra {
                 info!("[{}] TAKER {} {} @{:.3} d={:+.3}%", id, dir, w.asset.to_uppercase(), fp, delta);
             }
 
-            // A1_02/A1_05/A1_10: WITH BN contra filter
+            // HV1_02/HV1_05/HV1_10: WITH BN contra filter
             if bn_ok {
-                for (id,th) in [("A1_02",0.02),("A1_05",0.05),("A1_10",0.10)] {
+                for (id,th) in [("HV1_02",0.02),("HV1_05",0.05),("HV1_10",0.10)] {
                     if ad < th*sc { continue; }
                     let st = self.s.get_mut(id).expect("s");
                     if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_1 { continue; }
@@ -324,48 +322,6 @@ impl Hydra {
         }
     }
 
-    async fn eval_s2(&mut self, wins: &[Win]) {
-        for w in wins {
-            if w.wmin!=5 { continue; }
-            let left = w.left(); if left>51||left<49 { continue; } // exact T-50 ±1s
-            let st = self.s.get_mut("S2").expect("s");
-            if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_1 { continue; }
-            let bu = self.bk.get(&w.tid_up); let bd = self.bk.get(&w.tid_down);
-            if !bu.ha||!bd.ha { continue; }
-            let (dir,raw) = if bu.ba<=bd.ba && bu.ba<=0.40 { ("UP",bu.ba) }
-                else if bd.ba<=0.40 { ("DOWN",bd.ba) } else { continue };
-            let fp = raw + LATENCY_TICKS; // taker + latency
-            let sh = STAKE_1/fp;
-            st.active.insert(w.slug.clone(), PT { id:"S2", slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
-                dir:dir.into(), px:fp, shares:sh, dir2:String::new(), px2:0.0, sh2:0.0,
-                end_ts:w.end_ts, sl:fp*SL_PCT, dumped:false, dump_px:0.0, wsold:false, wpx:0.0,
-                tid_up:w.tid_up.clone(), tid_dn:w.tid_down.clone() });
-            st.done.insert(w.slug.clone());
-            info!("[S2] TAKER {} {} @{:.3}", dir, w.asset.to_uppercase(), fp);
-        }
-    }
-
-    async fn eval_s3a(&mut self, wins: &[Win]) {
-        for w in wins {
-            if w.wmin!=5 { continue; }
-            let left = w.left(); if left>51||left<49 { continue; } // exact T-50 ±1s
-            let st = self.s.get_mut("S3a").expect("s");
-            if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_2 { continue; }
-            let bu = self.bk.get(&w.tid_up); let bd = self.bk.get(&w.tid_down);
-            if !bu.ha||!bd.ha { continue; }
-            // Check arb with latency-adjusted asks
-            let ua = bu.ba + LATENCY_TICKS; let da = bd.ba + LATENCY_TICKS;
-            if ua+da >= 0.98 { continue; }
-            let sh = (STAKE_1/ua).min(STAKE_1/da);
-            st.active.insert(w.slug.clone(), PT { id:"S3a", slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
-                dir:"UP".into(), px:ua, shares:sh, dir2:"DOWN".into(), px2:da, sh2:sh,
-                end_ts:w.end_ts, sl:0.0, dumped:false, dump_px:0.0, wsold:false, wpx:0.0,
-                tid_up:w.tid_up.clone(), tid_dn:w.tid_down.clone() });
-            st.done.insert(w.slug.clone());
-            info!("[S3a] ARB {} sum={:.3}", w.asset.to_uppercase(), bu.ba+bd.ba);
-        }
-    }
-
     async fn eval_s3(&mut self, wins: &[Win]) {
         for w in wins {
             if w.wmin!=5 { continue; }
@@ -373,7 +329,7 @@ impl Hydra {
             let bu = self.bk.get(&w.tid_up); let bd = self.bk.get(&w.tid_down);
             if !bu.ha||!bd.ha { continue; }
             if bu.ba<0.47||bu.ba>0.53||bd.ba<0.47||bd.ba>0.53 { continue; }
-            for id in ["S3b","S3C","S3D","S3E"] {
+            for id in ["S3b","S3C","S3D"] {
                 let st = self.s.get_mut(id).expect("s");
                 if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_2 { continue; }
                 // Taker fill at real ask + latency adverse
@@ -429,7 +385,7 @@ impl Hydra {
                 let t = match st.active.get(&slug) { Some(t)=>t.clone(), None=>continue };
                 let left = t.end_ts - now;
 
-                // Single-side: A02/A05/A10, A1_02/05/10, S2, S4
+                // Single-side: HV02/HV05/HV10, HV1_02/05/10, S4
                 if t.dir2.is_empty() {
                     let entry_fee = fee(t.px) * t.shares;
                     // SL is STANDALONE — fires on CL flip regardless of time left, BN trend, or any other condition.
@@ -491,7 +447,7 @@ impl Hydra {
                     continue;
                 }
 
-                // Both-sides: S3a/S3b/S3C/S3D/S3E
+                // Both-sides: S3b/S3C/S3D
                 let co = self.cl_o.get(&slug).copied().unwrap_or(0.0);
                 let cn = s.cl.get(t.asset).copied().unwrap_or(0.0);
                 if co<=0.0||cn<=0.0 { continue; }
@@ -504,7 +460,6 @@ impl Hydra {
                     if cl_d>0.3 {0.05} else if cl_d>0.15 {0.10} else if cl_d>0.05 {0.20} else {0.35}
                 };
 
-                // S3a: hold to settle (no dump)
                 // S3b: MAKER dump at T-30 (posted order — no latency, waits for fill)
                 if st.id=="S3b" && !t.dumped && left<=30 {
                     let dp = (loser_bid + 0.01).min(0.50).max(0.01); // maker: no latency
@@ -524,25 +479,6 @@ impl Hydra {
                     if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                     info!("[S3D] TAKER DUMP {} @bid${:.3}", t.asset.to_uppercase(), dp);
                 }
-                // S3E: taker dump loser, taker sell winner when bid ≥ 0.95
-                if st.id=="S3E" && !t.dumped && loser_bid<=0.10 {
-                    let dp = (loser_bid - LATENCY_TICKS).max(0.01); // taker: latency adverse
-                    if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
-                    info!("[S3E] DUMP loser {} @bid${:.3}", t.asset.to_uppercase(), dp);
-                }
-                if st.id=="S3E" && t.dumped && !t.wsold {
-                    let winner_tid = if up_winning {&t.tid_up} else {&t.tid_dn};
-                    let winner_bk = self.bk.get(winner_tid);
-                    let winner_bid = if winner_bk.hb && winner_bk.bb > 0.0 { winner_bk.bb } else {
-                        if cl_d>0.3 {0.95} else if cl_d>0.15 {0.85} else {0.70}
-                    };
-                    if winner_bid >= 0.95 {
-                        let sp = (winner_bid - LATENCY_TICKS).max(0.01); // taker sell + latency
-                        if let Some(tm) = st.active.get_mut(&slug) { tm.wsold=true; tm.wpx=sp; }
-                        info!("[S3E] SELL winner {} @bid${:.3}", t.asset.to_uppercase(), sp);
-                    }
-                }
-
                 // Settle immediately at end_ts — no waiting
                 if now >= t.end_ts {
                     let cc = s.cl_at(t.asset,t.end_ts,0)
@@ -573,13 +509,7 @@ impl Hydra {
                     let (up_pay, dn_pay) = if actual=="UP" {(1.0,0.0)} else {(0.0,1.0)};
 
                     let entry_fees = fee(t.px)*t.shares + fee(t.px2)*t.sh2;
-                    let pnl = if st.id=="S3a" {
-                        t.shares * 1.0 - (t.px*t.shares + t.px2*t.sh2) - entry_fees
-                    } else if st.id=="S3E" && t.wsold {
-                        let lr = if up_winning {t.sh2} else {t.shares};
-                        let wr = if up_winning {t.shares} else {t.sh2};
-                        lr*t.dump_px + wr*t.wpx - STAKE_2 - entry_fees - fee(t.dump_px)*lr - fee(t.wpx)*wr
-                    } else if t.dumped {
+                    let pnl = if t.dumped {
                         let lr = if up_winning {t.sh2} else {t.shares};
                         let wr = if up_winning {t.shares} else {t.sh2};
                         let loser_was_right = (!up_winning && actual=="UP")||(up_winning && actual=="DOWN");
@@ -605,7 +535,7 @@ impl Hydra {
 
     fn status(&self) -> String {
         let mut p = Vec::new();
-        for id in ["A02","A05","A10","A1_02","A1_05","A1_10","S2","S3a","S3b","S3C","S3D","S3E","S4"] {
+        for id in ["HV02","HV05","HV10","HV1_02","HV1_05","HV1_10","S3b","S3C","S3D","S4"] {
             if let Some(st) = self.s.get(id) {
                 if st.t()>0||!st.active.is_empty() {
                     p.push(format!("{}:{}W/{}L${:+.1}", id, st.w, st.l, st.pnl));
@@ -621,10 +551,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("hydra=info").with_target(false).init();
     dotenvy::dotenv().ok();
     info!("══════════════════════════════════════════════════════════");
-    info!("  HYDRA — 13-Strategy Paper Tracker");
-    info!("  A02/A05/A10: CL δ (no BN) | A1_02/05/10: +BN contra");
-    info!("  S2: Contrarian ≤$0.40 | S3a: Arb <$0.98");
-    info!("  S3b/3C: Dump T-30 | S3D: Dump@0.10 | S3E: Safe exit");
+    info!("  HYDRA — 10-Strategy Paper Tracker");
+    info!("  Hydra-Volatility: HV02/HV05/HV10 (CL δ, no BN)");
+    info!("  Hydra-Volatility: HV1_02/HV1_05/HV1_10 (+BN contra)");
+    info!("  S3b/3C: Dump T-30 | S3D: Dump@0.10");
     info!("  S4: 5m→15m 2/3 confirm");
     info!("  ${}/{} stake | ${}/strat | SL {}%", STAKE_1, STAKE_2, START_CAP, SL_PCT*100.0);
     info!("══════════════════════════════════════════════════════════");
@@ -683,14 +613,13 @@ mod tests {
 
     #[test]
     fn test_single_side_win() {
-        let mut st = Strat::new("A02");
+        let mut st = Strat::new("HV02");
         let cap0 = st.cap;
         let px = 0.90;
         let pnl = single_win_pnl(px);
         st.rec(true, pnl);
         assert_close(st.cap, cap0 + pnl, "single win cap");
         assert!(pnl > 0.0, "winning trade must be profitable");
-        // Verify fee is subtracted
         let sh = STAKE_1 / px;
         let ef = fee(px) * sh;
         assert!(ef > 0.0, "entry fee must be nonzero");
@@ -699,46 +628,29 @@ mod tests {
 
     #[test]
     fn test_single_side_loss() {
-        let mut st = Strat::new("A02");
+        let mut st = Strat::new("HV02");
         let cap0 = st.cap;
         let px = 0.90;
         let pnl = single_loss_pnl(px);
         st.rec(false, pnl);
-        // Loss is worse than -STAKE because fee is also lost
         assert!(pnl < -STAKE_1, "loss must exceed stake due to entry fee");
         assert_close(st.cap, cap0 + pnl, "single loss cap");
     }
 
     #[test]
     fn test_sl_exit() {
-        let mut st = Strat::new("A02");
+        let mut st = Strat::new("HV02");
         let cap0 = st.cap;
         let px = 0.90;
-        let sl_bid = px * SL_PCT; // 0.45 — real bid from orderbook
+        let sl_bid = px * SL_PCT;
         let pnl = single_sl_pnl(px, sl_bid);
         st.rec(false, pnl);
         assert_close(st.cap, cap0 + pnl, "SL cap");
         assert!(pnl < 0.0, "SL must be a loss");
-        // Verify both entry + exit fees included
         let sh = STAKE_1 / px;
         let ef = fee(px) * sh;
         let xf = fee(sl_bid) * sh;
         assert_close(pnl, sh * sl_bid - STAKE_1 - ef - xf, "SL = rec - stake - entry_fee - exit_fee");
-    }
-
-    #[test]
-    fn test_s3a_arb() {
-        let mut st = Strat::new("S3a");
-        let cap0 = st.cap;
-        let up_ask = 0.47; // real ask from CLOB
-        let dn_ask = 0.48;
-        let sh = (STAKE_1 / up_ask).min(STAKE_1 / dn_ask);
-        let cost = sh * up_ask + sh * dn_ask;
-        let entry_fees = fee(up_ask) * sh + fee(dn_ask) * sh;
-        let pnl = sh * 1.0 - cost - entry_fees;
-        st.rec(pnl > 0.0, pnl);
-        assert_close(st.cap, cap0 + pnl, "S3a cap");
-        assert!(pnl > 0.0, "S3a arb must be profitable when sum < $0.98");
     }
 
     #[test]
@@ -832,21 +744,17 @@ mod tests {
     #[test]
     fn test_full_capital_trace() {
         println!("\n{}", "=".repeat(72));
-        println!("  HYDRA CAPITAL TRACE — ALL 13 STRATEGIES (REALISTIC)");
+        println!("  HYDRA CAPITAL TRACE — 10 STRATEGIES (REALISTIC)");
         println!("  Taker fills at real ask + latency | Real bid for SL/dump | Fees on ALL fills");
         println!("  START_CAP=${:.2}  STAKE_1=${:.2}  STAKE_2=${:.2}  SL={}%  LATENCY={}tick  STALE={}s",
             START_CAP, STAKE_1, STAKE_2, SL_PCT*100.0, LATENCY_TICKS, STALE_SECS);
         println!("{}\n", "=".repeat(72));
 
         // ────────────────────────────────────────────────────────────
-        // GROUP 1: Single-side CL-delta (A02/A05/A10) — no BN filter
-        //   Entry fee + exit fee on every trade
-        //   Win:   shares*$1.00 - stake - entry_fee
-        //   Loss:  -(stake + entry_fee)
-        //   SL:    shares*bid - stake - entry_fee - exit_fee
+        // GROUP 1: Hydra-Volatility (HV02/HV05/HV10) — no BN filter
         // ────────────────────────────────────────────────────────────
-        println!("══ GROUP 1: CL-delta (A02/A05/A10) — no BN filter ══");
-        for &(id, _th, px) in &[("A02",0.02,0.90), ("A05",0.05,0.92), ("A10",0.10,0.88)] {
+        println!("══ GROUP 1: Hydra-Volatility (HV02/HV05/HV10) — no BN filter ══");
+        for &(id, _th, px) in &[("HV02",0.02,0.90), ("HV05",0.05,0.92), ("HV10",0.10,0.88)] {
             let mut st = Strat::new(id);
             let sh = STAKE_1 / px;
             let ef = fee(px) * sh;
@@ -870,11 +778,10 @@ mod tests {
         }
 
         // ────────────────────────────────────────────────────────────
-        // GROUP 2: CL-delta + BN contra filter (A1_02/A1_05/A1_10)
-        //   Same math as Group 1 — full win+loss+SL cycle
+        // GROUP 2: Hydra-Volatility + BN contra (HV1_02/HV1_05/HV1_10)
         // ────────────────────────────────────────────────────────────
-        println!("\n\n══ GROUP 2: CL-delta + BN contra (A1_02/A1_05/A1_10) ══");
-        for &(id, px) in &[("A1_02",0.91), ("A1_05",0.93), ("A1_10",0.87)] {
+        println!("\n\n══ GROUP 2: Hydra-Volatility + BN contra (HV1_02/HV1_05/HV1_10) ══");
+        for &(id, px) in &[("HV1_02",0.91), ("HV1_05",0.93), ("HV1_10",0.87)] {
             let mut st = Strat::new(id);
 
             let pnl_w = single_win_pnl(px);
@@ -892,67 +799,17 @@ mod tests {
         }
 
         // ────────────────────────────────────────────────────────────
-        // GROUP 3: S2 — Contrarian (buy underdog ≤$0.40)
-        //   Entry at real ask (no added SLIP)
+        // GROUP 3: S3b/S3C/S3D — different dump mechanics
         // ────────────────────────────────────────────────────────────
-        println!("\n\n══ GROUP 3: S2 — Contrarian (underdog ≤$0.40) ══");
-        {
-            let mut st = Strat::new("S2");
-            let px = 0.35; // real ask from orderbook, no SLIP
-            let sh = STAKE_1 / px;
-            let ef = fee(px) * sh;
-
-            let pnl_w = single_win_pnl(px);
-            st.rec(true, pnl_w);
-            println!("\n  [S2 WIN]  underdog @${:.3} → {} sh, fee=${:.4}, PnL=${:+.4}  Cap=${:.4}", px, sh, ef, pnl_w, st.cap);
-            assert_close(st.cap, START_CAP + pnl_w, "S2 win");
-
-            let pnl_l = single_loss_pnl(px);
-            st.rec(false, pnl_l);
-            println!("  [S2 LOSS] PnL=${:+.4}  Cap=${:.4}", pnl_l, st.cap);
-
-            let sl_bid = px * SL_PCT;
-            let pnl_sl = single_sl_pnl(px, sl_bid);
-            st.rec(false, pnl_sl);
-            println!("  [S2 SL]   bid=${:.4} → PnL=${:+.4}  Cap=${:.4}", sl_bid, pnl_sl, st.cap);
-            assert_close(st.cap, START_CAP + pnl_w + pnl_l + pnl_sl, "S2 SL");
-            println!("  [S2 ✓]  {}W/{}L  cumPnL=${:+.4}", st.w, st.l, st.pnl);
-        }
-
-        // ────────────────────────────────────────────────────────────
-        // GROUP 4: S3a — Pure Arb (no dump, hold to settle)
-        // ────────────────────────────────────────────────────────────
-        println!("\n\n══ GROUP 4: S3a — Pure Arb (sum < $0.98) ══");
-        {
-            let mut st = Strat::new("S3a");
-            let ua = 0.47; let da = 0.48; // real asks
-            let sh = (STAKE_1 / ua).min(STAKE_1 / da);
-            let cost = sh * ua + sh * da;
-            let ef = fee(ua) * sh + fee(da) * sh;
-            let pnl = sh * 1.0 - cost - ef;
-            st.rec(pnl > 0.0, pnl);
-            println!("  Entry: {} sh @UP${:.2}+DN${:.2} cost=${:.4} fee=${:.4}", sh, ua, da, cost, ef);
-            println!("  PnL: ${:+.4}  Cap=${:.4}", pnl, st.cap);
-            assert!(pnl > 0.0, "S3a arb must profit when sum < $0.98");
-            println!("  [S3a ✓]  Guaranteed profit: ${:+.4}", pnl);
-        }
-
-        // ────────────────────────────────────────────────────────────
-        // GROUP 5: S3b/S3C/S3D — different dump mechanics
-        //   S3b: MAKER dump at bid+0.01 (better price, fill risk)
-        //   S3C: TAKER dump at bid (guaranteed fill, worse price)
-        //   S3D: dump when bid ≤ $0.10
-        //   Entry at real ask (no SLIP)
-        // ────────────────────────────────────────────────────────────
-        println!("\n\n══ GROUP 5: S3b/S3C/S3D — Dump loser, hold winner ══");
-        let bpx = 0.50; // real ask, no SLIP
+        println!("\n\n══ GROUP 3: S3b/S3C/S3D — Dump loser, hold winner ══");
+        let bpx = 0.50;
         let bsh = STAKE_1 / bpx;
         let bef = fee(bpx) * bsh * 2.0;
 
         for &(id, dp_label, dp) in &[
-            ("S3b", "MAKER T-30 bid+0.01", 0.06_f64),  // maker: bid(0.05)+0.01
-            ("S3C", "TAKER T-30 at bid",   0.05),       // taker: hit bid directly
-            ("S3D", "TAKER dump bid≤$0.10", 0.10),       // real bid from orderbook
+            ("S3b", "MAKER T-30 bid+0.01", 0.06_f64),
+            ("S3C", "TAKER T-30 at bid",   0.05),
+            ("S3D", "TAKER dump bid≤$0.10", 0.10),
         ] {
             let dfee = fee(dp) * bsh;
 
@@ -969,44 +826,12 @@ mod tests {
             assert_close(st.cap, START_CAP + pnl_ok + pnl_rev, &format!("{} reversal", id));
             println!("  [{} ✓]  {}W/{}L  cumPnL=${:+.4}", id, st.w, st.l, st.pnl);
         }
-        // Verify S3b maker > S3C taker
         println!("  [S3b vs S3C] Maker dump @$0.06 vs taker @$0.05 — maker gets better PnL ✓");
 
         // ────────────────────────────────────────────────────────────
-        // GROUP 6: S3E — Dump loser + sell winner (conditional)
-        //   Live code: only sells winner when real bid ≥ $0.95
-        //   This requires CL delta > 0.3% (strong trend)
+        // GROUP 4: S4 — 5m→15m confirmation (full W/L/SL cycle)
         // ────────────────────────────────────────────────────────────
-        println!("\n\n══ GROUP 6: S3E — Safe exit (conditional on winner bid ≥ $0.95) ══");
-        {
-            // Case 1: Strong trend (bid ≥ 0.95) — full safe exit
-            let dp = 0.10; // real loser bid
-            let wpx = 0.95; // real winner bid
-            let dfee = fee(dp) * bsh;
-            let wfee = fee(wpx) * bsh;
-
-            let mut st = Strat::new("S3E");
-            let pnl_safe = bsh * dp + bsh * wpx - STAKE_2 - bef - dfee - wfee;
-            st.rec(pnl_safe > 0.0, pnl_safe);
-            println!("  [S3E SAFE] loser bid=${:.2} winner bid=${:.2}", dp, wpx);
-            println!("    PnL=${:+.4}  Cap=${:.4}", pnl_safe, st.cap);
-            assert_close(st.cap, START_CAP + pnl_safe, "S3E safe");
-
-            // Case 2: Weak trend (bid < 0.95) — winner NOT sold, holds to settle
-            let mut st2 = Strat::new("S3E");
-            let wpx2 = 0.85; // winner bid < 0.95, not sold
-            let pnl_hold = bsh * dp + bsh * 1.0 - STAKE_2 - bef - dfee; // winner settles at $1
-            st2.rec(pnl_hold > 0.0, pnl_hold);
-            println!("  [S3E HOLD] winner bid=${:.2} < $0.95, hold to settle", wpx2);
-            println!("    PnL=${:+.4}  Cap=${:.4}", pnl_hold, st2.cap);
-            assert!(pnl_hold > pnl_safe, "holding to settle beats safe exit when no reversal");
-            println!("  [S3E ✓]  Safe=${:+.4} vs Hold=${:+.4} (safety cost=${:.4})", pnl_safe, pnl_hold, pnl_hold-pnl_safe);
-        }
-
-        // ────────────────────────────────────────────────────────────
-        // GROUP 7: S4 — 5m→15m confirmation (full W/L/SL cycle)
-        // ────────────────────────────────────────────────────────────
-        println!("\n\n══ GROUP 7: S4 — 5m→15m confirmation ══");
+        println!("\n\n══ GROUP 4: S4 — 5m→15m confirmation ══");
         {
             let mut st = Strat::new("S4");
             let px = 0.93;
@@ -1024,23 +849,18 @@ mod tests {
         }
 
         // ────────────────────────────────────────────────────────────
-        // FULL CYCLE: 13 strategies, 3 trades each = 39 trades
-        //   Single-side: win + loss + SL (with fees on all)
-        //   S3a: arb (hold to settle, no dump)
-        //   S3b: maker dump (bid+0.01)
-        //   S3C: taker dump (at bid)
-        //   S3D/S3E: dump at bid
+        // FULL CYCLE: 10 strategies, 3 trades each = 30 trades
         // ────────────────────────────────────────────────────────────
-        println!("\n\n══ FULL 13-STRATEGY SEQUENCE (39 trades) ══");
+        println!("\n\n══ FULL 10-STRATEGY SEQUENCE (30 trades) ══");
         let mut total_pnl = 0.0;
         let mut total_w = 0u32;
         let mut total_l = 0u32;
 
-        // Single-side strategies
+        // Single-side: Hydra-Volatility + S4
         for &(id, px) in &[
-            ("A02",0.90), ("A05",0.92), ("A10",0.88),
-            ("A1_02",0.91), ("A1_05",0.93), ("A1_10",0.87),
-            ("S2",0.35), ("S4",0.93),
+            ("HV02",0.90), ("HV05",0.92), ("HV10",0.88),
+            ("HV1_02",0.91), ("HV1_05",0.93), ("HV1_10",0.87),
+            ("S4",0.93),
         ] {
             let mut st = Strat::new(id);
             let p1 = single_win_pnl(px);
@@ -1055,42 +875,21 @@ mod tests {
             total_pnl += st.pnl; total_w += st.w; total_l += st.l;
         }
 
-        // S3a: arb (no dump) — 3 arb trades
-        {
-            let mut st = Strat::new("S3a");
-            let ua = 0.47; let da = 0.48;
-            let sh = (STAKE_1 / ua).min(STAKE_1 / da);
-            let cost = sh * ua + sh * da;
-            let ef = fee(ua) * sh + fee(da) * sh;
-            let p_arb = sh * 1.0 - cost - ef;
-            for _ in 0..3 {
-                st.rec(p_arb > 0.0, p_arb);
-            }
-            println!("  S3a (arb @$0.47+$0.48): 3 arbs → {}W/{}L  cum=${:+.4}  Cap=${:.4}",
-                st.w, st.l, st.pnl, st.cap);
-            assert_close(st.cap, START_CAP + p_arb * 3.0, "S3a 3-arb");
-            total_pnl += st.pnl; total_w += st.w; total_l += st.l;
-        }
-
-        // S3b/S3C/S3D/S3E: both-sides with dump
+        // S3b/S3C/S3D: both-sides with dump
         for &(id, dp) in &[
-            ("S3b", 0.06_f64),  // maker: bid+0.01
-            ("S3C", 0.05),      // taker: at bid
-            ("S3D", 0.10),      // dump when bid≤0.10
-            ("S3E", 0.10),      // dump loser + hold winner
+            ("S3b", 0.06_f64),
+            ("S3C", 0.05),
+            ("S3D", 0.10),
         ] {
             let mut st = Strat::new(id);
-            let px = 0.50; // real ask
+            let px = 0.50;
             let sh = STAKE_1 / px;
             let ef = fee(px) * sh * 2.0;
             let dfee = fee(dp) * sh;
-            // Trade 1: normal
             let p1 = sh * dp + sh * 1.0 - STAKE_2 - ef - dfee;
             st.rec(p1 > 0.0, p1);
-            // Trade 2: reversal
             let p2 = sh * dp - STAKE_2 - ef - dfee;
             st.rec(false, p2);
-            // Trade 3: normal
             st.rec(p1 > 0.0, p1);
             println!("  {} (both @${:.2} dump@${:.2}): {}W/{}L  cum=${:+.4}  Cap=${:.4}",
                 id, px, dp, st.w, st.l, st.pnl, st.cap);
@@ -1098,11 +897,11 @@ mod tests {
             total_pnl += st.pnl; total_w += st.w; total_l += st.l;
         }
 
-        println!("\n  TOTALS: {}W/{}L across 13 strategies, 39 trades", total_w, total_l);
+        println!("\n  TOTALS: {}W/{}L across 10 strategies, 30 trades", total_w, total_l);
         println!("  Combined PnL: ${:+.4}", total_pnl);
 
         println!("\n{}", "=".repeat(72));
-        println!("  ALL 13 STRATEGIES TRACED — REALISTIC CAPITAL MATH VERIFIED");
+        println!("  ALL 10 STRATEGIES TRACED — REALISTIC CAPITAL MATH VERIFIED");
         println!("  Entry fees on ALL fills | Real bids for exits | Latency model | Staleness guard");
         println!("{}", "=".repeat(72));
     }
