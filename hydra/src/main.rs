@@ -21,6 +21,8 @@ const START_CAP: f64 = 100.0;
 const MIN_ENTRY: f64 = 0.85;
 const MAX_ENTRY: f64 = 0.98;
 const SL_PCT: f64 = 0.50;
+const LATENCY_TICKS: f64 = 0.001; // 1 Polymarket tick (~200ms network latency adverse movement)
+const STALE_SECS: u64 = 3;        // reject orderbook data older than this
 const RTDS_WS: &str = "wss://ws-live-data.polymarket.com";
 const BN_WS: &str = "wss://stream.binance.com:9443/ws";
 const GAMMA: &str = "https://gamma-api.polymarket.com";
@@ -165,7 +167,14 @@ struct Bk { bb: f64, ba: f64, ha: bool, hb: bool }
 struct BkC { http: reqwest::Client, c: HashMap<String,Bk>, t: HashMap<String,Instant> }
 impl BkC {
     fn new() -> Self { BkC { http: reqwest::Client::builder().user_agent("hydra/1").timeout(Duration::from_secs(2)).build().expect("h"), c: HashMap::new(), t: HashMap::new() } }
-    fn get(&self, tid: &str) -> Bk { self.c.get(tid).cloned().unwrap_or_default() }
+    fn get(&self, tid: &str) -> Bk {
+        // Reject stale data — return empty (ha=false, hb=false) if too old
+        match self.t.get(tid) {
+            Some(ts) if ts.elapsed() < Duration::from_secs(STALE_SECS) =>
+                self.c.get(tid).cloned().unwrap_or_default(),
+            _ => Bk::default(),
+        }
+    }
     async fn refresh(&mut self, tids: &[String]) {
         let stale: Vec<&String> = tids.iter().filter(|t| self.t.get(*t).map(|ts|ts.elapsed()>=Duration::from_secs(1)).unwrap_or(true)).collect();
         if stale.is_empty() { return; }
@@ -262,7 +271,7 @@ impl Hydra {
         let s = self.st.read().await;
         for w in wins {
             if w.wmin != 5 { continue; }
-            let left = w.left(); if left>57||left<44 { continue; }
+            let left = w.left(); if left>51||left<49 { continue; } // exact T-50 ±1s
             let co = match self.cl_o.get(&w.slug) { Some(&p) if p>0.0=>p, _=>continue };
             let cn = match s.cl.get(w.asset) { Some(&p) if p>0.0=>p, _=>continue };
             let delta = (cn-co)/co*100.0;
@@ -273,8 +282,9 @@ impl Hydra {
             if !bk.ha||bk.ba<MIN_ENTRY||bk.ba>MAX_ENTRY { continue; }
             let ad = delta.abs();
             let sc = stdev(w.asset)/STDEV_BASE;
-            // Taker fill at real ask — no randomness
-            let fp = bk.ba;
+            // Taker fill at real ask + latency adverse
+            let fp = bk.ba + LATENCY_TICKS;
+            if fp > MAX_ENTRY { continue; }
 
             // BN contra (for A1 variants)
             let bn = s.bn_trend(w.asset, 15);
@@ -317,13 +327,14 @@ impl Hydra {
     async fn eval_s2(&mut self, wins: &[Win]) {
         for w in wins {
             if w.wmin!=5 { continue; }
-            let left = w.left(); if left>57||left<44 { continue; }
+            let left = w.left(); if left>51||left<49 { continue; } // exact T-50 ±1s
             let st = self.s.get_mut("S2").expect("s");
             if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_1 { continue; }
             let bu = self.bk.get(&w.tid_up); let bd = self.bk.get(&w.tid_down);
             if !bu.ha||!bd.ha { continue; }
-            let (dir,fp) = if bu.ba<=bd.ba && bu.ba<=0.40 { ("UP",bu.ba) }
+            let (dir,raw) = if bu.ba<=bd.ba && bu.ba<=0.40 { ("UP",bu.ba) }
                 else if bd.ba<=0.40 { ("DOWN",bd.ba) } else { continue };
+            let fp = raw + LATENCY_TICKS; // taker + latency
             let sh = STAKE_1/fp;
             st.active.insert(w.slug.clone(), PT { id:"S2", slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
                 dir:dir.into(), px:fp, shares:sh, dir2:String::new(), px2:0.0, sh2:0.0,
@@ -337,15 +348,17 @@ impl Hydra {
     async fn eval_s3a(&mut self, wins: &[Win]) {
         for w in wins {
             if w.wmin!=5 { continue; }
-            let left = w.left(); if left>57||left<44 { continue; }
+            let left = w.left(); if left>51||left<49 { continue; } // exact T-50 ±1s
             let st = self.s.get_mut("S3a").expect("s");
             if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_2 { continue; }
             let bu = self.bk.get(&w.tid_up); let bd = self.bk.get(&w.tid_down);
             if !bu.ha||!bd.ha { continue; }
-            if bu.ba+bd.ba >= 0.98 { continue; }
-            let sh = (STAKE_1/bu.ba).min(STAKE_1/bd.ba);
+            // Check arb with latency-adjusted asks
+            let ua = bu.ba + LATENCY_TICKS; let da = bd.ba + LATENCY_TICKS;
+            if ua+da >= 0.98 { continue; }
+            let sh = (STAKE_1/ua).min(STAKE_1/da);
             st.active.insert(w.slug.clone(), PT { id:"S3a", slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
-                dir:"UP".into(), px:bu.ba, shares:sh, dir2:"DOWN".into(), px2:bd.ba, sh2:sh,
+                dir:"UP".into(), px:ua, shares:sh, dir2:"DOWN".into(), px2:da, sh2:sh,
                 end_ts:w.end_ts, sl:0.0, dumped:false, dump_px:0.0, wsold:false, wpx:0.0,
                 tid_up:w.tid_up.clone(), tid_dn:w.tid_down.clone() });
             st.done.insert(w.slug.clone());
@@ -363,8 +376,8 @@ impl Hydra {
             for id in ["S3b","S3C","S3D","S3E"] {
                 let st = self.s.get_mut(id).expect("s");
                 if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_2 { continue; }
-                // Taker fill at real ask — no artificial slip
-                let up = bu.ba; let dn = bd.ba;
+                // Taker fill at real ask + latency adverse
+                let up = bu.ba + LATENCY_TICKS; let dn = bd.ba + LATENCY_TICKS;
                 let ush = STAKE_1/up; let dsh = STAKE_1/dn;
                 st.active.insert(w.slug.clone(), PT { id, slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
                     dir:"UP".into(), px:up, shares:ush, dir2:"DOWN".into(), px2:dn, sh2:dsh,
@@ -379,7 +392,7 @@ impl Hydra {
     async fn eval_s4(&mut self, wins: &[Win]) {
         for w in wins {
             if w.wmin!=15 { continue; }
-            let left = w.left(); if left>50||left<44 { continue; }
+            let left = w.left(); if left>51||left<49 { continue; } // exact T-50 ±1s
             let st = self.s.get_mut("S4").expect("s");
             if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_1 { continue; }
             let iv = 300i64;
@@ -392,8 +405,9 @@ impl Hydra {
             let tid = if dir=="UP" {&w.tid_up} else {&w.tid_down};
             let bk = self.bk.get(tid);
             if !bk.ha||bk.ba<MIN_ENTRY||bk.ba>MAX_ENTRY { continue; }
-            // Taker fill at real ask
-            let fp = bk.ba;
+            // Taker fill at real ask + latency
+            let fp = bk.ba + LATENCY_TICKS;
+            if fp > MAX_ENTRY { continue; }
             let sh = STAKE_1/fp;
             st.active.insert(w.slug.clone(), PT { id:"S4", slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
                 dir:dir.into(), px:fp, shares:sh, dir2:String::new(), px2:0.0, sh2:0.0,
@@ -418,16 +432,17 @@ impl Hydra {
                 // Single-side: A02/A05/A10, A1_02/05/10, S2, S4
                 if t.dir2.is_empty() {
                     let entry_fee = fee(t.px) * t.shares;
-                    // SL: CL flip → sell at real orderbook bid
+                    // SL is STANDALONE — fires on CL flip regardless of time left, BN trend, or any other condition.
+                    // Only gate: t.sl > 0.0 (disabled for both-sides strategies which hold both sides).
                     if t.sl > 0.0 {
                         if let (Some(&co), Some(&cn)) = (self.cl_o.get(&slug), s.cl.get(t.asset)) {
                             let d = (cn-co)/co*100.0;
                             let flip = (t.dir=="UP" && d < -0.01)||(t.dir=="DOWN" && d>0.01);
                             if flip {
-                                // Use real bid from orderbook for the held token
                                 let held_tid = if t.dir=="UP" {&t.tid_up} else {&t.tid_dn};
                                 let bk = self.bk.get(held_tid);
-                                let sl_px = if bk.hb && bk.bb > 0.0 { bk.bb } else { t.sl }; // real bid, fallback theoretical
+                                let raw_bid = if bk.hb && bk.bb > 0.0 { bk.bb } else { t.sl };
+                                let sl_px = (raw_bid - LATENCY_TICKS).max(0.01); // taker sell + latency
                                 let rec = t.shares * sl_px;
                                 let exit_fee = fee(sl_px) * t.shares;
                                 let pnl = rec - STAKE_1 - entry_fee - exit_fee;
@@ -436,15 +451,14 @@ impl Hydra {
                             }
                         }
                     }
-                    // Settle
-                    if now >= t.end_ts+3 {
+                    // Settle at exact end_ts + 1s (CL propagation)
+                    if now >= t.end_ts+1 {
                         let co = self.cl_o.get(&slug).copied().unwrap_or(0.0);
-                        let cc = s.cl_at(t.asset,t.end_ts,2).or_else(||s.cl_at(t.asset,t.end_ts,5)).or_else(||s.cl.get(t.asset).copied()).unwrap_or(0.0);
+                        let cc = s.cl_at(t.asset,t.end_ts,1).or_else(||s.cl.get(t.asset).copied()).unwrap_or(0.0);
                         if t.wmin==5 { self.sub_r.insert(slug.clone(), if cc>=co {"UP"} else {"DOWN"}.into()); }
                         if co<=0.0||cc<=0.0 { settles.push((st.id,slug.clone(),-STAKE_1-entry_fee)); continue; }
                         let actual = if cc>=co {"UP"} else {"DOWN"};
                         let won = actual==t.dir;
-                        // Fee charged on entry for both wins and losses
                         let pnl = if won { t.shares*1.0 - STAKE_1 - entry_fee } else { -STAKE_1 - entry_fee };
                         info!("[{}] {} {} {}m @{:.3} → {} ${:+.2} (fee=${:.4})", st.id, if won{"WIN"}else{"LOSS"}, t.asset.to_uppercase(), t.wmin, t.px, actual, pnl, entry_fee);
                         settles.push((st.id, slug.clone(), pnl));
@@ -462,55 +476,51 @@ impl Hydra {
                 let loser_tid = if up_winning {&t.tid_dn} else {&t.tid_up};
                 let loser_bk = self.bk.get(loser_tid);
                 let loser_bid = if loser_bk.hb && loser_bk.bb > 0.0 { loser_bk.bb } else {
-                    // Fallback: estimate from CL delta
                     if cl_d>0.3 {0.05} else if cl_d>0.15 {0.10} else if cl_d>0.05 {0.20} else {0.35}
                 };
 
                 // S3a: hold to settle (no dump)
-                // S3b: MAKER dump at T-30 (post ask slightly above bid, better price)
+                // S3b: MAKER dump at T-30 (posted order — no latency, waits for fill)
                 if st.id=="S3b" && !t.dumped && left<=30 {
-                    // Maker: post at bid + 0.01 (aim for better fill)
-                    let dp = (loser_bid + 0.01).min(0.50).max(0.01);
+                    let dp = (loser_bid + 0.01).min(0.50).max(0.01); // maker: no latency
                     if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                     let ls = if up_winning {t.sh2} else {t.shares};
                     info!("[S3b] MAKER DUMP {} @{:.3} rec=${:.2}", t.asset.to_uppercase(), dp, ls*dp);
                 }
-                // S3C: TAKER dump at T-30 (hit bid immediately, guaranteed fill)
+                // S3C: TAKER dump at T-30 (hit bid - latency)
                 if st.id=="S3C" && !t.dumped && left<=30 {
-                    // Taker: hit the real bid directly
-                    let dp = loser_bid.max(0.01);
+                    let dp = (loser_bid - LATENCY_TICKS).max(0.01); // taker: latency adverse
                     if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                     info!("[S3C] TAKER DUMP {} @bid${:.3}", t.asset.to_uppercase(), dp);
                 }
-                // S3D: dump when real loser bid ≤ 0.10
+                // S3D: taker dump when loser bid ≤ 0.10
                 if st.id=="S3D" && !t.dumped && loser_bid<=0.10 {
-                    let dp = loser_bid.max(0.01);
+                    let dp = (loser_bid - LATENCY_TICKS).max(0.01); // taker: latency adverse
                     if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                     info!("[S3D] TAKER DUMP {} @bid${:.3}", t.asset.to_uppercase(), dp);
                 }
-                // S3E: dump loser when bid ≤ 0.10, sell winner at real bid when bid ≥ 0.95
+                // S3E: taker dump loser, taker sell winner when bid ≥ 0.95
                 if st.id=="S3E" && !t.dumped && loser_bid<=0.10 {
-                    let dp = loser_bid.max(0.01);
+                    let dp = (loser_bid - LATENCY_TICKS).max(0.01); // taker: latency adverse
                     if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                     info!("[S3E] DUMP loser {} @bid${:.3}", t.asset.to_uppercase(), dp);
                 }
                 if st.id=="S3E" && t.dumped && !t.wsold {
-                    // Use real bid for winner token
                     let winner_tid = if up_winning {&t.tid_up} else {&t.tid_dn};
                     let winner_bk = self.bk.get(winner_tid);
                     let winner_bid = if winner_bk.hb && winner_bk.bb > 0.0 { winner_bk.bb } else {
                         if cl_d>0.3 {0.95} else if cl_d>0.15 {0.85} else {0.70}
                     };
                     if winner_bid >= 0.95 {
-                        let sp = winner_bid; // real bid, no artificial slip
+                        let sp = (winner_bid - LATENCY_TICKS).max(0.01); // taker sell + latency
                         if let Some(tm) = st.active.get_mut(&slug) { tm.wsold=true; tm.wpx=sp; }
                         info!("[S3E] SELL winner {} @bid${:.3}", t.asset.to_uppercase(), sp);
                     }
                 }
 
-                // Settlement
-                if now >= t.end_ts+3 {
-                    let cc = s.cl_at(t.asset,t.end_ts,2).or_else(||s.cl_at(t.asset,t.end_ts,5)).or_else(||s.cl.get(t.asset).copied()).unwrap_or(0.0);
+                // Settle at exact end_ts + 1s
+                if now >= t.end_ts+1 {
+                    let cc = s.cl_at(t.asset,t.end_ts,1).or_else(||s.cl.get(t.asset).copied()).unwrap_or(0.0);
                     if cc<=0.0 { settles.push((st.id,slug.clone(),-STAKE_2)); continue; }
                     if t.wmin==5 { self.sub_r.insert(slug.clone(), if cc>=co {"UP"} else {"DOWN"}.into()); }
                     let actual = if cc>=co {"UP"} else {"DOWN"};
@@ -518,26 +528,21 @@ impl Hydra {
 
                     let entry_fees = fee(t.px)*t.shares + fee(t.px2)*t.sh2;
                     let pnl = if st.id=="S3a" {
-                        // Pure arb: winner pays $1.00, no dump
                         t.shares * 1.0 - (t.px*t.shares + t.px2*t.sh2) - entry_fees
                     } else if st.id=="S3E" && t.wsold {
                         let lr = if up_winning {t.sh2} else {t.shares};
                         let wr = if up_winning {t.shares} else {t.sh2};
-                        let lrec = lr * t.dump_px;
-                        let wrec = wr * t.wpx;
-                        lrec + wrec - STAKE_2 - entry_fees - fee(t.dump_px)*lr - fee(t.wpx)*wr
+                        lr*t.dump_px + wr*t.wpx - STAKE_2 - entry_fees - fee(t.dump_px)*lr - fee(t.wpx)*wr
                     } else if t.dumped {
                         let lr = if up_winning {t.sh2} else {t.shares};
                         let wr = if up_winning {t.shares} else {t.sh2};
-                        // Check reversal: did the side we dumped actually win?
                         let loser_was_right = (!up_winning && actual=="UP")||(up_winning && actual=="DOWN");
                         if loser_was_right {
-                            lr*t.dump_px - STAKE_2 - entry_fees - fee(t.dump_px)*lr // catastrophic
+                            lr*t.dump_px - STAKE_2 - entry_fees - fee(t.dump_px)*lr
                         } else {
                             lr*t.dump_px + wr*1.0 - STAKE_2 - entry_fees - fee(t.dump_px)*lr
                         }
                     } else {
-                        // S3a or undumped: straight settlement
                         t.shares*up_pay + t.sh2*dn_pay - STAKE_2 - entry_fees
                     };
 
@@ -782,8 +787,9 @@ mod tests {
     fn test_full_capital_trace() {
         println!("\n{}", "=".repeat(72));
         println!("  HYDRA CAPITAL TRACE — ALL 13 STRATEGIES (REALISTIC)");
-        println!("  Taker fills at real ask | Real bid for SL/dump | Fees on ALL fills");
-        println!("  START_CAP=${:.2}  STAKE_1=${:.2}  STAKE_2=${:.2}  SL={}%", START_CAP, STAKE_1, STAKE_2, SL_PCT*100.0);
+        println!("  Taker fills at real ask + latency | Real bid for SL/dump | Fees on ALL fills");
+        println!("  START_CAP=${:.2}  STAKE_1=${:.2}  STAKE_2=${:.2}  SL={}%  LATENCY={}tick  STALE={}s",
+            START_CAP, STAKE_1, STAKE_2, SL_PCT*100.0, LATENCY_TICKS, STALE_SECS);
         println!("{}\n", "=".repeat(72));
 
         // ────────────────────────────────────────────────────────────
@@ -1051,7 +1057,7 @@ mod tests {
 
         println!("\n{}", "=".repeat(72));
         println!("  ALL 13 STRATEGIES TRACED — REALISTIC CAPITAL MATH VERIFIED");
-        println!("  Entry fees on ALL fills | Real bids for exits | No fake FILL_PROB");
+        println!("  Entry fees on ALL fills | Real bids for exits | Latency model | Staleness guard");
         println!("{}", "=".repeat(72));
     }
 }
