@@ -1,16 +1,12 @@
 //! Hydra — 3-strategy both-sides paper tracker for Polymarket 5m markets
 //! S3b: Maker dump T-30 | S3C: Taker dump T-30 | S3D: Taker dump bid≤$0.10
 //!
-//! Failure points tracked:
-//!   1. THIN_BOOK  — no bid at entry → dump may get $0.01 or no fill
-//!   2. WIDE_SPREAD — spread >5% at entry → taker fill worse than modeled
-//!   3. STALE_DATA  — orderbook older than STALE_SECS → reject entirely
-//!   4. CL_CLOB_SPLIT — CL and CLOB disagree on winner at settlement
-//!   5. MAKER_FILL_RISK — S3b posts maker dump; may not fill if price moves away
-//!   6. EST_BID    — no real bid for loser at dump time, using CL-delta heuristic
-//!   7. CL_MISSING — no CL price at settlement, falling back to CLOB bids
+//! Terminal: clean one-liners only
+//! File log: hydra_trades.csv — full audit trail for post-analysis
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
@@ -19,22 +15,116 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 const ASSETS: &[&str] = &["btc", "eth", "sol", "xrp"];
-const STAKE_1: f64 = 5.0;   // per side
-const STAKE_2: f64 = 10.0;  // both sides total
+const STAKE_1: f64 = 5.0;
+const STAKE_2: f64 = 10.0;
 const START_CAP: f64 = 100.0;
-const LATENCY_TICKS: f64 = 0.001; // 1 Polymarket tick (~200ms network latency adverse movement)
-const STALE_SECS: u64 = 3;        // reject orderbook data older than this
-const SPREAD_WARN: f64 = 0.05;    // warn if spread > 5% of mid at entry
+const LATENCY_TICKS: f64 = 0.001;
+const STALE_SECS: u64 = 3;
+const SPREAD_WARN: f64 = 0.05;
 const RTDS_WS: &str = "wss://ws-live-data.polymarket.com";
 const BN_WS: &str = "wss://stream.binance.com:9443/ws";
 const GAMMA: &str = "https://gamma-api.polymarket.com";
 const CLOB: &str = "https://clob.polymarket.com";
+const LOG_FILE: &str = "hydra_trades.csv";
 
 fn fee(px: f64) -> f64 { px * (1.0 - px) * 0.0625 }
 
+// ── CSV trade log ──────────────────────────────────────────────────
+struct TradeLog { f: std::fs::File }
+impl TradeLog {
+    fn new() -> Self {
+        let exists = std::path::Path::new(LOG_FILE).exists();
+        let f = OpenOptions::new().create(true).append(true).open(LOG_FILE).expect("open log");
+        let mut tl = TradeLog { f };
+        if !exists {
+            tl.hdr();
+        }
+        tl
+    }
+    fn hdr(&mut self) {
+        let _ = writeln!(self.f, "ts,event,strategy,asset,slug,left_s,\
+            up_ask,up_bid,up_spread,up_age_ms,\
+            dn_ask,dn_bid,dn_spread,dn_age_ms,\
+            fill_up,fill_dn,cost_up,cost_dn,\
+            dump_side,dump_px,dump_bid,dump_bid_src,dump_rec,\
+            cl_open,cl_close,cl_delta_pct,\
+            settle_dir,settle_src,clob_up_bid,clob_dn_bid,\
+            entry_fees,dump_fee,\
+            pnl,cum_pnl,cap,w,l,flags");
+    }
+    fn entry(&mut self, id: &str, asset: &str, slug: &str, left: i64,
+             bu: &Bk, bd: &Bk, up_age: u64, dn_age: u64,
+             fill_up: f64, fill_dn: f64, flags: &str) {
+        let _ = writeln!(self.f, "{},ENTRY,{},{},{},{},\
+            {:.4},{:.4},{:.4},{},\
+            {:.4},{:.4},{:.4},{},\
+            {:.4},{:.4},{:.4},{:.4},\
+            ,,,,\
+            ,,,,,,\
+            ,,\
+            ,,,,,,{}",
+            Utc::now().to_rfc3339(), id, asset, slug, left,
+            bu.ba, if bu.hb {bu.bb} else {0.0}, bu.spread(), up_age,
+            bd.ba, if bd.hb {bd.bb} else {0.0}, bd.spread(), dn_age,
+            fill_up, fill_dn, fill_up*(STAKE_1/fill_up), fill_dn*(STAKE_1/fill_dn),
+            flags);
+        let _ = self.f.flush();
+    }
+    fn dump(&mut self, id: &str, asset: &str, slug: &str, left: i64,
+            dump_side: &str, dump_px: f64, dump_bid: f64, bid_src: &str,
+            dump_rec: f64, cl_open: f64, cl_now: f64, flags: &str) {
+        let cl_d = if cl_open > 0.0 { (cl_now-cl_open)/cl_open*100.0 } else { 0.0 };
+        let _ = writeln!(self.f, "{},DUMP,{},{},{},{},\
+            ,,,,\
+            ,,,,\
+            ,,,,\
+            {},{:.4},{:.4},{},{:.4},\
+            {:.2},{:.2},{:+.4},\
+            ,,,,\
+            ,,\
+            ,,,,,,{}",
+            Utc::now().to_rfc3339(), id, asset, slug, left,
+            dump_side, dump_px, dump_bid, bid_src, dump_rec,
+            cl_open, cl_now, cl_d,
+            flags);
+        let _ = self.f.flush();
+    }
+    #[allow(clippy::too_many_arguments, unused_variables)]
+    fn settle(&mut self, id: &str, asset: &str, slug: &str,
+              cl_open: f64, cl_close: f64,
+              settle_dir: &str, settle_src: &str,
+              clob_up: f64, clob_dn: f64,
+              entry_fees: f64, dump_fee: f64,
+              dumped: bool, dump_px: f64,
+              pnl: f64, cum_pnl: f64, cap: f64, w: u32, l: u32,
+              entry_left: i64, entry_up_spread: f64, entry_dn_spread: f64,
+              flags: &str) {
+        let cl_d = if cl_open > 0.0 { (cl_close-cl_open)/cl_open*100.0 } else { 0.0 };
+        let _ = writeln!(self.f, "{},SETTLE,{},{},{},0,\
+            ,,{:.4},,\
+            ,,{:.4},,\
+            ,,,,\
+            ,{:.4},,,\
+            {:.2},{:.2},{:+.4},\
+            {},{},{:.4},{:.4},\
+            {:.4},{:.4},\
+            {:+.4},{:+.4},{:.4},{},{},{}",
+            Utc::now().to_rfc3339(), id, asset, slug,
+            entry_up_spread,
+            entry_dn_spread,
+            if dumped {dump_px} else {0.0},
+            cl_open, cl_close, cl_d,
+            settle_dir, settle_src, clob_up, clob_dn,
+            entry_fees, dump_fee,
+            pnl, cum_pnl, cap, w, l, flags);
+        let _ = self.f.flush();
+    }
+}
+
+// ── State / Feeds ──────────────────────────────────────────────────
 type SS = Arc<RwLock<State>>;
 
 struct State {
@@ -76,14 +166,13 @@ fn bnsym(a: &str) -> &'static str {
 }
 
 async fn cl_feed(st: SS) { loop {
-    info!("[CL] Connecting..."); if let Err(e) = cl_ws(&st).await { error!("[CL] {}", e); }
+    if let Err(e) = cl_ws(&st).await { error!("[CL] {}", e); }
     tokio::time::sleep(Duration::from_secs(3)).await;
 }}
 async fn cl_ws(st: &SS) -> Result<()> {
     let (mut ws, _) = connect_async(RTDS_WS).await.context("CL")?;
     ws.send(Message::Text(json!({"action":"subscribe","subscriptions":[
         {"topic":"crypto_prices_chainlink","type":"*","filters":""}]}).to_string())).await?;
-    info!("[CL] OK");
     while let Some(msg) = ws.next().await { match msg {
         Ok(Message::Text(t)) => {
             let d: Value = match serde_json::from_str(&t) { Ok(d)=>d, _=>continue };
@@ -101,13 +190,12 @@ async fn cl_ws(st: &SS) -> Result<()> {
     Ok(())
 }
 async fn bn_feed(st: SS) { loop {
-    info!("[BN] Connecting..."); if let Err(e) = bn_ws(&st).await { error!("[BN] {}", e); }
+    if let Err(e) = bn_ws(&st).await { error!("[BN] {}", e); }
     tokio::time::sleep(Duration::from_secs(3)).await;
 }}
 async fn bn_ws(st: &SS) -> Result<()> {
     let streams: Vec<String> = ASSETS.iter().map(|a| format!("{}@aggTrade", bnsym(a))).collect();
     let (mut ws, _) = connect_async(format!("{}/{}", BN_WS, streams.join("/"))).await.context("BN")?;
-    info!("[BN] OK");
     while let Some(msg) = ws.next().await { match msg {
         Ok(Message::Text(t)) => {
             let d: Value = match serde_json::from_str(&t) { Ok(d)=>d, _=>continue };
@@ -124,6 +212,7 @@ async fn bn_ws(st: &SS) -> Result<()> {
     Ok(())
 }
 
+// ── Market scanning / Orderbook ────────────────────────────────────
 #[derive(Clone, Debug)]
 struct Win { slug: String, asset: &'static str, wmin: u32, tid_up: String, tid_down: String, start_ts: i64, end_ts: i64 }
 impl Win { fn left(&self) -> i64 { self.end_ts - Utc::now().timestamp() } }
@@ -136,7 +225,7 @@ impl Scan {
         let now = Utc::now().timestamp();
         let mut ws = Vec::new();
         for &a in ASSETS {
-            let wm = 5u32; // S3 strategies only use 5m markets
+            let wm = 5u32;
             let iv = wm as i64 * 60;
             let s0 = (now/iv)*iv;
             for st in [s0, s0+iv] {
@@ -204,6 +293,7 @@ impl BkC {
     }
 }
 
+// ── Position / Strategy ────────────────────────────────────────────
 #[derive(Clone)]
 #[allow(dead_code)]
 struct PT {
@@ -213,10 +303,9 @@ struct PT {
     end_ts: i64,
     dumped: bool, dump_px: f64,
     tid_up: String, tid_dn: String,
-    // Realism tracking
-    entry_up_bid: f64, entry_dn_bid: f64,  // bids at entry (for thin-book detection)
-    entry_up_spread: f64, entry_dn_spread: f64, // spreads at entry
-    entry_left: i64, // seconds left at entry
+    entry_up_bid: f64, entry_dn_bid: f64,
+    entry_up_spread: f64, entry_dn_spread: f64,
+    entry_left: i64,
 }
 
 struct Strat { id: &'static str, cap: f64, w: u32, l: u32, pnl: f64, active: HashMap<String,PT>, done: HashSet<String> }
@@ -226,14 +315,15 @@ impl Strat {
     fn t(&self) -> u32 { self.w+self.l }
 }
 
+// ── Hydra engine ───────────────────────────────────────────────────
 struct Hydra { st: SS, scan: Scan, bk: BkC, s: HashMap<&'static str, Strat>,
-    cl_o: HashMap<String,f64>, start: Instant }
+    cl_o: HashMap<String,f64>, start: Instant, log: TradeLog }
 
 impl Hydra {
     fn new(st: SS, scan: Scan, bk: BkC) -> Self {
         let mut s = HashMap::new();
         for id in ["S3b","S3C","S3D"] { s.insert(id, Strat::new(id)); }
-        Hydra { st, scan, bk, s, cl_o: HashMap::new(), start: Instant::now() }
+        Hydra { st, scan, bk, s, cl_o: HashMap::new(), start: Instant::now(), log: TradeLog::new() }
     }
 
     async fn tick(&mut self) {
@@ -275,28 +365,20 @@ impl Hydra {
             if !bu.ha||!bd.ha { continue; }
             if bu.ba<0.47||bu.ba>0.53||bd.ba<0.47||bd.ba>0.53 { continue; }
 
-            // ── Realism checks at entry ──
+            // Build flags for CSV (all realism warnings go here, not terminal)
+            let mut flags = Vec::new();
             let up_spread = bu.spread();
             let dn_spread = bd.spread();
             let up_mid = bu.mid();
             let dn_mid = bd.mid();
-            let up_spread_pct = if up_mid > 0.0 { up_spread / up_mid } else { 1.0 };
-            let dn_spread_pct = if dn_mid > 0.0 { dn_spread / dn_mid } else { 1.0 };
-
-            if up_spread_pct > SPREAD_WARN || dn_spread_pct > SPREAD_WARN {
-                warn!("[WIDE_SPREAD] {} T-{}s UP spread={:.3} ({:.1}%) DN spread={:.3} ({:.1}%)",
-                    w.asset.to_uppercase(), left,
-                    up_spread, up_spread_pct*100.0, dn_spread, dn_spread_pct*100.0);
-            }
-            if !bu.hb || bu.bb <= 0.0 {
-                warn!("[THIN_BOOK] {} UP no bid at entry — dump exit at risk", w.asset.to_uppercase());
-            }
-            if !bd.hb || bd.bb <= 0.0 {
-                warn!("[THIN_BOOK] {} DN no bid at entry — dump exit at risk", w.asset.to_uppercase());
-            }
+            if up_mid > 0.0 && up_spread / up_mid > SPREAD_WARN { flags.push("WIDE_SPREAD_UP"); }
+            if dn_mid > 0.0 && dn_spread / dn_mid > SPREAD_WARN { flags.push("WIDE_SPREAD_DN"); }
+            if !bu.hb || bu.bb <= 0.0 { flags.push("THIN_BOOK_UP"); }
+            if !bd.hb || bd.bb <= 0.0 { flags.push("THIN_BOOK_DN"); }
 
             let up_age = self.bk.age_ms(&w.tid_up);
             let dn_age = self.bk.age_ms(&w.tid_down);
+            let flag_str = flags.join("|");
 
             for id in ["S3b","S3C","S3D"] {
                 let st = self.s.get_mut(id).expect("s");
@@ -312,11 +394,12 @@ impl Hydra {
                     entry_up_spread: up_spread, entry_dn_spread: dn_spread,
                     entry_left: left });
                 st.done.insert(w.slug.clone());
-                info!("[{}] ENTRY {} T-{}s | UP ask={:.3} bid={:.3} spread={:.3} age={}ms | DN ask={:.3} bid={:.3} spread={:.3} age={}ms | cost=${:.2}+${:.2}",
-                    id, w.asset.to_uppercase(), left,
-                    bu.ba, if bu.hb {bu.bb} else {0.0}, up_spread, up_age,
-                    bd.ba, if bd.hb {bd.bb} else {0.0}, dn_spread, dn_age,
-                    up*ush, dn*dsh);
+
+                // CSV: full details
+                self.log.entry(id, w.asset, &w.slug, left, &bu, &bd, up_age, dn_age, up, dn, &flag_str);
+
+                // Terminal: clean one-liner
+                info!("[{}] ENTRY {} T-{}s  UP@{:.3} DN@{:.3}", id, w.asset.to_uppercase(), left, bu.ba, bd.ba);
             }
         }
     }
@@ -332,15 +415,12 @@ impl Hydra {
                 let t = match st.active.get(&slug) { Some(t)=>t.clone(), None=>continue };
                 let left = t.end_ts - now;
 
-                // All positions are both-sides (S3b/S3C/S3D)
                 let co = self.cl_o.get(&slug).copied().unwrap_or(0.0);
                 let cn = s.cl.get(t.asset).copied().unwrap_or(0.0);
                 if co<=0.0||cn<=0.0 { continue; }
                 let cl_d = ((cn-co)/co*100.0).abs();
-                let cl_dir_pct = (cn-co)/co*100.0;
                 let up_winning = cn >= co;
 
-                // Real orderbook bid for loser token
                 let loser_tid = if up_winning {&t.tid_dn} else {&t.tid_up};
                 let loser_bk = self.bk.get(loser_tid);
                 let loser_side = if up_winning {"DN"} else {"UP"};
@@ -351,39 +431,36 @@ impl Hydra {
                     (est, "EST")
                 };
 
-                if bid_source == "EST" {
-                    warn!("[EST_BID] {} {} loser bid estimated at {:.3} (CL Δ={:+.3}%) — no real bid available",
-                        st.id, t.asset.to_uppercase(), loser_bid, cl_dir_pct);
-                }
-
                 // S3b: MAKER dump at T-30
                 if st.id=="S3b" && !t.dumped && left<=30 {
-                    let dp = (loser_bid + 0.01).min(0.50).max(0.01); // maker: no latency
+                    let dp = (loser_bid + 0.01).min(0.50).max(0.01);
                     if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                     let ls = if up_winning {t.sh2} else {t.shares};
-                    warn!("[MAKER_FILL_RISK] {} posting maker dump at {:.3} — fill NOT guaranteed, loser {} bid={:.3} ({})",
-                        t.asset.to_uppercase(), dp, loser_side, loser_bid, bid_source);
-                    info!("[S3b] MAKER DUMP {} T-{}s | loser={} @{:.3} bid={:.3} ({}) | rec=${:.2} | CL Δ={:+.3}%",
-                        t.asset.to_uppercase(), left, loser_side, dp, loser_bid, bid_source, ls*dp, cl_dir_pct);
+                    let mut flags = vec!["MAKER_FILL_RISK"];
+                    if bid_source == "EST" { flags.push("EST_BID"); }
+                    self.log.dump("S3b", t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, &flags.join("|"));
+                    info!("[S3b] DUMP {} {} @{:.3}  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
                 }
                 // S3C: TAKER dump at T-30
                 if st.id=="S3C" && !t.dumped && left<=30 {
-                    let dp = (loser_bid - LATENCY_TICKS).max(0.01); // taker: latency adverse
+                    let dp = (loser_bid - LATENCY_TICKS).max(0.01);
                     if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                     let ls = if up_winning {t.sh2} else {t.shares};
-                    info!("[S3C] TAKER DUMP {} T-{}s | loser={} @bid${:.3}-lat=${:.3} ({}) | rec=${:.2} | CL Δ={:+.3}%",
-                        t.asset.to_uppercase(), left, loser_side, loser_bid, dp, bid_source, ls*dp, cl_dir_pct);
+                    let flags = if bid_source == "EST" { "EST_BID" } else { "" };
+                    self.log.dump("S3C", t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, flags);
+                    info!("[S3C] DUMP {} {} @{:.3}  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
                 }
                 // S3D: taker dump when loser bid ≤ 0.10
                 if st.id=="S3D" && !t.dumped && loser_bid<=0.10 {
-                    let dp = (loser_bid - LATENCY_TICKS).max(0.01); // taker: latency adverse
+                    let dp = (loser_bid - LATENCY_TICKS).max(0.01);
                     if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                     let ls = if up_winning {t.sh2} else {t.shares};
-                    info!("[S3D] TAKER DUMP {} T-{}s | loser={} bid={:.3}≤$0.10 → dump@${:.3} ({}) | rec=${:.2} | CL Δ={:+.3}%",
-                        t.asset.to_uppercase(), left, loser_side, loser_bid, dp, bid_source, ls*dp, cl_dir_pct);
+                    let flags = if bid_source == "EST" { "EST_BID" } else { "" };
+                    self.log.dump("S3D", t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, flags);
+                    info!("[S3D] DUMP {} {} @{:.3}  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
                 }
 
-                // Settle immediately at end_ts
+                // Settlement
                 if now >= t.end_ts {
                     let cc = s.cl_at(t.asset,t.end_ts,0)
                         .or_else(|| s.cl.get(t.asset).copied())
@@ -391,50 +468,65 @@ impl Hydra {
                     let up_bk = self.bk.get(&t.tid_up);
                     let dn_bk = self.bk.get(&t.tid_dn);
 
+                    let mut flags = Vec::new();
+
                     let (actual, settle_source) = if co > 0.0 && cc > 0.0 {
                         let cl_dir = if cc >= co {"UP"} else {"DOWN"};
-                        // Cross-check with CLOB
                         if up_bk.hb && dn_bk.hb {
                             let clob_dir = if up_bk.bb > dn_bk.bb {"UP"} else {"DOWN"};
-                            if clob_dir != cl_dir {
-                                warn!("[CL_CLOB_SPLIT] {} — CL says {} (open={:.2} close={:.2}) but CLOB bids UP={:.3} DN={:.3} say {}",
-                                    t.asset.to_uppercase(), cl_dir, co, cc, up_bk.bb, dn_bk.bb, clob_dir);
-                            }
+                            if clob_dir != cl_dir { flags.push("CL_CLOB_SPLIT"); }
                         }
                         (cl_dir, "CL")
                     } else if up_bk.hb && dn_bk.hb && (up_bk.bb > 0.80 || dn_bk.bb > 0.80) {
                         let dir = if up_bk.bb > dn_bk.bb {"UP"} else {"DOWN"};
-                        warn!("[CL_MISSING] {} — no CL price at settlement, CLOB fallback → {} (UP bid={:.3} DN bid={:.3})",
-                            t.asset.to_uppercase(), dir, up_bk.bb, dn_bk.bb);
+                        flags.push("CL_MISSING");
                         (dir, "CLOB_FALLBACK")
                     } else {
-                        warn!("[NO_DATA] {} — no CL, no CLOB at settlement — full loss", t.asset.to_uppercase());
-                        settles.push((st.id,slug.clone(),-STAKE_2)); continue;
+                        flags.push("NO_DATA");
+                        self.log.settle(st.id, t.asset, &slug, co, 0.0, "?", "NONE",
+                            0.0, 0.0, 0.0, 0.0, false, 0.0,
+                            -STAKE_2, st.pnl-STAKE_2, st.cap-STAKE_2, st.w, st.l+1,
+                            t.entry_left, t.entry_up_spread, t.entry_dn_spread, "NO_DATA");
+                        settles.push((st.id,slug.clone(),-STAKE_2));
+                        info!("[{}] LOSS {} -${:.2} (no data)", st.id, t.asset.to_uppercase(), STAKE_2);
+                        continue;
                     };
 
                     let entry_fees = fee(t.px)*t.shares + fee(t.px2)*t.sh2;
-                    let pnl = if t.dumped {
+                    let (pnl, dump_fee) = if t.dumped {
                         let lr = if up_winning {t.sh2} else {t.shares};
                         let wr = if up_winning {t.shares} else {t.sh2};
                         let loser_was_right = (!up_winning && actual=="UP")||(up_winning && actual=="DOWN");
+                        let df = fee(t.dump_px)*lr;
                         if loser_was_right {
-                            lr*t.dump_px - STAKE_2 - entry_fees - fee(t.dump_px)*lr
+                            flags.push("REVERSAL");
+                            (lr*t.dump_px - STAKE_2 - entry_fees - df, df)
                         } else {
-                            lr*t.dump_px + wr*1.0 - STAKE_2 - entry_fees - fee(t.dump_px)*lr
+                            (lr*t.dump_px + wr*1.0 - STAKE_2 - entry_fees - df, df)
                         }
                     } else {
+                        flags.push("NO_DUMP");
                         let (up_pay, dn_pay) = if actual=="UP" {(1.0,0.0)} else {(0.0,1.0)};
-                        t.shares*up_pay + t.sh2*dn_pay - STAKE_2 - entry_fees
+                        (t.shares*up_pay + t.sh2*dn_pay - STAKE_2 - entry_fees, 0.0)
                     };
 
                     let tag = if pnl>0.0 {"WIN"} else {"LOSS"};
-                    let settle_delta = if co > 0.0 && cc > 0.0 { (cc-co)/co*100.0 } else { 0.0 };
-                    info!("[{}] {} {} ${:+.2} (cum ${:+.2}) | settle={} ({}) CL open={:.2} close={:.2} Δ={:+.3}% | dumped={} dump_px={:.3} | entry_T-{}s up_spread={:.3} dn_spread={:.3} | CLOB UP bid={:.3} DN bid={:.3}",
-                        st.id, tag, t.asset.to_uppercase(), pnl, st.pnl+pnl,
-                        actual, settle_source, co, cc, settle_delta,
+                    let flag_str = flags.join("|");
+
+                    // CSV: full audit
+                    self.log.settle(st.id, t.asset, &slug, co, cc,
+                        actual, settle_source,
+                        if up_bk.hb {up_bk.bb} else {0.0}, if dn_bk.hb {dn_bk.bb} else {0.0},
+                        entry_fees, dump_fee,
                         t.dumped, t.dump_px,
+                        pnl, st.pnl+pnl, st.cap+pnl, st.w + if pnl>0.0{1}else{0}, st.l + if pnl<=0.0{1}else{0},
                         t.entry_left, t.entry_up_spread, t.entry_dn_spread,
-                        if up_bk.hb {up_bk.bb} else {0.0}, if dn_bk.hb {dn_bk.bb} else {0.0});
+                        &flag_str);
+
+                    // Terminal: clean one-liner
+                    info!("[{}] {} {} ${:+.2}  cum=${:+.2}  {}W/{}L",
+                        st.id, tag, t.asset.to_uppercase(), pnl, st.pnl+pnl,
+                        st.w + if pnl>0.0{1}else{0}, st.l + if pnl<=0.0{1}else{0});
                     settles.push((st.id, slug.clone(), pnl));
                 }
             }
@@ -449,7 +541,7 @@ impl Hydra {
         for id in ["S3b","S3C","S3D"] {
             if let Some(st) = self.s.get(id) {
                 if st.t()>0||!st.active.is_empty() {
-                    p.push(format!("{}:{}W/{}L${:+.1}({}a)", id, st.w, st.l, st.pnl, st.active.len()));
+                    p.push(format!("{}:{}W/{}L${:+.1}", id, st.w, st.l, st.pnl));
                 }
             }
         }
@@ -459,31 +551,24 @@ impl Hydra {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_env_filter("hydra=info,hydra=warn").with_target(false).init();
+    tracing_subscriber::fmt().with_env_filter("hydra=info").with_target(false).init();
     dotenvy::dotenv().ok();
-    info!("══════════════════════════════════════════════════════════");
-    info!("  HYDRA — 3-Strategy Both-Sides Paper Tracker");
-    info!("  S3b: Maker dump T-30 | S3C: Taker dump T-30");
-    info!("  S3D: Taker dump bid≤$0.10");
-    info!("  ${}/{} stake | ${}/strat | LATENCY={}tick | STALE={}s",
-        STAKE_1, STAKE_2, START_CAP, LATENCY_TICKS, STALE_SECS);
-    info!("  Realism: spread warn >{}% | stale reject >{}s | CL/CLOB cross-check",
-        SPREAD_WARN*100.0, STALE_SECS);
-    info!("══════════════════════════════════════════════════════════");
+    info!("HYDRA — S3b/S3C/S3D | ${}/{} stake | log → {}", STAKE_1, STAKE_2, LOG_FILE);
 
     let st: SS = Arc::new(RwLock::new(State::new()));
     let c = st.clone(); tokio::spawn(async move { cl_feed(c).await; });
     let b = st.clone(); tokio::spawn(async move { bn_feed(b).await; });
 
-    info!("[BOOT] Waiting for feeds...");
     for _ in 0..20 { tokio::time::sleep(Duration::from_secs(1)).await;
         let s = st.read().await; if s.cl.contains_key("btc")&&s.bn.contains_key("btc") { break; } }
-    { let s = st.read().await; for &a in ASSETS {
-        info!("  {}: CL=${:.2} BN=${:.2}", a.to_uppercase(), s.cl.get(a).copied().unwrap_or(0.0), s.bn.get(a).copied().unwrap_or(0.0));
-    }}
+    { let s = st.read().await;
+      let px: Vec<String> = ASSETS.iter().filter_map(|&a|{
+          s.cl.get(a).map(|p| format!("{}=${:.0}", a.to_uppercase(), p))
+      }).collect();
+      info!("Feeds OK: {}", px.join(" "));
+    }
 
     let mut hydra = Hydra::new(st.clone(), Scan::new(), BkC::new());
-    info!("[BOOT] Running...");
     let mut ls = Instant::now();
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -491,11 +576,9 @@ async fn main() -> Result<()> {
         if ls.elapsed().as_secs() >= 60 {
             let s = st.read().await;
             let px: Vec<String> = ASSETS.iter().filter_map(|&a|{
-                let cl = s.cl.get(a).copied().unwrap_or(0.0);
-                let bn = s.bn.get(a).copied().unwrap_or(0.0);
-                if cl > 0.0 { Some(format!("{}=${:.0}/BN${:.0}", a.to_uppercase(), cl, bn)) } else { None }
+                s.cl.get(a).map(|p| format!("{}=${:.0}", a.to_uppercase(), p))
             }).collect();
-            info!("─── {} | {:.1}h | {} ───", px.join(" "), hydra.start.elapsed().as_secs_f64()/3600.0, hydra.status());
+            info!("{} | {:.1}h | {}", px.join(" "), hydra.start.elapsed().as_secs_f64()/3600.0, hydra.status());
             ls = Instant::now();
         }
     }
@@ -537,9 +620,8 @@ mod tests {
         let ush = STAKE_1 / up_px;
         let dsh = STAKE_1 / dn_px;
         let entry_fees = fee(up_px) * ush + fee(dn_px) * dsh;
-        let dump_px = 0.06; // maker: bid(0.05)+0.01
-        let lr = dsh;
-        let wr = ush;
+        let dump_px = 0.06;
+        let lr = dsh; let wr = ush;
         let pnl = lr * dump_px + wr * 1.0 - STAKE_2 - entry_fees - fee(dump_px) * lr;
         st.rec(pnl > 0.0, pnl);
         assert_close(st.cap, cap0 + pnl, "S3b maker dumped cap");
@@ -550,20 +632,14 @@ mod tests {
     fn test_both_sides_taker_dump_normal() {
         let mut st = Strat::new("S3C");
         let cap0 = st.cap;
-        let up_px = 0.50;
-        let dn_px = 0.50;
-        let ush = STAKE_1 / up_px;
-        let dsh = STAKE_1 / dn_px;
-        let entry_fees = fee(up_px) * ush + fee(dn_px) * dsh;
-        let dump_px = 0.05; // taker: hit bid directly
-        let lr = dsh;
-        let wr = ush;
-        let pnl = lr * dump_px + wr * 1.0 - STAKE_2 - entry_fees - fee(dump_px) * lr;
+        let px = 0.50;
+        let sh = STAKE_1 / px;
+        let entry_fees = fee(px) * sh * 2.0;
+        let dump_px = 0.05;
+        let pnl = sh * dump_px + sh * 1.0 - STAKE_2 - entry_fees - fee(dump_px) * sh;
         st.rec(pnl > 0.0, pnl);
         assert_close(st.cap, cap0 + pnl, "S3C taker dumped cap");
-        // S3C must get worse fill than S3b maker
-        let s3b_dp = 0.06;
-        let s3b_pnl = lr * s3b_dp + wr * 1.0 - STAKE_2 - entry_fees - fee(s3b_dp) * lr;
+        let s3b_pnl = sh * 0.06 + sh * 1.0 - STAKE_2 - entry_fees - fee(0.06) * sh;
         assert!(pnl < s3b_pnl, "S3C taker must get worse PnL than S3b maker");
     }
 
@@ -575,7 +651,6 @@ mod tests {
         let sh = STAKE_1 / px;
         let entry_fees = fee(px) * sh * 2.0;
         let dump_px = 0.06;
-        // Reversal: dumped side was right, held side worthless
         let pnl = sh * dump_px - STAKE_2 - entry_fees - fee(dump_px) * sh;
         st.rec(false, pnl);
         assert_close(st.cap, cap0 + pnl, "S3b reversal cap");
@@ -584,79 +659,51 @@ mod tests {
 
     #[test]
     fn test_no_dump_settle() {
-        // S3D: if bid never drops to 0.10, position settles without dump
         let mut st = Strat::new("S3D");
         let cap0 = st.cap;
         let px = 0.50;
         let sh = STAKE_1 / px;
         let entry_fees = fee(px) * sh * 2.0;
-        // Winner settles at $1, loser at $0
         let pnl = sh * 1.0 + sh * 0.0 - STAKE_2 - entry_fees;
         st.rec(pnl > 0.0, pnl);
         assert_close(st.cap, cap0 + pnl, "S3D no-dump settle cap");
-        // Without dump, only winner payout matters
         assert!(pnl < sh * 0.06 + sh * 1.0 - STAKE_2 - entry_fees - fee(0.06)*sh,
             "no-dump loses loser recovery compared to dumped");
     }
 
     #[test]
-    fn test_full_capital_trace() {
-        println!("\n{}", "=".repeat(72));
-        println!("  HYDRA CAPITAL TRACE — 3 STRATEGIES (S3b/S3C/S3D)");
-        println!("  Both-sides entry at taker ask + latency");
-        println!("  STAKE_1=${:.2}/side  STAKE_2=${:.2}/total  LATENCY={}tick",
-            STAKE_1, STAKE_2, LATENCY_TICKS);
-        println!("{}\n", "=".repeat(72));
+    fn test_csv_header() {
+        let path = "/tmp/hydra_test_log.csv";
+        let _ = std::fs::remove_file(path);
+        {
+            let f = OpenOptions::new().create(true).append(true).open(path).unwrap();
+            let mut tl = TradeLog { f };
+            tl.hdr();
+        }
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(content.starts_with("ts,event,strategy,"), "CSV header must start with ts,event,strategy");
+        assert!(content.contains("flags"), "CSV header must contain flags column");
+        let _ = std::fs::remove_file(path);
+    }
 
+    #[test]
+    fn test_full_capital_trace() {
+        println!("\n  HYDRA — 3 strategies, both-sides, all PnL paths");
         let bpx = 0.50;
         let bsh = STAKE_1 / bpx;
         let bef = fee(bpx) * bsh * 2.0;
 
-        for &(id, dp_label, dp) in &[
-            ("S3b", "MAKER T-30 bid+0.01", 0.06_f64),
-            ("S3C", "TAKER T-30 at bid",   0.05),
-            ("S3D", "TAKER dump bid≤$0.10", 0.10),
-        ] {
+        for &(id, dp) in &[("S3b", 0.06_f64), ("S3C", 0.05), ("S3D", 0.10)] {
             let dfee = fee(dp) * bsh;
-
             let mut st = Strat::new(id);
-            // Trade 1: normal (winner settles $1, loser dumped)
-            let pnl_ok = bsh * dp + bsh * 1.0 - STAKE_2 - bef - dfee;
-            st.rec(pnl_ok > 0.0, pnl_ok);
-            println!("\n  [{} NORMAL] {} sh/side @${:.3}, {} @${:.3}", id, bsh, bpx, dp_label, dp);
-            println!("    PnL: ${:+.4}  Cap=${:.4}", pnl_ok, st.cap);
-            assert_close(st.cap, START_CAP + pnl_ok, &format!("{} normal", id));
-
-            // Trade 2: reversal (dumped side was right)
-            let pnl_rev = bsh * dp - STAKE_2 - bef - dfee;
-            st.rec(false, pnl_rev);
-            println!("  [{} REVERSAL] PnL=${:+.4}  Cap=${:.4}", id, pnl_rev, st.cap);
-            assert_close(st.cap, START_CAP + pnl_ok + pnl_rev, &format!("{} reversal", id));
-
-            // Trade 3: no dump (S3D scenario — bid never ≤ 0.10)
-            let pnl_nodump = bsh * 1.0 - STAKE_2 - bef;
-            st.rec(pnl_nodump > 0.0, pnl_nodump);
-            println!("  [{} NO-DUMP] winner settles $1 PnL=${:+.4}  Cap=${:.4}", id, pnl_nodump, st.cap);
-            assert_close(st.cap, START_CAP + pnl_ok + pnl_rev + pnl_nodump, &format!("{} 3-trade", id));
-            println!("  [{} DONE] {}W/{}L  cumPnL=${:+.4}", id, st.w, st.l, st.pnl);
+            let p1 = bsh * dp + bsh * 1.0 - STAKE_2 - bef - dfee;
+            st.rec(p1 > 0.0, p1);
+            let p2 = bsh * dp - STAKE_2 - bef - dfee; // reversal
+            st.rec(false, p2);
+            let p3 = bsh * 1.0 - STAKE_2 - bef; // no dump
+            st.rec(p3 > 0.0, p3);
+            assert_close(st.cap, START_CAP + p1 + p2 + p3, &format!("{} 3-trade", id));
+            println!("  {} | {}W/{}L | PnL=${:+.4} | Cap=${:.2}", id, st.w, st.l, st.pnl, st.cap);
         }
-
-        // Verify ordering: S3b > S3C > S3D dump recovery
-        let s3b_dp = 0.06; let s3c_dp = 0.05; let s3d_dp = 0.10;
-        let s3b_rec = bsh * s3b_dp; let s3c_rec = bsh * s3c_dp;
-        println!("\n  S3b maker dump rec=${:.4} > S3C taker rec=${:.4}", s3b_rec, s3c_rec);
-        assert!(s3b_rec > s3c_rec, "maker must beat taker on dump recovery");
-        println!("  S3D dumps at bid≤$0.10 → max dump_px=${:.2} (higher recovery, later timing)", s3d_dp);
-
-        println!("\n{}", "=".repeat(72));
-        println!("  3 STRATEGIES TRACED — FAILURE POINTS:");
-        println!("  1. THIN_BOOK: no bid at entry → dump gets $0.01");
-        println!("  2. WIDE_SPREAD: >5% spread → taker fill worse than model");
-        println!("  3. STALE_DATA: book >3s old → rejected (no phantom fills)");
-        println!("  4. CL_CLOB_SPLIT: CL vs CLOB disagree → logged, CL wins");
-        println!("  5. MAKER_FILL_RISK: S3b maker order may not fill");
-        println!("  6. EST_BID: no real bid → heuristic estimate (logged)");
-        println!("  7. CL_MISSING: no CL at settle → CLOB fallback (logged)");
-        println!("{}", "=".repeat(72));
     }
 }
