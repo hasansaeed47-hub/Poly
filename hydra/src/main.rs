@@ -33,21 +33,23 @@ const LOG_FILE: &str = "hydra_trades.csv";
 fn fee(px: f64) -> f64 { px * (1.0 - px) * 0.0625 }
 
 // ── CSV trade log ──────────────────────────────────────────────────
-struct TradeLog { f: std::fs::File }
+struct TradeLog { f: std::fs::File, run_id: String }
 impl TradeLog {
     fn new() -> Self {
+        let run_id = format!("R{}", Utc::now().format("%m%d_%H%M%S"));
         let exists = std::path::Path::new(LOG_FILE).exists();
         let f = OpenOptions::new().create(true).append(true).open(LOG_FILE).expect("open log");
-        let mut tl = TradeLog { f };
+        let mut tl = TradeLog { f, run_id };
         if !exists {
             tl.hdr();
         }
         tl
     }
     fn hdr(&mut self) {
-        let _ = writeln!(self.f, "ts,event,strategy,asset,slug,left_s,\
-            up_ask,up_bid,up_spread,up_age_ms,\
-            dn_ask,dn_bid,dn_spread,dn_age_ms,\
+        let _ = writeln!(self.f, "ts,run_id,event,strategy,asset,slug,left_s,\
+            bn_px,\
+            up_ask,up_bid,up_spread,up_bid_sz,up_ask_sz,up_n_bids,up_n_asks,up_age_ms,\
+            dn_ask,dn_bid,dn_spread,dn_bid_sz,dn_ask_sz,dn_n_bids,dn_n_asks,dn_age_ms,\
             fill_up,fill_dn,cost_up,cost_dn,\
             dump_side,dump_px,dump_bid,dump_bid_src,dump_rec,\
             cl_open,cl_close,cl_delta_pct,\
@@ -57,36 +59,42 @@ impl TradeLog {
     }
     fn entry(&mut self, id: &str, asset: &str, slug: &str, left: i64,
              bu: &Bk, bd: &Bk, up_age: u64, dn_age: u64,
-             fill_up: f64, fill_dn: f64, flags: &str) {
-        let _ = writeln!(self.f, "{},ENTRY,{},{},{},{},\
-            {:.4},{:.4},{:.4},{},\
-            {:.4},{:.4},{:.4},{},\
+             fill_up: f64, fill_dn: f64, bn_px: f64, flags: &str) {
+        let _ = writeln!(self.f, "{},{},ENTRY,{},{},{},{},\
+            {:.2},\
+            {:.4},{:.4},{:.4},{:.1},{:.1},{},{},{},\
+            {:.4},{:.4},{:.4},{:.1},{:.1},{},{},{},\
             {:.4},{:.4},{:.4},{:.4},\
             ,,,,\
             ,,,,,,\
             ,,\
             ,,,,,,{}",
-            Utc::now().to_rfc3339(), id, asset, slug, left,
-            bu.ba, if bu.hb {bu.bb} else {0.0}, bu.spread(), up_age,
-            bd.ba, if bd.hb {bd.bb} else {0.0}, bd.spread(), dn_age,
+            Utc::now().to_rfc3339(), self.run_id, id, asset, slug, left,
+            bn_px,
+            bu.ba, if bu.hb {bu.bb} else {0.0}, bu.spread(), bu.bid_sz, bu.ask_sz, bu.n_bids, bu.n_asks, up_age,
+            bd.ba, if bd.hb {bd.bb} else {0.0}, bd.spread(), bd.bid_sz, bd.ask_sz, bd.n_bids, bd.n_asks, dn_age,
             fill_up, fill_dn, fill_up*(STAKE_1/fill_up), fill_dn*(STAKE_1/fill_dn),
             flags);
         let _ = self.f.flush();
     }
     fn dump(&mut self, id: &str, asset: &str, slug: &str, left: i64,
             dump_side: &str, dump_px: f64, dump_bid: f64, bid_src: &str,
-            dump_rec: f64, cl_open: f64, cl_now: f64, flags: &str) {
+            dump_rec: f64, cl_open: f64, cl_now: f64, bn_px: f64,
+            loser_bk: &Bk, flags: &str) {
         let cl_d = if cl_open > 0.0 { (cl_now-cl_open)/cl_open*100.0 } else { 0.0 };
-        let _ = writeln!(self.f, "{},DUMP,{},{},{},{},\
-            ,,,,\
-            ,,,,\
+        let _ = writeln!(self.f, "{},{},DUMP,{},{},{},{},\
+            {:.2},\
+            ,,,,,,,,\
+            ,,,,{:.1},,{},{},\
             ,,,,\
             {},{:.4},{:.4},{},{:.4},\
             {:.2},{:.2},{:+.4},\
             ,,,,\
             ,,\
             ,,,,,,{}",
-            Utc::now().to_rfc3339(), id, asset, slug, left,
+            Utc::now().to_rfc3339(), self.run_id, id, asset, slug, left,
+            bn_px,
+            loser_bk.bid_sz, loser_bk.n_bids, loser_bk.n_asks,
             dump_side, dump_px, dump_bid, bid_src, dump_rec,
             cl_open, cl_now, cl_d,
             flags);
@@ -101,18 +109,20 @@ impl TradeLog {
               dumped: bool, dump_px: f64,
               pnl: f64, cum_pnl: f64, cap: f64, w: u32, l: u32,
               entry_left: i64, entry_up_spread: f64, entry_dn_spread: f64,
-              flags: &str) {
+              bn_px: f64, flags: &str) {
         let cl_d = if cl_open > 0.0 { (cl_close-cl_open)/cl_open*100.0 } else { 0.0 };
-        let _ = writeln!(self.f, "{},SETTLE,{},{},{},0,\
-            ,,{:.4},,\
-            ,,{:.4},,\
+        let _ = writeln!(self.f, "{},{},SETTLE,{},{},{},0,\
+            {:.2},\
+            ,,{:.4},,,,,,\
+            ,,{:.4},,,,,,\
             ,,,,\
             ,{:.4},,,\
             {:.2},{:.2},{:+.4},\
             {},{},{:.4},{:.4},\
             {:.4},{:.4},\
             {:+.4},{:+.4},{:.4},{},{},{}",
-            Utc::now().to_rfc3339(), id, asset, slug,
+            Utc::now().to_rfc3339(), self.run_id, id, asset, slug,
+            bn_px,
             entry_up_spread,
             entry_dn_spread,
             if dumped {dump_px} else {0.0},
@@ -249,7 +259,8 @@ impl Scan {
 }
 
 #[derive(Clone,Default,Debug)]
-struct Bk { bb: f64, ba: f64, ha: bool, hb: bool }
+struct Bk { bb: f64, ba: f64, ha: bool, hb: bool,
+    bid_sz: f64, ask_sz: f64, n_bids: u32, n_asks: u32 }
 impl Bk {
     fn spread(&self) -> f64 { if self.ha && self.hb && self.ba > 0.0 { self.ba - self.bb } else { 999.0 } }
     fn mid(&self) -> f64 { if self.ha && self.hb { (self.ba + self.bb) / 2.0 } else { 0.0 } }
@@ -279,14 +290,24 @@ impl BkC {
             if tid.is_empty() { continue; }
             let mut bk = Bk::default();
             if let Some(bids) = item.get("bids").and_then(|b|b.as_array()) {
-                let mut p: Vec<f64> = bids.iter().filter_map(|b|b.get("price").and_then(|p|p.as_str().and_then(|s|s.parse().ok()))).collect();
-                p.sort_by(|a,b|b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                if let Some(&v) = p.first() { bk.bb=v; bk.hb=true; }
+                bk.n_bids = bids.len() as u32;
+                let mut p: Vec<(f64,f64)> = bids.iter().filter_map(|b|{
+                    let px = b.get("price").and_then(|p|p.as_str().and_then(|s|s.parse().ok()))?;
+                    let sz = b.get("size").and_then(|s|s.as_str().and_then(|s|s.parse().ok())).unwrap_or(0.0);
+                    Some((px,sz))
+                }).collect();
+                p.sort_by(|a,b|b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some(&(v,sz)) = p.first() { bk.bb=v; bk.hb=true; bk.bid_sz=sz; }
             }
             if let Some(asks) = item.get("asks").and_then(|a|a.as_array()) {
-                let mut p: Vec<f64> = asks.iter().filter_map(|a|a.get("price").and_then(|p|p.as_str().and_then(|s|s.parse().ok()))).collect();
-                p.sort_by(|a,b|a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                if let Some(&v) = p.first() { bk.ba=v; bk.ha=true; }
+                bk.n_asks = asks.len() as u32;
+                let mut p: Vec<(f64,f64)> = asks.iter().filter_map(|a|{
+                    let px = a.get("price").and_then(|p|p.as_str().and_then(|s|s.parse().ok()))?;
+                    let sz = a.get("size").and_then(|s|s.as_str().and_then(|s|s.parse().ok())).unwrap_or(0.0);
+                    Some((px,sz))
+                }).collect();
+                p.sort_by(|a,b|a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some(&(v,sz)) = p.first() { bk.ba=v; bk.ha=true; bk.ask_sz=sz; }
             }
             self.c.insert(tid.clone(), bk); self.t.insert(tid, now);
         }
@@ -358,6 +379,10 @@ impl Hydra {
     }
 
     async fn eval_s3(&mut self, wins: &[Win]) {
+        let bn_snap: HashMap<&str, f64> = {
+            let s = self.st.read().await;
+            ASSETS.iter().filter_map(|&a| s.bn.get(a).map(|&p| (a, p))).collect()
+        };
         for w in wins {
             if w.wmin!=5 { continue; }
             let left = w.left(); if left>290||left<60 { continue; }
@@ -365,7 +390,6 @@ impl Hydra {
             if !bu.ha||!bd.ha { continue; }
             if bu.ba<0.47||bu.ba>0.53||bd.ba<0.47||bd.ba>0.53 { continue; }
 
-            // Build flags for CSV (all realism warnings go here, not terminal)
             let mut flags = Vec::new();
             let up_spread = bu.spread();
             let dn_spread = bd.spread();
@@ -378,6 +402,7 @@ impl Hydra {
 
             let up_age = self.bk.age_ms(&w.tid_up);
             let dn_age = self.bk.age_ms(&w.tid_down);
+            let bn_px = bn_snap.get(w.asset).copied().unwrap_or(0.0);
             let flag_str = flags.join("|");
 
             for id in ["S3b","S3C","S3D"] {
@@ -395,10 +420,7 @@ impl Hydra {
                     entry_left: left });
                 st.done.insert(w.slug.clone());
 
-                // CSV: full details
-                self.log.entry(id, w.asset, &w.slug, left, &bu, &bd, up_age, dn_age, up, dn, &flag_str);
-
-                // Terminal: clean one-liner
+                self.log.entry(id, w.asset, &w.slug, left, &bu, &bd, up_age, dn_age, up, dn, bn_px, &flag_str);
                 info!("[{}] ENTRY {} T-{}s  UP@{:.3} DN@{:.3}", id, w.asset.to_uppercase(), left, bu.ba, bd.ba);
             }
         }
@@ -414,6 +436,7 @@ impl Hydra {
             for slug in slugs {
                 let t = match st.active.get(&slug) { Some(t)=>t.clone(), None=>continue };
                 let left = t.end_ts - now;
+                let bn_px = s.bn.get(t.asset).copied().unwrap_or(0.0);
 
                 let co = self.cl_o.get(&slug).copied().unwrap_or(0.0);
                 let cn = s.cl.get(t.asset).copied().unwrap_or(0.0);
@@ -438,7 +461,7 @@ impl Hydra {
                     let ls = if up_winning {t.sh2} else {t.shares};
                     let mut flags = vec!["MAKER_FILL_RISK"];
                     if bid_source == "EST" { flags.push("EST_BID"); }
-                    self.log.dump("S3b", t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, &flags.join("|"));
+                    self.log.dump("S3b", t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, bn_px, &loser_bk, &flags.join("|"));
                     info!("[S3b] DUMP {} {} @{:.3}  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
                 }
                 // S3C: TAKER dump at T-30
@@ -447,7 +470,7 @@ impl Hydra {
                     if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                     let ls = if up_winning {t.sh2} else {t.shares};
                     let flags = if bid_source == "EST" { "EST_BID" } else { "" };
-                    self.log.dump("S3C", t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, flags);
+                    self.log.dump("S3C", t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, bn_px, &loser_bk, flags);
                     info!("[S3C] DUMP {} {} @{:.3}  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
                 }
                 // S3D: taker dump when loser bid ≤ 0.10
@@ -456,7 +479,7 @@ impl Hydra {
                     if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                     let ls = if up_winning {t.sh2} else {t.shares};
                     let flags = if bid_source == "EST" { "EST_BID" } else { "" };
-                    self.log.dump("S3D", t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, flags);
+                    self.log.dump("S3D", t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, bn_px, &loser_bk, flags);
                     info!("[S3D] DUMP {} {} @{:.3}  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
                 }
 
@@ -486,7 +509,7 @@ impl Hydra {
                         self.log.settle(st.id, t.asset, &slug, co, 0.0, "?", "NONE",
                             0.0, 0.0, 0.0, 0.0, false, 0.0,
                             -STAKE_2, st.pnl-STAKE_2, st.cap-STAKE_2, st.w, st.l+1,
-                            t.entry_left, t.entry_up_spread, t.entry_dn_spread, "NO_DATA");
+                            t.entry_left, t.entry_up_spread, t.entry_dn_spread, bn_px, "NO_DATA");
                         settles.push((st.id,slug.clone(),-STAKE_2));
                         info!("[{}] LOSS {} -${:.2} (no data)", st.id, t.asset.to_uppercase(), STAKE_2);
                         continue;
@@ -513,7 +536,6 @@ impl Hydra {
                     let tag = if pnl>0.0 {"WIN"} else {"LOSS"};
                     let flag_str = flags.join("|");
 
-                    // CSV: full audit
                     self.log.settle(st.id, t.asset, &slug, co, cc,
                         actual, settle_source,
                         if up_bk.hb {up_bk.bb} else {0.0}, if dn_bk.hb {dn_bk.bb} else {0.0},
@@ -521,9 +543,8 @@ impl Hydra {
                         t.dumped, t.dump_px,
                         pnl, st.pnl+pnl, st.cap+pnl, st.w + if pnl>0.0{1}else{0}, st.l + if pnl<=0.0{1}else{0},
                         t.entry_left, t.entry_up_spread, t.entry_dn_spread,
-                        &flag_str);
+                        bn_px, &flag_str);
 
-                    // Terminal: clean one-liner
                     info!("[{}] {} {} ${:+.2}  cum=${:+.2}  {}W/{}L",
                         st.id, tag, t.asset.to_uppercase(), pnl, st.pnl+pnl,
                         st.w + if pnl>0.0{1}else{0}, st.l + if pnl<=0.0{1}else{0});
@@ -602,12 +623,12 @@ mod tests {
 
     #[test]
     fn test_spread_detection() {
-        let bk = Bk { bb: 0.45, ba: 0.55, ha: true, hb: true };
+        let bk = Bk { bb: 0.45, ba: 0.55, ha: true, hb: true, ..Default::default() };
         assert_close(bk.spread(), 0.10, "spread");
         assert_close(bk.mid(), 0.50, "mid");
         assert!(bk.spread() / bk.mid() > SPREAD_WARN, "10%/50% spread must trigger warning");
 
-        let thin = Bk { bb: 0.0, ba: 0.50, ha: true, hb: false };
+        let thin = Bk { bb: 0.0, ba: 0.50, ha: true, hb: false, ..Default::default() };
         assert!(thin.spread() > 100.0, "no bid = infinite spread");
     }
 
@@ -677,11 +698,13 @@ mod tests {
         let _ = std::fs::remove_file(path);
         {
             let f = OpenOptions::new().create(true).append(true).open(path).unwrap();
-            let mut tl = TradeLog { f };
+            let mut tl = TradeLog { f, run_id: "TEST".into() };
             tl.hdr();
         }
         let content = std::fs::read_to_string(path).unwrap();
-        assert!(content.starts_with("ts,event,strategy,"), "CSV header must start with ts,event,strategy");
+        assert!(content.starts_with("ts,run_id,event,"), "CSV header must start with ts,run_id,event");
+        assert!(content.contains("bn_px"), "CSV header must contain bn_px column");
+        assert!(content.contains("up_bid_sz"), "CSV header must contain depth columns");
         assert!(content.contains("flags"), "CSV header must contain flags column");
         let _ = std::fs::remove_file(path);
     }
