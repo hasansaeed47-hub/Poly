@@ -344,15 +344,15 @@ impl Hydra {
 
     async fn tick(&mut self) {
         let wins = self.scan.get().await;
-        let mut tids: Vec<String> = Vec::new();
-        for w in &wins { if w.left()>0 && w.left()<300 { tids.push(w.tid_up.clone()); tids.push(w.tid_down.clone()); } }
+        let mut tid_set: HashSet<String> = HashSet::new();
+        for w in &wins { if w.left()>0 && w.left()<300 { tid_set.insert(w.tid_up.clone()); tid_set.insert(w.tid_down.clone()); } }
         for st in self.s.values() {
             for t in st.active.values() {
-                tids.push(t.tid_up.clone());
-                tids.push(t.tid_dn.clone());
+                tid_set.insert(t.tid_up.clone());
+                tid_set.insert(t.tid_dn.clone());
             }
         }
-        tids.sort(); tids.dedup();
+        let tids: Vec<String> = tid_set.into_iter().collect();
         if !tids.is_empty() { self.bk.refresh(&tids).await; }
 
         { let s = self.st.read().await;
