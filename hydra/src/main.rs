@@ -21,7 +21,8 @@ const ASSETS: &[&str] = &["btc", "eth", "sol", "xrp"];
 const STAKE_1: f64 = 5.0;
 const STAKE_2: f64 = 10.0;
 const START_CAP: f64 = 100.0;
-const LATENCY_TICKS: f64 = 0.001;
+const LATENCY_TICKS: f64 = 0.003;   // realistic REST API round-trip ~200ms = 2-3 ticks
+const MIN_FILL_SZ: f64 = 5.0;       // min top-of-book $size to absorb our order
 const STALE_SECS: u64 = 3;
 const SPREAD_WARN: f64 = 0.05;
 const RTDS_WS: &str = "wss://ws-live-data.polymarket.com";
@@ -385,6 +386,14 @@ impl Hydra {
             if !bu.ha||!bd.ha { continue; }
             if bu.ba<0.47||bu.ba>0.53||bd.ba<0.47||bd.ba>0.53 { continue; }
 
+            // Size gate: top-of-book must absorb our order
+            let up_shares = STAKE_1 / bu.ba;
+            let dn_shares = STAKE_1 / bd.ba;
+            if bu.ask_sz > 0.0 && bu.ask_sz < up_shares { continue; }
+            if bd.ask_sz > 0.0 && bd.ask_sz < dn_shares { continue; }
+            if bu.ask_sz > 0.0 && bu.ask_sz < MIN_FILL_SZ { continue; }
+            if bd.ask_sz > 0.0 && bd.ask_sz < MIN_FILL_SZ { continue; }
+
             let mut flags = Vec::new();
             let up_spread = bu.spread();
             let dn_spread = bd.spread();
@@ -463,10 +472,15 @@ impl Hydra {
                             self.log.dump(st.id, t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, bn_px, &loser_bk, flags);
                             info!("[S3] DUMP {} {} @{:.3} MAKER  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
                         } else if left<=27 {
-                            let dp = (loser_bid - LATENCY_TICKS).max(0.01);
+                            // Depth-adjusted taker: penalize if bid_sz can't absorb our dump
+                            let depth_penalty = if loser_bk.bid_sz > 0.0 && loser_bk.bid_sz < ls {
+                                0.01 // walk the book ~1 tick when thin
+                            } else { 0.0 };
+                            let dp = (loser_bid - LATENCY_TICKS - depth_penalty).max(0.01);
                             if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                             let mut fv = vec!["TAKER_FORCE"];
                             if bid_source=="EST" { fv.push("EST_BID"); }
+                            if depth_penalty > 0.0 { fv.push("THIN_DUMP"); }
                             self.log.dump(st.id, t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, bn_px, &loser_bk, &fv.join("|"));
                             info!("[S3] DUMP {} {} @{:.3} TAKER  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
                         } else {
@@ -481,10 +495,14 @@ impl Hydra {
                             info!("[S3] MAKER {} {} @{:.3}  T-{}s", t.asset.to_uppercase(), loser_side, mpx, left);
                         } else {
                             // Missed chase window — go straight to taker
-                            let dp = (loser_bid - LATENCY_TICKS).max(0.01);
+                            let depth_penalty = if loser_bk.bid_sz > 0.0 && loser_bk.bid_sz < ls {
+                                0.01
+                            } else { 0.0 };
+                            let dp = (loser_bid - LATENCY_TICKS - depth_penalty).max(0.01);
                             if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
                             let mut fv = vec!["TAKER_DIRECT"];
                             if bid_source=="EST" { fv.push("EST_BID"); }
+                            if depth_penalty > 0.0 { fv.push("THIN_DUMP"); }
                             self.log.dump(st.id, t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, bn_px, &loser_bk, &fv.join("|"));
                             info!("[S3] DUMP {} {} @{:.3} TAKER  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
                         }
@@ -688,7 +706,7 @@ mod tests {
 
         // Taker force at T-27 using current bid
         let tp = taker_px(bid_t27);
-        assert_close(tp, 0.039, "taker price at bid=0.04");
+        assert_close(tp, 0.037, "taker price at bid=0.04");
 
         // Maker gets better price than taker
         assert!(mp > tp, "maker always beats taker on price");
@@ -791,10 +809,12 @@ mod tests {
         let pnl_decay = pnl_dumped(0.50, taker_px(0.01));
         assert!(pnl_decay < 0.0, "taker@$0.01 bid loses money (bid collapsed too far)");
         let pnl_ok = pnl_dumped(0.50, taker_px(0.03));
-        assert!(pnl_ok < 0.0, "taker@$0.03 bid barely negative");
+        assert!(pnl_ok < 0.0, "taker@$0.03 bid negative");
+        let pnl_ok2 = pnl_dumped(0.50, taker_px(0.04));
+        assert!(pnl_ok2 < 0.0, "taker@$0.04 bid negative with 3-tick latency");
         let pnl_good = pnl_dumped(0.50, taker_px(0.05));
         assert!(pnl_good > 0.0, "taker@$0.05 bid profitable");
-        println!("    taker breakeven ~$0.04 bid: OK");
+        println!("    taker breakeven ~$0.05 bid: OK (3-tick latency)");
 
         println!("  ═══ ALL CHAIN CHECKS PASSED ═══\n");
     }

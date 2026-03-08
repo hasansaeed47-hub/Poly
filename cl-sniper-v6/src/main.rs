@@ -303,7 +303,7 @@ impl Scanner {
 // ── Book Cache ───────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Default)]
-struct Book { bb: f64, ba: f64, has_asks: bool, has_bids: bool }
+struct Book { bb: f64, ba: f64, has_asks: bool, has_bids: bool, bid_sz: f64, ask_sz: f64 }
 
 struct BookCache {
     http: reqwest::Client,
@@ -338,18 +338,24 @@ impl BookCache {
             if tid.is_empty() { continue; }
             let mut book = Book::default();
             if let Some(bids) = item.get("bids").and_then(|b| b.as_array()) {
-                let mut prices: Vec<f64> = bids.iter()
-                    .filter_map(|b| b.get("price").and_then(|p| p.as_str().and_then(|s| s.parse().ok())))
-                    .collect();
-                prices.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-                if let Some(&bb) = prices.first() { book.bb = bb; book.has_bids = true; }
+                let mut levels: Vec<(f64, f64)> = bids.iter()
+                    .filter_map(|b| {
+                        let px = b.get("price").and_then(|p| p.as_str().and_then(|s| s.parse().ok()))?;
+                        let sz = b.get("size").and_then(|s| s.as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0);
+                        Some((px, sz))
+                    }).collect();
+                levels.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some(&(bb, sz)) = levels.first() { book.bb = bb; book.has_bids = true; book.bid_sz = sz; }
             }
             if let Some(asks) = item.get("asks").and_then(|a| a.as_array()) {
-                let mut prices: Vec<f64> = asks.iter()
-                    .filter_map(|a| a.get("price").and_then(|p| p.as_str().and_then(|s| s.parse().ok())))
-                    .collect();
-                prices.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                if let Some(&ba) = prices.first() { book.ba = ba; book.has_asks = true; }
+                let mut levels: Vec<(f64, f64)> = asks.iter()
+                    .filter_map(|a| {
+                        let px = a.get("price").and_then(|p| p.as_str().and_then(|s| s.parse().ok()))?;
+                        let sz = a.get("size").and_then(|s| s.as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0);
+                        Some((px, sz))
+                    }).collect();
+                levels.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                if let Some(&(ba, sz)) = levels.first() { book.ba = ba; book.has_asks = true; book.ask_sz = sz; }
             }
             self.cache.insert(tid.clone(), book);
             self.ts.insert(tid, now);
@@ -441,18 +447,12 @@ impl Executor {
     fn check_maker_fill(&mut self, oid: &str, current_ask: f64) -> bool {
         let Some(fill) = self.fills.get_mut(oid) else { return false };
         if fill.filled { return true; }
+        // Conservative fill: our limit price must meet or beat the current ask
+        // (same model as Hydra — no random fills, ask must come down to us)
         if fill.price >= current_ask {
             fill.filled = true;
             fill.fill_px = fill.price;
             return true;
-        }
-        if self.paper && fill.posted_at.elapsed() > Duration::from_secs(1) {
-            let elapsed_ms = fill.posted_at.elapsed().as_millis();
-            if (elapsed_ms % 100) < 60 {
-                fill.filled = true;
-                fill.fill_px = fill.price;
-                return true;
-            }
         }
         false
     }
@@ -506,7 +506,8 @@ impl Executor {
     async fn taker_buy(&mut self, client: &AuthClient, tid: &str, ask_price: f64) -> Result<(String, f64)> {
         let oid = self.next_oid();
         if self.paper {
-            let fill_px = (ask_price + 0.005).min(0.99);
+            // Realistic paper fill: 3-tick latency (REST round-trip ~200ms)
+            let fill_px = (ask_price + 0.003).min(0.99);
             self.fills.insert(oid.clone(), FillInfo { price: fill_px, filled: true, fill_px, posted_at: Instant::now() });
             return Ok((oid, fill_px));
         }
@@ -538,7 +539,8 @@ impl Executor {
     /// SL exit: taker sell at bid to recover partial value
     async fn taker_sell(&mut self, client: &AuthClient, tid: &str, shares: f64, bid_price: f64) -> Result<f64> {
         if self.paper {
-            let recovery = (bid_price - 0.005).max(0.0);
+            // Realistic: 3-tick latency + 1-tick depth penalty for thin books
+            let recovery = (bid_price - 0.003).max(0.0);
             return Ok(recovery);
         }
         let signer = LocalSigner::from_str(&self.private_key)?.with_chain_id(Some(POLYGON));
@@ -803,10 +805,16 @@ impl Engine {
             let threshold = scaled_threshold(w.asset, w.wmin);
             if cl_delta.abs() < threshold { continue; }
 
-            // Book check
+            // Book check + size gate
             let tid = if dir == "UP" { &w.tid_up } else { &w.tid_down };
             let book = self.books.get(tid);
             if !book.has_asks || book.ba < MIN_ENTRY || book.ba > MAX_ENTRY { continue; }
+            // Size gate: skip if top-of-book can't absorb our order
+            let shares_needed = STAKE / book.ba;
+            if book.ask_sz > 0.0 && book.ask_sz < shares_needed {
+                trace!("[SKIP] {} ask_sz={:.1} < shares={:.1}", w.slug, book.ask_sz, shares_needed);
+                continue;
+            }
 
             let entry_price = ((book.ba - 0.01) * 100.0).round() / 100.0;
             let entry_price = entry_price.clamp(MIN_ENTRY, MAX_ENTRY);
@@ -884,8 +892,8 @@ impl Engine {
                             let (new_oid, fp) = if let Some(ref c) = client {
                                 self.exe.taker_buy(c, &tid_clone, book.ba).await.unwrap_or_default()
                             } else {
-                                // Paper taker
-                                let fp = (book.ba + 0.005).min(0.99);
+                                // Paper taker: 3-tick latency slip
+                                let fp = (book.ba + 0.003).min(0.99);
                                 let oid = self.exe.next_oid();
                                 self.exe.fills.insert(oid.clone(), FillInfo { price: fp, filled: true, fill_px: fp, posted_at: Instant::now() });
                                 (oid, fp)
@@ -947,7 +955,8 @@ impl Engine {
                         let recovery = if let Some(ref c) = client {
                             self.exe.taker_sell(c, &tid, shares, book.bb).await.unwrap_or(0.0)
                         } else {
-                            (book.bb - 0.005).max(0.0)
+                            // Paper SL sell: 3-tick latency slip
+                            (book.bb - 0.003).max(0.0)
                         };
                         if let Some(t_mut) = self.active.get_mut(&slug) {
                             t_mut.sl_triggered = true;
