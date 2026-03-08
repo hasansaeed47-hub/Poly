@@ -91,6 +91,7 @@ impl State {
         hist.push_back((ts, px));
         if hist.len() > 7200 { hist.pop_front(); }
     }
+    #[allow(dead_code)]
     fn cl_at(&self, asset: &str, target: i64, tol: i64) -> Option<f64> {
         let snap = self.cl_snap.get(asset)?;
         for dt in 0..=tol {
@@ -701,10 +702,10 @@ impl Engine {
         for w in windows {
             if self.active.contains_key(&w.slug) { continue; }
             if self.traded.contains(&w.slug) { continue; }
-            if self.cl_opens.get(&w.slug).is_none() { continue; }
+            if !self.cl_opens.contains_key(&w.slug) { continue; }
 
             let left = w.left();
-            if left > ENTRY_START || left < TAKER_DEADLINE { continue; }
+            if !(TAKER_DEADLINE..=ENTRY_START).contains(&left) { continue; }
 
             let cl_open = self.cl_opens[&w.slug];
             let s = self.state.read().await;
@@ -761,7 +762,7 @@ impl Engine {
             if !book.has_asks || book.ba < MIN_ENTRY || book.ba > MAX_ENTRY { continue; }
 
             let entry_price = ((book.ba - 0.01) * 100.0).round() / 100.0;
-            let entry_price = entry_price.max(MIN_ENTRY).min(MAX_ENTRY);
+            let entry_price = entry_price.clamp(MIN_ENTRY, MAX_ENTRY);
 
             let bn_str = bn_trend.map(|bt| format!(" BN={:+.3}%", bt)).unwrap_or_default();
             info!("[ENTRY] {} {} {}m @{:.3} d={:+.4}% ask={:.2} left={}s{}",
