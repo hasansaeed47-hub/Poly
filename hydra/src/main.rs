@@ -451,12 +451,43 @@ impl Hydra {
                             }
                         }
                     }
-                    // Settle at exact end_ts + 1s (CL propagation)
-                    if now >= t.end_ts+1 {
+                    // Settle at exact end_ts (zero tolerance) or +1s if CL hasn't arrived
+                    if now >= t.end_ts {
                         let co = self.cl_o.get(&slug).copied().unwrap_or(0.0);
-                        let cc = s.cl_at(t.asset,t.end_ts,1).or_else(||s.cl.get(t.asset).copied()).unwrap_or(0.0);
+                        // Try CL at exact end_ts first (zero tolerance), then latest CL
+                        let cc = s.cl_at(t.asset,t.end_ts,0)
+                            .or_else(|| if now >= t.end_ts+1 { s.cl_at(t.asset,t.end_ts,1) } else { None })
+                            .or_else(|| if now >= t.end_ts+1 { s.cl.get(t.asset).copied() } else { None })
+                            .unwrap_or(0.0);
+                        // If CL not yet available and we're at exactly end_ts, wait one more tick
+                        if cc <= 0.0 && now < t.end_ts+2 { continue; }
+                        // CLOB cross-check: compare CL direction with CLOB prices
+                        let up_bk = self.bk.get(&t.tid_up);
+                        let dn_bk = self.bk.get(&t.tid_dn);
+                        let clob_agrees = if co > 0.0 && cc > 0.0 {
+                            let cl_up = cc >= co;
+                            // If CLOB has bids, winner should be bid >= 0.80 and loser <= 0.20
+                            let clob_up = up_bk.hb && dn_bk.hb && up_bk.bb > dn_bk.bb;
+                            let clob_dn = up_bk.hb && dn_bk.hb && dn_bk.bb > up_bk.bb;
+                            if cl_up { !clob_dn } else { !clob_up } // CL and CLOB shouldn't contradict
+                        } else { true }; // no CLOB data = can't check
+                        if !clob_agrees {
+                            info!("[{}] CLOB DISAGREES with CL on {} — CL says {} but CLOB bids UP={:.3} DN={:.3}",
+                                st.id, t.asset.to_uppercase(),
+                                if cc>=co {"UP"} else {"DOWN"}, up_bk.bb, dn_bk.bb);
+                        }
                         if t.wmin==5 { self.sub_r.insert(slug.clone(), if cc>=co {"UP"} else {"DOWN"}.into()); }
-                        if co<=0.0||cc<=0.0 { settles.push((st.id,slug.clone(),-STAKE_1-entry_fee)); continue; }
+                        // CL missing: use CLOB as fallback
+                        if co<=0.0||cc<=0.0 {
+                            if up_bk.hb && dn_bk.hb && (up_bk.bb > 0.80 || dn_bk.bb > 0.80) {
+                                let actual = if up_bk.bb > dn_bk.bb {"UP"} else {"DOWN"};
+                                let won = actual==t.dir;
+                                let pnl = if won { t.shares*1.0 - STAKE_1 - entry_fee } else { -STAKE_1 - entry_fee };
+                                info!("[{}] {} (CLOB fallback) {} {}m @{:.3} ${:+.2}", st.id, if won{"WIN"}else{"LOSS"}, t.asset.to_uppercase(), t.wmin, t.px, pnl);
+                                settles.push((st.id, slug.clone(), pnl)); continue;
+                            }
+                            settles.push((st.id,slug.clone(),-STAKE_1-entry_fee)); continue;
+                        }
                         let actual = if cc>=co {"UP"} else {"DOWN"};
                         let won = actual==t.dir;
                         let pnl = if won { t.shares*1.0 - STAKE_1 - entry_fee } else { -STAKE_1 - entry_fee };
@@ -518,10 +549,42 @@ impl Hydra {
                     }
                 }
 
-                // Settle at exact end_ts + 1s
-                if now >= t.end_ts+1 {
-                    let cc = s.cl_at(t.asset,t.end_ts,1).or_else(||s.cl.get(t.asset).copied()).unwrap_or(0.0);
-                    if cc<=0.0 { settles.push((st.id,slug.clone(),-STAKE_2)); continue; }
+                // Settle at exact end_ts (zero tolerance) or +1s if CL hasn't arrived
+                if now >= t.end_ts {
+                    let cc = s.cl_at(t.asset,t.end_ts,0)
+                        .or_else(|| if now >= t.end_ts+1 { s.cl_at(t.asset,t.end_ts,1) } else { None })
+                        .or_else(|| if now >= t.end_ts+1 { s.cl.get(t.asset).copied() } else { None })
+                        .unwrap_or(0.0);
+                    if cc <= 0.0 && now < t.end_ts+2 { continue; } // wait for CL
+                    // CLOB cross-check for both-sides
+                    let up_bk = self.bk.get(&t.tid_up);
+                    let dn_bk = self.bk.get(&t.tid_dn);
+                    if cc > 0.0 && co > 0.0 && up_bk.hb && dn_bk.hb {
+                        let cl_up = cc >= co;
+                        let clob_up = up_bk.bb > dn_bk.bb;
+                        if cl_up != clob_up {
+                            info!("[{}] CLOB DISAGREES on {} — CL={} CLOB bids UP={:.3} DN={:.3}",
+                                st.id, t.asset.to_uppercase(), if cl_up {"UP"} else {"DN"}, up_bk.bb, dn_bk.bb);
+                        }
+                    }
+                    // CL missing: CLOB fallback
+                    if cc<=0.0 {
+                        if up_bk.hb && dn_bk.hb && (up_bk.bb > 0.80 || dn_bk.bb > 0.80) {
+                            let actual = if up_bk.bb > dn_bk.bb {"UP"} else {"DOWN"};
+                            let (up_pay, dn_pay) = if actual=="UP" {(1.0,0.0)} else {(0.0,1.0)};
+                            let entry_fees = fee(t.px)*t.shares + fee(t.px2)*t.sh2;
+                            let pnl = if t.dumped {
+                                let lr = if actual=="DOWN" {t.shares} else {t.sh2};
+                                let wr = if actual=="DOWN" {t.sh2} else {t.shares};
+                                lr*t.dump_px + wr*1.0 - STAKE_2 - entry_fees - fee(t.dump_px)*lr
+                            } else {
+                                t.shares*up_pay + t.sh2*dn_pay - STAKE_2 - entry_fees
+                            };
+                            info!("[{}] {} (CLOB fallback) {} ${:+.2}", st.id, if pnl>0.0{"WIN"}else{"LOSS"}, t.asset.to_uppercase(), pnl);
+                            settles.push((st.id,slug.clone(),pnl)); continue;
+                        }
+                        settles.push((st.id,slug.clone(),-STAKE_2)); continue;
+                    }
                     if t.wmin==5 { self.sub_r.insert(slug.clone(), if cc>=co {"UP"} else {"DOWN"}.into()); }
                     let actual = if cc>=co {"UP"} else {"DOWN"};
                     let (up_pay, dn_pay) = if actual=="UP" {(1.0,0.0)} else {(0.0,1.0)};
