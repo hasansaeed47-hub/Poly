@@ -30,7 +30,7 @@ use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::types::Decimal;
 use polymarket_client_sdk::POLYGON;
 
-type AuthClient = ClobClient<polymarket_client_sdk::clob::Authenticated>;
+type AuthClient = ClobClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
