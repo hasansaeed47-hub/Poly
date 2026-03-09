@@ -407,33 +407,31 @@ def engine_check_fills(t: WindowTracker, up_ask: float, dn_ask: float,
             just_filled_dn = True
 
         # Record FIRST fill + other side's ask at that moment
-        if just_filled_up and not e.first_fill_side:
-            e.first_fill_side = "UP"
-            e.first_fill_elapsed = elapsed
-            e.other_ask_at_first_fill = dn_ask   # THIS is the hedge ask
-            e.other_depth_at_first_fill = dn_ask_sz
-        elif just_filled_dn and not e.first_fill_side:
-            e.first_fill_side = "DN"
-            e.first_fill_elapsed = elapsed
-            e.other_ask_at_first_fill = up_ask
-            e.other_depth_at_first_fill = up_ask_sz
+        if not e.first_fill_side:
+            if just_filled_up and just_filled_dn:
+                # Both filled on same tick — simultaneous
+                e.first_fill_side = "BOTH"
+                e.first_fill_elapsed = elapsed
+                e.second_fill_elapsed = elapsed
+                e.other_ask_at_first_fill = 0  # moot, both filled
+                e.other_depth_at_first_fill = 0
+            elif just_filled_up:
+                e.first_fill_side = "UP"
+                e.first_fill_elapsed = elapsed
+                e.other_ask_at_first_fill = dn_ask   # THE hedge ask
+                e.other_depth_at_first_fill = dn_ask_sz
+            elif just_filled_dn:
+                e.first_fill_side = "DN"
+                e.first_fill_elapsed = elapsed
+                e.other_ask_at_first_fill = up_ask
+                e.other_depth_at_first_fill = up_ask_sz
 
         # Record second fill timing
-        if e.first_fill_side and e.second_fill_elapsed < 0:
+        if e.first_fill_side and e.first_fill_side != "BOTH" and e.second_fill_elapsed < 0:
             if e.first_fill_side == "UP" and just_filled_dn:
                 e.second_fill_elapsed = elapsed
             elif e.first_fill_side == "DN" and just_filled_up:
                 e.second_fill_elapsed = elapsed
-
-        # Edge case: both fill on same tick
-        if just_filled_up and just_filled_dn and not e.first_fill_side:
-            # Treat as simultaneous
-            e.first_fill_side = "BOTH"
-            e.first_fill_elapsed = elapsed
-            e.second_fill_elapsed = elapsed
-            # Hedge ask is moot — both filled
-            e.other_ask_at_first_fill = 0
-            e.other_depth_at_first_fill = 0
 
 
 def engine_finalize(t: WindowTracker):
@@ -483,13 +481,14 @@ def engine_finalize(t: WindowTracker):
         first_bid = e.up_bid if first_side == "UP" else e.dn_bid
 
         if hedge_ask <= 0:
-            # No valid hedge ask recorded — first fill side goes to settlement
-            if first_side == t.winner_side or first_side == t.settle_dir:
-                # Holding winner
+            # No book data on other side — couldn't hedge even if we wanted to.
+            # Naked position: outcome depends on settlement.
+            if first_side == t.settle_dir:
+                # Lucky: holding winner, settles at $1
                 e.outcome = "WIN_ONLY"
                 e.settled_pnl = (1.0 - first_bid) * (STAKE / first_bid)
             else:
-                # Holding loser, no hedge
+                # Holding loser, no hedge possible
                 e.outcome = "S2_FAIL"
                 e.settled_pnl = -STAKE
             continue
@@ -501,30 +500,21 @@ def engine_finalize(t: WindowTracker):
         shares = STAKE / first_bid
         pnl_per_sh = 1.0 - total_per_pair
 
+        # In real execution, you ALWAYS hedge — you don't know which side wins.
+        # Holding both sides of a binary = guaranteed $1/pair, P&L = 1 - cost.
         if hedge_ask <= max_hedge:
             e.outcome = "S2_HEDGE"
             e.settled_pnl = pnl_per_sh * shares
         else:
-            # Hedge too expensive — but we still take it if it's only slightly negative
-            # because the alternative is -$5 if we hold the loser
-            # Record the actual P&L of the hedge (could be slightly negative)
-            if first_side == t.winner_side or first_side == t.settle_dir:
-                # First fill was actually the winner — we're fine
-                e.outcome = "WIN_ONLY"
-                e.settled_pnl = (1.0 - first_bid) * shares
-            else:
-                # First fill was loser, hedge too expensive
-                # Realistic: you'd still hedge to cap the loss
-                e.outcome = "S2_FAIL"
-                e.settled_pnl = pnl_per_sh * shares  # actual loss from expensive hedge
+            # Hedge too expensive but you still take it (alternative is -$5 naked)
+            e.outcome = "S2_FAIL"
+            e.settled_pnl = pnl_per_sh * shares  # actual loss from expensive hedge
 
 
 def classify_regime(t: WindowTracker) -> str:
     """Classify window regime post-hoc from price action."""
     up_min = t.up_min_ask if t.up_min_ask < 999 else 1.0
     dn_min = t.dn_min_ask if t.dn_min_ask < 999 else 1.0
-    up_max = t.up_max_ask
-    dn_max = t.dn_max_ask
 
     # CHOP: both sides dipped significantly (both had low asks)
     # This means both UP and DN were trading below ~$0.40 at some point
@@ -896,7 +886,9 @@ def display(active: list[WindowTracker]):
                     else:
                         estr.append(f"{CYAN}both({gap:.0f}s){RST}")
                 elif e.first_fill_side:
-                    estr.append(f"{CYAN}{e.first_fill_side:>2}→${e.other_ask_at_first_fill:.2f}{RST}")
+                    ha = e.other_ask_at_first_fill
+                    ha_str = f"${ha:.2f}" if ha > 0 else "nobook"
+                    estr.append(f"{CYAN}{e.first_fill_side:>2}→{ha_str}{RST}")
                 else:
                     estr.append(f"   wait ")
 
