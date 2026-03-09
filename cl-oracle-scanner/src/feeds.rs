@@ -653,68 +653,83 @@ fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
             }
         }
         "price_change" => {
-            // Polymarket price_change format (Sept 2025+):
-            // {
-            //   "event_type": "price_change",
-            //   "market": "0x...",
-            //   "timestamp": "...",
-            //   "price_changes": [
-            //     {"asset_id":"...","price":"0.5","size":"200","side":"BUY",
-            //      "hash":"...","best_bid":"0.5","best_ask":"1"}
-            //   ]
-            // }
-            // side "SELL" = ask level, "BUY" = bid level
-            // size "0" = remove level
+            // Handle BOTH Polymarket price_change formats:
+            //
+            // New format (Sept 2025+) — "price_changes" array, asset_id per change:
+            // {"event_type":"price_change","market":"0x...","timestamp":"...",
+            //  "price_changes":[{"asset_id":"...","price":"0.5","size":"200","side":"BUY",
+            //   "best_bid":"0.5","best_ask":"1"}]}
+            //
+            // Old format — "changes" array, asset_id on message:
+            // {"event_type":"price_change","asset_id":"...","market":"0x...",
+            //  "changes":[{"price":"0.52","size":"0","side":"SELL"}]}
+            //
+            // side "SELL" = ask level, "BUY" = bid level, size "0" = remove level
 
+            // Try new format first (price_changes with per-entry asset_id)
             if let Some(changes) = v.get("price_changes").and_then(|c| c.as_array()) {
                 for change in changes {
                     let asset_id = match change.get("asset_id").and_then(|a| a.as_str()) {
                         Some(id) => id.to_string(),
                         None => continue,
                     };
-
-                    let price = change.get("price")
-                        .and_then(|p| p.as_str())
-                        .and_then(|s| s.parse::<f64>().ok());
-                    let size = change.get("size")
-                        .and_then(|s| s.as_str())
-                        .and_then(|s| s.parse::<f64>().ok());
-                    let side = change.get("side")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("");
-
-                    if let (Some(price), Some(size)) = (price, size) {
-                        let is_ask = side.eq_ignore_ascii_case("SELL")
-                                  || side.eq_ignore_ascii_case("ASK");
-
-                        let mut entry = book_state
-                            .get(&asset_id)
-                            .map(|e| e.clone())
-                            .unwrap_or_else(BookEntry::new);
-
-                        entry.apply_level(price, size, is_ask, now);
-
-                        // Also update best_bid/best_ask from the message if available
-                        // (more reliable than recomputing from partial state)
-                        if let Some(bb) = change.get("best_bid").and_then(|b| b.as_str()).and_then(|s| s.parse::<f64>().ok()) {
-                            if bb > 0.0 {
-                                entry.best_bid = bb;
-                            }
-                        }
-                        if let Some(ba) = change.get("best_ask").and_then(|b| b.as_str()).and_then(|s| s.parse::<f64>().ok()) {
-                            if ba > 0.0 {
-                                entry.best_ask = ba;
-                            }
-                        }
-
-                        if entry.best_ask > 0.0 {
-                            book_state.insert(asset_id, entry);
-                        }
-                    }
+                    apply_price_change(&asset_id, change, book_state, now);
+                }
+            }
+            // Fall back to old format (changes with message-level asset_id)
+            else if let Some(changes) = v.get("changes").and_then(|c| c.as_array()) {
+                let asset_id = match v.get("asset_id").and_then(|a| a.as_str()) {
+                    Some(id) => id.to_string(),
+                    None => return,
+                };
+                for change in changes {
+                    apply_price_change(&asset_id, change, book_state, now);
                 }
             }
         }
         _ => {}
+    }
+}
+
+/// Apply a single price_change entry to the book
+fn apply_price_change(
+    asset_id: &str,
+    change: &serde_json::Value,
+    book_state: &BookState,
+    now: f64,
+) {
+    let price = change.get("price")
+        .and_then(|p| p.as_str())
+        .and_then(|s| s.parse::<f64>().ok());
+    let size = change.get("size")
+        .and_then(|s| s.as_str())
+        .and_then(|s| s.parse::<f64>().ok());
+    let side = change.get("side")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+
+    if let (Some(price), Some(size)) = (price, size) {
+        let is_ask = side.eq_ignore_ascii_case("SELL")
+                  || side.eq_ignore_ascii_case("ASK");
+
+        let mut entry = book_state
+            .get(asset_id)
+            .map(|e| e.clone())
+            .unwrap_or_else(BookEntry::new);
+
+        entry.apply_level(price, size, is_ask, now);
+
+        // Use best_bid/best_ask from message if available (more reliable)
+        if let Some(bb) = change.get("best_bid").and_then(|b| b.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+            if bb > 0.0 { entry.best_bid = bb; }
+        }
+        if let Some(ba) = change.get("best_ask").and_then(|b| b.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+            if ba > 0.0 { entry.best_ask = ba; }
+        }
+
+        if entry.best_ask > 0.0 {
+            book_state.insert(asset_id.to_string(), entry);
+        }
     }
 }
 
