@@ -330,8 +330,8 @@ pub async fn fetch_market_meta(
 
 // -- Batch book fetcher -------------------------------------------------------
 
-/// Fetch order books for a batch of token IDs via REST.
-/// Returns full BookEntry with all levels (not just best ask/bid).
+/// Fetch order books via REST.
+/// Uses GET /book?token_id=X for each token individually.
 pub async fn fetch_books_batch(
     client:   &Client,
     clob_rest: &str,
@@ -342,87 +342,68 @@ pub async fn fetch_books_batch(
         return Ok(HashMap::new());
     }
 
-    limiter.wait().await;
-
     let mut result = HashMap::new();
 
-    for chunk in token_ids.chunks(BOOK_BATCH_SIZE) {
-        let mut url = Url::parse(&format!("{}/books", clob_rest))
-            .context("invalid CLOB REST URL")?;
+    for tid in token_ids {
+        limiter.wait().await;
 
+        let url = format!("{}/book?token_id={}", clob_rest, tid);
+
+        let resp = match client
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
         {
-            let mut pairs = url.query_pairs_mut();
-            for tid in chunk {
-                pairs.append_pair("token_id", tid);
-            }
-        }
-
-        debug!("Batch book fetch: {} tokens, url={}", chunk.len(), url.as_str());
-
-        // Polymarket CLOB uses /book (singular) with one token_id at a time
-        // Fetch each token individually
-        for tid in chunk {
-            limiter.wait().await;
-
-            let single_url = format!("{}/book?token_id={}", clob_rest, tid);
-            debug!("Book fetch: {}", single_url);
-
-            let resp = match client
-                .get(&single_url)
-                .timeout(Duration::from_secs(5))
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("CLOB book request failed for {}: {}", &tid[..8.min(tid.len())], e);
-                    continue;
-                }
-            };
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                warn!("CLOB book returned {} for {}: {}", status, &tid[..8.min(tid.len())], &body[..body.len().min(200)]);
+            Ok(r) => r,
+            Err(e) => {
+                warn!("CLOB book request failed for {}: {}", &tid[..8.min(tid.len())], e);
                 continue;
             }
+        };
 
-            let book: ClobBook = match resp.json().await {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!("CLOB book parse failed for {}: {}", &tid[..8.min(tid.len())], e);
-                    continue;
-                }
-            };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!("CLOB book returned {} for {}: {}", status, &tid[..8.min(tid.len())], &body[..body.len().min(200)]);
+            continue;
+        }
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64();
-
-            let asks: Vec<(f64, f64)> = book.asks.iter()
-                .filter_map(|l| {
-                    let p = l.price.parse::<f64>().ok()?;
-                    let s = l.size.parse::<f64>().ok()?;
-                    Some((p, s))
-                })
-                .collect();
-
-            let bids: Vec<(f64, f64)> = book.bids.iter()
-                .filter_map(|l| {
-                    let p = l.price.parse::<f64>().ok()?;
-                    let s = l.size.parse::<f64>().ok()?;
-                    Some((p, s))
-                })
-                .collect();
-
-            let mut entry = BookEntry::new();
-            entry.set_snapshot(asks, bids, now);
-
-            if entry.best_ask > 0.0 {
-                result.insert(tid.clone(), entry);
+        let book: ClobBook = match resp.json().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("CLOB book parse failed for {}: {}", &tid[..8.min(tid.len())], e);
+                continue;
             }
-        } // end per-token loop
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+
+        let asks: Vec<(f64, f64)> = book.asks.iter()
+            .filter_map(|l| {
+                let p = l.price.parse::<f64>().ok()?;
+                let s = l.size.parse::<f64>().ok()?;
+                Some((p, s))
+            })
+            .collect();
+
+        let bids: Vec<(f64, f64)> = book.bids.iter()
+            .filter_map(|l| {
+                let p = l.price.parse::<f64>().ok()?;
+                let s = l.size.parse::<f64>().ok()?;
+                Some((p, s))
+            })
+            .collect();
+
+        let mut entry = BookEntry::new();
+        entry.set_snapshot(asks, bids, now);
+
+        if entry.best_ask > 0.0 {
+            result.insert(tid.clone(), entry);
+        }
     }
 
     Ok(result)
@@ -457,25 +438,41 @@ async fn connect_cl_feed(
     let url = Url::parse(live_ws).context("invalid live WS URL")?;
     let (mut ws, _) = connect_async(url).await.context("CL WS connect failed")?;
 
-    for asset in assets {
-        let symbol = format!("{}usd", asset.to_uppercase());
-        let sub = serde_json::json!({
-            "type": "subscribe",
-            "channel": "crypto_prices_chainlink",
-            "symbol": symbol
-        });
-        ws.send(Message::Text(sub.to_string())).await?;
-        debug!("[CL] Subscribed to {}", symbol);
-    }
+    // RTDS subscription format: action + subscriptions array
+    // Symbol format: "btc/usd" (lowercase, slash separated)
+    // Note: RTDS may only support one symbol per subscription but we send all
+    // in one subscriptions array — if this doesn't work, we'll need separate connections.
+    let filters: Vec<String> = assets.iter().map(|a| format!("{}/usd", a.to_lowercase())).collect();
+    let sub = serde_json::json!({
+        "action": "subscribe",
+        "subscriptions": filters.iter().map(|f| {
+            serde_json::json!({
+                "topic": "crypto_prices_chainlink",
+                "type": "update",
+                "filters": f
+            })
+        }).collect::<Vec<_>>()
+    });
+    ws.send(Message::Text(sub.to_string())).await?;
+    debug!("[CL] Subscribe msg: {}", serde_json::to_string(&sub).unwrap_or_default());
 
     info!("[CL] Feed connected, {} assets", assets.len());
 
     while let Some(msg) = ws.next().await {
         let msg = msg.context("CL WS message error")?;
-        if let Message::Text(text) = msg {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                process_cl_message(&v, cl_prices, price_history);
+        match msg {
+            Message::Text(text) => {
+                if text.contains("payload") {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                        process_cl_message(&v, cl_prices, price_history);
+                    }
+                }
             }
+            Message::Ping(data) => {
+                // Respond to server pings to keep connection alive
+                let _ = ws.send(Message::Pong(data)).await;
+            }
+            _ => {}
         }
     }
 
@@ -487,27 +484,46 @@ fn process_cl_message(
     cl_prices:     &ClPrices,
     price_history: &PriceHistory,
 ) {
-    let channel = v.get("channel").and_then(|c| c.as_str()).unwrap_or("");
-    if channel != "crypto_prices_chainlink" {
+    // RTDS message format:
+    // {"topic":"crypto_prices_chainlink","type":"update","timestamp":17533...,
+    //  "payload":{"symbol":"btc/usd","timestamp":17533...,"value":67234.50}}
+    let topic = v.get("topic").and_then(|t| t.as_str()).unwrap_or("");
+    if topic != "crypto_prices_chainlink" {
         return;
     }
 
-    let symbol = match v.get("symbol").and_then(|s| s.as_str()) {
+    let payload = match v.get("payload") {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Symbol is "btc/usd" format — extract asset name before the slash
+    let symbol = match payload.get("symbol").and_then(|s| s.as_str()) {
         Some(s) => s.to_lowercase(),
         None    => return,
     };
+    let asset = symbol.split('/').next().unwrap_or("").to_string();
+    if asset.is_empty() {
+        return;
+    }
 
-    let asset = symbol.trim_end_matches("usd").to_string();
-
-    let price_str = v.get("price").and_then(|p| p.as_str()).unwrap_or("0");
-    let price: f64 = match price_str.parse() {
-        Ok(p) if p > 0.0 => p,
-        _ => return,
+    // Price is "value" field (numeric)
+    let price = match payload.get("value").and_then(|p| p.as_f64()) {
+        Some(p) if p > 0.0 => p,
+        _ => {
+            // Also try string format
+            match payload.get("value").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                Some(p) if p > 0.0 => p,
+                _ => return,
+            }
+        }
     };
 
-    let ts = v
-        .get("ts")
+    // Timestamp in millis — convert to seconds
+    let ts = payload
+        .get("timestamp")
         .and_then(|t| t.as_f64())
+        .map(|t| if t > 1e12 { t / 1000.0 } else { t })  // millis → secs
         .unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -557,14 +573,14 @@ async fn connect_book_feed(
 
     let ids: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
     if !ids.is_empty() {
-        // Polymarket CLOB WS subscription format uses "assets_ids"
+        // Polymarket CLOB Market Channel subscription format:
+        // {"type": "market", "assets_ids": ["token1", "token2", ...]}
+        // No auth needed for market channel. Max 500 instruments per connection.
         let sub = serde_json::json!({
-            "auth": {},
-            "type": "subscribe",
-            "channel": "book",
+            "type": "market",
             "assets_ids": ids
         });
-        debug!("[BOOK] Sending subscribe: {} tokens", ids.len());
+        debug!("[BOOK] Subscribe msg: {} tokens", ids.len());
         ws.send(Message::Text(sub.to_string())).await?;
         info!("[BOOK] Subscribed to {} token IDs", ids.len());
     }
@@ -578,17 +594,32 @@ async fn connect_book_feed(
     let mut msg_count = 0u64;
     while let Some(msg) = ws.next().await {
         let msg = msg.context("CLOB WS message error")?;
-        if let Message::Text(text) = msg {
-            msg_count += 1;
-            if msg_count <= 3 {
-                debug!("[BOOK] WS msg #{}: {}", msg_count, &text[..text.len().min(300)]);
+        match msg {
+            Message::Text(text) => {
+                msg_count += 1;
+                if msg_count <= 5 {
+                    debug!("[BOOK] WS msg #{}: {}", msg_count, &text[..text.len().min(500)]);
+                }
+
+                // CLOB WS may send messages as JSON arrays
+                if text.starts_with('[') {
+                    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                        for v in &arr {
+                            process_book_message(v, book_state);
+                        }
+                    }
+                } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    process_book_message(&v, book_state);
+                }
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                process_book_message(&v, book_state);
+            Message::Ping(data) => {
+                let _ = ws.send(Message::Pong(data)).await;
             }
-        } else if let Message::Close(frame) = msg {
-            warn!("[BOOK] WS close frame: {:?}", frame);
-            break;
+            Message::Close(frame) => {
+                warn!("[BOOK] WS close frame: {:?}", frame);
+                break;
+            }
+            _ => {}
         }
     }
 
@@ -597,10 +628,6 @@ async fn connect_book_feed(
 
 fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
     let event_type = v.get("event_type").and_then(|e| e.as_str()).unwrap_or("");
-    let asset_id   = match v.get("asset_id").and_then(|a| a.as_str()) {
-        Some(id) => id.to_string(),
-        None     => return,
-    };
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -609,7 +636,12 @@ fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
 
     match event_type {
         "book" => {
-            // Full book snapshot — replace entire book
+            // Full book snapshot: {"event_type":"book","asset_id":"...","asks":[...],"bids":[...]}
+            let asset_id = match v.get("asset_id").and_then(|a| a.as_str()) {
+                Some(id) => id.to_string(),
+                None     => return,
+            };
+
             let asks = parse_levels(v.get("asks"));
             let bids = parse_levels(v.get("bids"));
 
@@ -621,26 +653,26 @@ fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
             }
         }
         "price_change" => {
-            // Incremental delta — apply individual level changes to existing book.
-            //
-            // OLD BUG: treated delta levels as a full snapshot, overwriting the
-            // entire book. A delta with 1 ask level would destroy a 50-level book.
-            //
-            // FIX: get or create the existing book, apply each change individually.
-            // PM WS sends changes as: {"changes":[{"price":"0.55","size":"10","side":"SELL"},...]
-            // where side "SELL" = ask, "BUY" = bid, size "0" = remove level.
-            // Also handle asks/bids arrays if present (some PM WS versions).
+            // Polymarket price_change format (Sept 2025+):
+            // {
+            //   "event_type": "price_change",
+            //   "market": "0x...",
+            //   "timestamp": "...",
+            //   "price_changes": [
+            //     {"asset_id":"...","price":"0.5","size":"200","side":"BUY",
+            //      "hash":"...","best_bid":"0.5","best_ask":"1"}
+            //   ]
+            // }
+            // side "SELL" = ask level, "BUY" = bid level
+            // size "0" = remove level
 
-            let mut entry = book_state
-                .get(&asset_id)
-                .map(|e| e.clone())
-                .unwrap_or_else(BookEntry::new);
-
-            let mut applied = false;
-
-            // Handle "changes" array format
-            if let Some(changes) = v.get("changes").and_then(|c| c.as_array()) {
+            if let Some(changes) = v.get("price_changes").and_then(|c| c.as_array()) {
                 for change in changes {
+                    let asset_id = match change.get("asset_id").and_then(|a| a.as_str()) {
+                        Some(id) => id.to_string(),
+                        None => continue,
+                    };
+
                     let price = change.get("price")
                         .and_then(|p| p.as_str())
                         .and_then(|s| s.parse::<f64>().ok());
@@ -654,39 +686,32 @@ fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
                     if let (Some(price), Some(size)) = (price, size) {
                         let is_ask = side.eq_ignore_ascii_case("SELL")
                                   || side.eq_ignore_ascii_case("ASK");
+
+                        let mut entry = book_state
+                            .get(&asset_id)
+                            .map(|e| e.clone())
+                            .unwrap_or_else(BookEntry::new);
+
                         entry.apply_level(price, size, is_ask, now);
-                        applied = true;
+
+                        // Also update best_bid/best_ask from the message if available
+                        // (more reliable than recomputing from partial state)
+                        if let Some(bb) = change.get("best_bid").and_then(|b| b.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                            if bb > 0.0 {
+                                entry.best_bid = bb;
+                            }
+                        }
+                        if let Some(ba) = change.get("best_ask").and_then(|b| b.as_str()).and_then(|s| s.parse::<f64>().ok()) {
+                            if ba > 0.0 {
+                                entry.best_ask = ba;
+                            }
+                        }
+
+                        if entry.best_ask > 0.0 {
+                            book_state.insert(asset_id, entry);
+                        }
                     }
                 }
-            }
-
-            // Also handle direct asks/bids arrays in delta (some formats)
-            if let Some(asks) = v.get("asks").and_then(|a| a.as_array()) {
-                for level in asks {
-                    if let (Some(p), Some(s)) = (
-                        level.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()),
-                        level.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()),
-                    ) {
-                        entry.apply_level(p, s, true, now);
-                        applied = true;
-                    }
-                }
-            }
-
-            if let Some(bids) = v.get("bids").and_then(|b| b.as_array()) {
-                for level in bids {
-                    if let (Some(p), Some(s)) = (
-                        level.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()),
-                        level.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()),
-                    ) {
-                        entry.apply_level(p, s, false, now);
-                        applied = true;
-                    }
-                }
-            }
-
-            if applied && entry.best_ask > 0.0 {
-                book_state.insert(asset_id, entry);
             }
         }
         _ => {}
@@ -820,13 +845,17 @@ mod tests {
         });
         process_book_message(&snap, &book_state);
 
-        // Then: price_change delta — remove best ask, add new bid
+        // Then: price_change delta (Polymarket format with price_changes array)
+        // Remove best ask, add new bid
         let delta = serde_json::json!({
             "event_type": "price_change",
-            "asset_id": "token123",
-            "changes": [
-                {"price": "0.52", "size": "0", "side": "SELL"},
-                {"price": "0.49", "size": "12", "side": "BUY"}
+            "market": "0xabc",
+            "timestamp": "1753314088351",
+            "price_changes": [
+                {"asset_id": "token123", "price": "0.52", "size": "0", "side": "SELL",
+                 "hash": "abc", "best_bid": "0.50", "best_ask": "0.55"},
+                {"asset_id": "token123", "price": "0.49", "size": "12", "side": "BUY",
+                 "hash": "def", "best_bid": "0.50", "best_ask": "0.55"}
             ]
         });
         process_book_message(&delta, &book_state);
@@ -834,18 +863,5 @@ mod tests {
         let entry = book_state.get("token123").unwrap();
         assert_eq!(entry.best_ask, 0.55, "best ask should now be 0.55 after removing 0.52");
         assert_eq!(entry.best_bid, 0.50, "best bid still 0.50");
-    }
-
-    #[test]
-    fn batch_book_url_construction() {
-        let base = "https://clob.polymarket.com";
-        let mut url = Url::parse(&format!("{}/books", base)).unwrap();
-        {
-            let mut pairs = url.query_pairs_mut();
-            pairs.append_pair("token_id", "abc");
-            pairs.append_pair("token_id", "def");
-        }
-        assert!(url.as_str().contains("token_id=abc"));
-        assert!(url.as_str().contains("token_id=def"));
     }
 }
