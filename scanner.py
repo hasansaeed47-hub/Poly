@@ -26,8 +26,12 @@ REFRESH_SEC = 5
 HEADERS = {"User-Agent": "scanner/1"}
 
 # ── Polymarket fee for 5-min markets ───────────────────────────────
-def fee(px: float) -> float:
-    return px * (1.0 - px) * 0.0625
+# Maker fee = 0%, Taker fee = p * (1-p) * 0.0314, Settlement fee = 0%
+def maker_fee(px: float) -> float:
+    return 0.0
+
+def taker_fee(px: float) -> float:
+    return px * (1.0 - px) * 0.0314
 
 # ── Discover active 5-min windows ─────────────────────────────────
 def discover_windows() -> list[dict]:
@@ -137,11 +141,11 @@ def evaluate(w: dict, up_bk: dict, dn_bk: dict) -> dict:
         "signal": "SKIP",
     }
 
-    # ── Scenario 1: Both sides fill as MAKER at best bid ──
+    # ── Scenario 1: Both sides fill as MAKER at best bid (0% fee) ──
     if up_bk["bid"] > 0 and dn_bk["bid"] > 0:
         cost_mm = up_bk["bid"] + dn_bk["bid"]
-        fee_mm = fee(up_bk["bid"]) + fee(dn_bk["bid"])
-        profit_mm = 1.0 - cost_mm - fee_mm
+        fee_mm = 0.0  # maker = zero fees
+        profit_mm = 1.0 - cost_mm
         result["maker_maker"] = {
             "cost": cost_mm,
             "fees": fee_mm,
@@ -149,20 +153,20 @@ def evaluate(w: dict, up_bk: dict, dn_bk: dict) -> dict:
             "profit_at_stake": profit_mm * (STAKE / max(up_bk["bid"], dn_bk["bid"])),
         }
 
-    # ── Scenario 2: One fills as maker at bid, hedge other at ask (taker) ──
+    # ── Scenario 2: One fills as maker (0% fee), hedge other at ask as taker ──
     if up_bk["bid"] > 0 and dn_bk["ask"] > 0:
         # Maker UP bid, taker DN ask
         cost_a = up_bk["bid"] + dn_bk["ask"]
-        fee_a = fee(up_bk["bid"]) + fee(dn_bk["ask"])
+        fee_a = maker_fee(up_bk["bid"]) + taker_fee(dn_bk["ask"])
         profit_a = 1.0 - cost_a - fee_a
 
         # Maker DN bid, taker UP ask
         cost_b = dn_bk["bid"] + up_bk["ask"]
-        fee_b = fee(dn_bk["bid"]) + fee(up_bk["ask"])
+        fee_b = maker_fee(dn_bk["bid"]) + taker_fee(up_bk["ask"])
         profit_b = 1.0 - cost_b - fee_b
 
         # Worst case hedge (the more expensive side)
-        worst_cost = max(cost_a, cost_b)
+        worst_cost = max(cost_a + fee_a, cost_b + fee_b)
         worst_profit = min(profit_a, profit_b)
         best_profit = max(profit_a, profit_b)
 
@@ -255,9 +259,24 @@ def display(results: list[dict]):
                       f"→ profit {mm['profit_per_share']:+.4f}/sh  (${mm['profit_at_stake']:+.2f} on ${STAKE})")
             if r["maker_taker"]:
                 mt = r["maker_taker"]
-                print(f"    Hedge (UP maker, DN taker): {r['up_bid']:.3f} + {r['dn_ask']:.3f} = {mt['cost_up_maker']:.4f}  → {mt['profit_up_maker']:+.4f}/sh")
-                print(f"    Hedge (DN maker, UP taker): {r['dn_bid']:.3f} + {r['up_ask']:.3f} = {mt['cost_dn_maker']:.4f}  → {mt['profit_dn_maker']:+.4f}/sh")
+                print(f"    Hedge (UP maker, DN taker): {r['up_bid']:.3f} + {r['dn_ask']:.3f} + fee {taker_fee(r['dn_ask']):.4f} = {mt['cost_up_maker'] + taker_fee(r['dn_ask']):.4f}  → {mt['profit_up_maker']:+.4f}/sh")
+                print(f"    Hedge (DN maker, UP taker): {r['dn_bid']:.3f} + {r['up_ask']:.3f} + fee {taker_fee(r['up_ask']):.4f} = {mt['cost_dn_maker'] + taker_fee(r['up_ask']):.4f}  → {mt['profit_dn_maker']:+.4f}/sh")
                 print(f"    Worst-case hedge profit: {mt['worst_hedge_profit']:+.4f}/sh")
+                # Max taker ask to break even: maker_price + ask + ask*(1-ask)*0.0314 = 1.0
+                # Solve numerically for each maker price
+                for label, mkr_px in [("UP maker", r['up_bid']), ("DN maker", r['dn_bid'])]:
+                    # ask + ask*(1-ask)*0.0314 = 1.0 - mkr_px
+                    budget = 1.0 - mkr_px
+                    # Binary search for max ask
+                    lo, hi = 0.40, 0.60
+                    for _ in range(50):
+                        mid = (lo + hi) / 2
+                        total = mid + mid * (1.0 - mid) * 0.0314
+                        if total < budget:
+                            lo = mid
+                        else:
+                            hi = mid
+                    print(f"    Max taker ask for {label} at {mkr_px:.3f}: ≤ ${lo:.4f}")
 
             # Book depth
             print(f"    Book depth: UP [{r['up_n_bids']}b/{r['up_n_asks']}a  top bid ${r['up_bid_sz']:.0f}]  "
@@ -267,9 +286,10 @@ def display(results: list[dict]):
         print(f"  \033[0;90mNo actionable opportunities right now.{RST}")
 
     print()
-    print(f"  Signals: BOTH_MAKER = both bids < $1 | HEDGE_SAFE = any hedge profitable")
-    print(f"           HEDGE_OK = one direction profitable | NEAR = close to breakeven")
-    print(f"  M+M = maker+maker profit/share | HEDGE = worst-case hedge profit/share")
+    print(f"  Signals: BOTH_MAKER = both maker bids < $1 (0% fee) | HEDGE_SAFE = taker hedge profitable")
+    print(f"           HEDGE_OK = one hedge dir profitable | NEAR = close to breakeven")
+    print(f"  M+M = maker+maker profit/sh (0% fee) | HEDGE = worst-case maker+taker profit/sh")
+    print(f"  Fees: Maker=0% | Taker=p*(1-p)*3.14% | Settlement=0%")
     print()
 
 # ── Main loop ──────────────────────────────────────────────────────
