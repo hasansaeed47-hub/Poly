@@ -128,10 +128,56 @@ struct GammaEvent {
 #[serde(rename_all = "camelCase")]
 struct GammaMarket {
     condition_id:   Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     clob_token_ids: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     outcomes:       Option<Vec<String>>,
     start_date_iso: Option<String>,
     end_date_iso:   Option<String>,
+}
+
+/// Deserialize a field that may be either a JSON array or a stringified JSON array.
+/// e.g. both `["a","b"]` and `"[\"a\",\"b\"]"` → Some(vec!["a","b"])
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+
+    struct StringOrVec;
+
+    impl<'de> de::Visitor<'de> for StringOrVec {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a string or array of strings")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: de::Error>(self, s: &str) -> Result<Self::Value, E> {
+            // Try parsing as JSON array
+            serde_json::from_str::<Vec<String>>(s)
+                .map(Some)
+                .map_err(de::Error::custom)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            while let Some(item) = seq.next_element::<String>()? {
+                v.push(item);
+            }
+            Ok(Some(v))
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
 }
 
 // -- CLOB REST book response --------------------------------------------------
@@ -228,10 +274,13 @@ pub async fn fetch_market_meta(
         }
     };
 
+    // Find market with Up/Down or Yes/No outcomes
     let market = event.markets.iter().find(|m| {
         m.outcomes
             .as_ref()
-            .map(|o| o.iter().any(|x| x.eq_ignore_ascii_case("yes")))
+            .map(|o| o.iter().any(|x| {
+                x.eq_ignore_ascii_case("yes") || x.eq_ignore_ascii_case("up")
+            }))
             .unwrap_or(false)
     });
 
@@ -247,14 +296,15 @@ pub async fn fetch_market_meta(
         return Ok(None);
     }
 
+    // Support both Yes/No and Up/Down outcome labels
     let yes_idx = outcomes
         .iter()
-        .position(|o| o.eq_ignore_ascii_case("yes"))
-        .ok_or_else(|| anyhow!("no YES outcome"))?;
+        .position(|o| o.eq_ignore_ascii_case("yes") || o.eq_ignore_ascii_case("up"))
+        .ok_or_else(|| anyhow!("no YES/Up outcome"))?;
     let no_idx = outcomes
         .iter()
-        .position(|o| o.eq_ignore_ascii_case("no"))
-        .ok_or_else(|| anyhow!("no NO outcome"))?;
+        .position(|o| o.eq_ignore_ascii_case("no") || o.eq_ignore_ascii_case("down"))
+        .ok_or_else(|| anyhow!("no NO/Down outcome"))?;
 
     let token_yes = tokens[yes_idx].clone();
     let token_no  = tokens[no_idx].clone();
