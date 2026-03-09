@@ -698,13 +698,19 @@ async fn process_book_message(
                         "SELL" => {
                             if size > 0.0 {
                                 sell_prices.push((price, size));
+                            } else if (price - entry.best_ask).abs() < 1e-9 {
+                                // Best ask removed — invalidate so REST refresh corrects it
+                                entry.best_ask = 0.0;
+                                entry.ask_depth = 0.0;
                             }
-                            // If size=0 and this was our best ask, we can't know the new best
-                            // without the full book. REST fallback will correct this.
                         }
                         "BUY" => {
                             if size > 0.0 {
                                 buy_prices.push((price, size));
+                            } else if (price - entry.best_bid).abs() < 1e-9 {
+                                // Best bid removed — invalidate so REST refresh corrects it
+                                entry.best_bid = 0.0;
+                                entry.bid_depth = 0.0;
                             }
                         }
                         _ => {}
@@ -741,8 +747,9 @@ async fn process_book_message(
 
                 entry.ts = now;
                 entry.source = "ws_delta".to_string();
+
+                // Always write back (including invalidated entries so stale prices don't persist)
                 if entry.best_ask > 0.0 {
-                    // Log price change delta
                     let log_entry = BookUpdateLog {
                         token_id: asset_id.clone(),
                         best_ask: entry.best_ask,
@@ -759,8 +766,8 @@ async fn process_book_message(
                         let mut file = book_log.lock().await;
                         let _ = writeln!(file, "{}", line);
                     }
-                    book_state.insert(asset_id, entry);
                 }
+                book_state.insert(asset_id, entry);
             }
         }
         _ => {}
@@ -913,6 +920,40 @@ mod tests {
         let entry = book_state.get("token2").unwrap();
         assert_eq!(entry.best_ask, 0.60, "ask should be preserved");
         assert_eq!(entry.best_bid, 0.42, "bid should improve to 0.42");
+    }
+
+    #[tokio::test]
+    async fn best_ask_invalidated_on_removal() {
+        let book_state: BookState = Arc::new(DashMap::new());
+        let log = test_book_log();
+        let health = test_health();
+
+        // Snapshot: best_ask=0.55
+        let snap = serde_json::json!({
+            "event_type": "book",
+            "asset_id": "token3",
+            "asks": [{"price": "0.55", "size": "10"}],
+            "bids": [{"price": "0.45", "size": "5"}]
+        });
+        process_book_message(&snap, &book_state, &log, &health).await;
+
+        // Remove the best ask level (size=0)
+        let delta = serde_json::json!({
+            "event_type": "price_change",
+            "asset_id": "token3",
+            "changes": [
+                {"side": "SELL", "price": "0.55", "size": "0"}
+            ]
+        });
+        process_book_message(&delta, &book_state, &log, &health).await;
+
+        // best_ask should be invalidated (0.0) — no phantom price
+        let entry = book_state.get("token3");
+        // Entry might be removed (best_ask=0) or absent
+        match entry {
+            Some(e) => assert_eq!(e.best_ask, 0.0, "best_ask should be invalidated on removal"),
+            None => {} // also acceptable — entry not stored when best_ask=0
+        }
     }
 
     #[test]

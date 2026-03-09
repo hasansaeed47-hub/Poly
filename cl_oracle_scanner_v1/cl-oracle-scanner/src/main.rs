@@ -402,10 +402,17 @@ async fn main() -> Result<()> {
                 continue;
             }
             // Capture CL price as close to window_end as possible
-            if now_u >= meta.window_end && now_u < meta.window_end + 3 {
+            // Use 5s window to ensure we don't miss it (matches settlement grace)
+            if now_u >= meta.window_end && now_u < meta.window_end + 5 {
                 if let Some(cl_ref) = cl_prices.get(&meta.asset) {
-                    close_prices.insert(slug.clone(), (cl_ref.1, now));
-                    info!("[CLOSE_PRICE] {} cl={:.2}", slug, cl_ref.1);
+                    // Only update if this is a fresher price than what we have
+                    let should_update = close_prices.get(slug)
+                        .map(|(_, prev_ts)| now > *prev_ts)
+                        .unwrap_or(true);
+                    if should_update {
+                        close_prices.insert(slug.clone(), (cl_ref.1, now));
+                        info!("[CLOSE_PRICE] {} cl={:.2} age={:.1}s", slug, cl_ref.1, now - cl_ref.0);
+                    }
                 }
             }
         }
@@ -433,7 +440,8 @@ async fn main() -> Result<()> {
                 }
 
                 // Determine winning side
-                let winning_side = if cl_settle > meta.open_price {
+                // Polymarket up/down: YES wins if cl >= open (at or above)
+                let winning_side = if cl_settle >= meta.open_price {
                     Side::Yes
                 } else {
                     Side::No

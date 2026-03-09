@@ -65,14 +65,16 @@ pub struct Signal {
 // ── Black-Scholes binary call ─────────────────────────────────────────────────
 
 /// Probability that price at expiry > open (YES wins)
-/// Uses log-normal model: N( ln(S/K) / (sigma * sqrt(t)) )
-/// No drift assumption — appropriate for short windows
+/// Uses log-normal model with proper d2 for digital/binary options:
+///   d2 = [ln(S/K) - 0.5 * sigma^2 * T] / (sigma * sqrt(T))
+///   fair = N(d2)
+/// Zero drift assumption — appropriate for short windows
 pub fn fair_yes(cl: f64, open: f64, sigma: f64, secs_left: f64) -> f64 {
     let sigma = sigma.max(MIN_SIGMA);
     let t     = (secs_left / SECS_PER_YEAR).max(MIN_T);
-    let d1    = (cl / open).ln() / (sigma * t.sqrt());
+    let d2    = ((cl / open).ln() - 0.5 * sigma * sigma * t) / (sigma * t.sqrt());
     let n     = Normal::new(0.0, 1.0).expect("normal distribution");
-    n.cdf(d1).clamp(0.001, 0.999)
+    n.cdf(d2).clamp(0.001, 0.999)
 }
 
 // ── Sigma estimation ──────────────────────────────────────────────────────────
@@ -281,15 +283,27 @@ mod tests {
     }
 
     #[test]
-    fn equal_edges_picks_yes() {
-        // Both sides have same positive edge — should pick YES, not None
+    fn both_sides_have_edge_picks_one() {
+        // Both sides have positive edge — should pick one, not None
+        // With d2 convexity, fair_yes < 0.50 when cl==open, so NO gets slightly more edge
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 100.0, 0.01, 300.0,
             &snap(0.48, 0.47), &snap(0.48, 0.47), 0.5, 0.0,
         ).unwrap();
-        // fair_yes ≈ 0.50, edge_yes ≈ 0.02, edge_no ≈ 0.02
-        assert_eq!(sig.best_side, Some(Side::Yes), "equal edges should default to YES");
+        assert!(sig.best_side.is_some(), "should pick a side when both have edge");
+        assert!(sig.best_edge > 0.0, "best_edge should be positive");
+    }
+
+    #[test]
+    fn equal_edges_above_open_picks_yes() {
+        // When cl > open, fair_yes > 0.5, so YES should get more edge with symmetric books
+        let sig = compute(
+            "btc-updown-5m-test", "btc", 5,
+            100.0, 100.5, 0.01, 300.0,
+            &snap(0.48, 0.47), &snap(0.53, 0.52), 0.5, 0.0,
+        ).unwrap();
+        assert_eq!(sig.best_side, Some(Side::Yes), "cl>open should favour YES");
     }
 
     #[test]
