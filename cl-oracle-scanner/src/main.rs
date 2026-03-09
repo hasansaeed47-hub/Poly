@@ -43,13 +43,43 @@ use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use feeds::{
-    BookInput as FeedBookInput, BookSource, BookState, ClPrices, FeedParams, MarketMeta,
+    BookState, ClPrices, FeedParams, LogWriter, MarketMeta,
     PriceHistory, RateLimiter,
     build_slug, current_window_starts, fetch_books_batch, fetch_market_meta,
     run_book_feed, run_cl_feed,
 };
 use runner::{ConfigRunner, RunnerConfig};
 use signal::{BookInput, compute, estimate_sigma};
+use tokio::sync::Mutex;
+
+// ── JSONL log struct for per-tick per-market signal state ──────────────────
+
+#[derive(serde::Serialize)]
+struct TickLog {
+    pub ts:          f64,
+    pub slug:        String,
+    pub asset:       String,
+    pub tf:          u32,
+    pub cl_price:    f64,
+    pub open_price:  f64,
+    pub cl_vs_open:  f64,
+    pub sigma:       f64,
+    pub secs_left:   f64,
+    pub fair_yes:    f64,
+    pub fair_no:     f64,
+    pub book_yes:    f64,
+    pub book_no:     f64,
+    pub bid_yes:     f64,
+    pub bid_no:      f64,
+    pub edge_yes:    f64,
+    pub edge_no:     f64,
+    pub best_side:   Option<String>,
+    pub best_edge:   f64,
+    pub spread_yes:  f64,
+    pub spread_no:   f64,
+    pub book_age_yes: f64,
+    pub book_age_no:  f64,
+}
 
 // ── Config file types ─────────────────────────────────────────────────────────
 
@@ -156,6 +186,25 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all("logs").context("cannot create logs/")?;
     std::fs::create_dir_all("logs/signals").context("cannot create logs/signals/")?;
 
+    // Open JSONL log files for structured analysis
+    let cl_log: LogWriter = Arc::new(Mutex::new(
+        std::fs::OpenOptions::new().create(true).append(true)
+            .open("logs/cl_prices.jsonl").context("cannot open logs/cl_prices.jsonl")?
+    ));
+    let book_log: LogWriter = Arc::new(Mutex::new(
+        std::fs::OpenOptions::new().create(true).append(true)
+            .open("logs/books.jsonl").context("cannot open logs/books.jsonl")?
+    ));
+    let tick_log_file: LogWriter = Arc::new(Mutex::new(
+        std::fs::OpenOptions::new().create(true).append(true)
+            .open("logs/ticks.jsonl").context("cannot open logs/ticks.jsonl")?
+    ));
+    let mtm_log_file: LogWriter = Arc::new(Mutex::new(
+        std::fs::OpenOptions::new().create(true).append(true)
+            .open("logs/mtm.jsonl").context("cannot open logs/mtm.jsonl")?
+    ));
+    info!("JSONL logs: cl_prices.jsonl, books.jsonl, ticks.jsonl, mtm.jsonl");
+
     // Graceful shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -243,8 +292,9 @@ async fn main() -> Result<()> {
         let assets = cfg.feed.assets.clone();
         let ws = cfg.feed.live_ws.clone();
         let params = feed_params.clone();
+        let cl_log_c = cl_log.clone();
         tokio::spawn(async move {
-            run_cl_feed(ws, assets, cp, ph, params).await;
+            run_cl_feed(ws, assets, cp, ph, params, cl_log_c).await;
         });
     }
 
@@ -254,8 +304,9 @@ async fn main() -> Result<()> {
         let bl = book_live.clone();
         let ws = cfg.feed.clob_ws.clone();
         let params = feed_params.clone();
+        let book_log_c = book_log.clone();
         tokio::spawn(async move {
-            run_book_feed(ws, ti, bs, bl, params).await;
+            run_book_feed(ws, ti, bs, bl, params, book_log_c).await;
         });
     }
 
@@ -352,7 +403,7 @@ async fn main() -> Result<()> {
         if tick_count % 4 == 0 {
             let all_tokens: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
             if !all_tokens.is_empty() {
-                match fetch_books_batch(&http, &cfg.feed.clob_rest, &all_tokens, &limiter, batch_size, throttle_ms).await {
+                match fetch_books_batch(&http, &cfg.feed.clob_rest, &all_tokens, &limiter, batch_size, throttle_ms, &book_log).await {
                     Ok(books) => {
                         let count = books.len();
                         for (tid, entry) in books {
@@ -512,6 +563,27 @@ async fn main() -> Result<()> {
 
             signal_count += 1;
 
+            // Write TickLog JSONL for every signal computation
+            {
+                let tick_entry = TickLog {
+                    ts: sig.ts, slug: sig.slug.clone(), asset: sig.asset.clone(),
+                    tf: sig.tf, cl_price: sig.cl_price, open_price: sig.open_price,
+                    cl_vs_open: sig.cl_vs_open, sigma: sig.sigma, secs_left: sig.secs_left,
+                    fair_yes: sig.fair_yes, fair_no: sig.fair_no,
+                    book_yes: sig.book_yes, book_no: sig.book_no,
+                    bid_yes: sig.bid_yes, bid_no: sig.bid_no,
+                    edge_yes: sig.edge_yes, edge_no: sig.edge_no,
+                    best_side: sig.best_side.map(|s| s.to_string()),
+                    best_edge: sig.best_edge,
+                    spread_yes: sig.spread_yes, spread_no: sig.spread_no,
+                    book_age_yes: sig.book_age_yes, book_age_no: sig.book_age_no,
+                };
+                if let Ok(line) = serde_json::to_string(&tick_entry) {
+                    let mut f = tick_log_file.lock().await;
+                    let _ = writeln!(f, "{}", line);
+                }
+            }
+
             // Log every signal with edge to JSONL for post-analysis
             if sig.best_edge > 0.01 {
                 if let Ok(line) = serde_json::to_string(&sig) {
@@ -522,6 +594,17 @@ async fn main() -> Result<()> {
             // Periodic signal log flush
             if signal_count % 100 == 0 {
                 let _ = signal_log.flush();
+            }
+
+            // Write MtmLog for all open positions in this market before dispatch
+            for runner in runners.iter() {
+                let mtm_entries = runner.get_mtm_entries(&sig);
+                for mtm in &mtm_entries {
+                    if let Ok(line) = serde_json::to_string(mtm) {
+                        let mut f = mtm_log_file.lock().await;
+                        let _ = writeln!(f, "{}", line);
+                    }
+                }
             }
 
             // Log signals with meaningful edge

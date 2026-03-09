@@ -53,7 +53,11 @@ pub struct PaperPosition {
     pub stake:         f64,
     pub entry_ts:      f64,
     pub window_end:    u64,
-    // Book state at entry
+    // Book state at entry (both sides)
+    pub book_yes_at_entry: f64,   // best ask YES at entry
+    pub book_no_at_entry:  f64,   // best ask NO at entry
+    pub bid_yes_at_entry:  f64,   // best bid YES at entry
+    pub bid_no_at_entry:   f64,   // best bid NO at entry
     pub book_spread:   f64,
     pub book_depth:    f64,     // ask depth at best
     pub book_age:      f64,     // seconds since last book update
@@ -85,11 +89,21 @@ pub struct TradeLog {
     pub book_spread_entry: f64,
     pub book_depth_entry:  f64,
     pub book_age_entry:    f64,
+    // Entry book state (both sides)
+    pub book_yes_at_entry: f64,
+    pub book_no_at_entry:  f64,
+    pub bid_yes_at_entry:  f64,
+    pub bid_no_at_entry:   f64,
     // Exit state
     pub exit_price:       f64,
     pub exit_reason:      String,
     pub fair_at_exit:     f64,
     pub cl_at_exit:       f64,
+    pub exit_sigma:       f64,
+    pub exit_book_yes:    f64,
+    pub exit_book_no:     f64,
+    pub exit_bid_yes:     f64,
+    pub exit_bid_no:      f64,
     pub secs_left_exit:   f64,
     // PnL
     pub gross_pnl:        f64,
@@ -149,6 +163,23 @@ impl RunnerStats {
             self.max_drawdown = dd;
         }
     }
+}
+
+// ── Mark-to-market log ────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct MtmLog {
+    pub ts:             f64,
+    pub config:         String,
+    pub trade_id:       String,
+    pub slug:           String,
+    pub side:           String,
+    pub entry_price:    f64,
+    pub shares:         f64,
+    pub current_fair:   f64,
+    pub current_bid:    f64,
+    pub unrealised_pnl: f64,
+    pub secs_left:      f64,
 }
 
 // ── Runner ────────────────────────────────────────────────────────────────────
@@ -238,7 +269,7 @@ impl ConfigRunner {
                     exit_price, cl_settle
                 );
 
-                self.close_position(pos, exit_price, "SETTLEMENT", settle_ts, cl_settle, secs_left, 0.0).await;
+                self.close_position(pos, exit_price, "SETTLEMENT", settle_ts, cl_settle, secs_left, 0.0, None).await;
             }
         }
     }
@@ -323,6 +354,10 @@ impl ConfigRunner {
             stake:         self.stake,
             entry_ts:      sig.ts,
             window_end,
+            book_yes_at_entry: sig.book_yes,
+            book_no_at_entry:  sig.book_no,
+            bid_yes_at_entry:  sig.bid_yes,
+            bid_no_at_entry:   sig.bid_no,
             book_spread,
             book_depth,
             book_age,
@@ -375,7 +410,7 @@ impl ConfigRunner {
                     current_fair, pos.entry_price, exit_price,
                     sig.cl_price, sig.secs_left
                 );
-                self.close_position(pos, exit_price, "STOP_LOSS", sig.ts, sig.cl_price, sig.secs_left, current_fair).await;
+                self.close_position(pos, exit_price, "STOP_LOSS", sig.ts, sig.cl_price, sig.secs_left, current_fair, Some(sig)).await;
                 continue;
             }
 
@@ -391,7 +426,7 @@ impl ConfigRunner {
                     current_bid, pos.fair_at_entry,
                     sig.cl_price, sig.secs_left
                 );
-                self.close_position(pos, exit_price, "TAKE_PROFIT", sig.ts, sig.cl_price, sig.secs_left, current_fair).await;
+                self.close_position(pos, exit_price, "TAKE_PROFIT", sig.ts, sig.cl_price, sig.secs_left, current_fair, Some(sig)).await;
                 continue;
             }
 
@@ -417,6 +452,7 @@ impl ConfigRunner {
         cl_at_exit:   f64,
         secs_left:    f64,
         fair_at_exit: f64,
+        exit_sig:     Option<&Signal>,
     ) {
         let shares = pos.shares;
 
@@ -455,6 +491,13 @@ impl ConfigRunner {
             _              => {}
         }
 
+        // Extract exit book state from signal if available
+        let (exit_sigma, exit_book_yes, exit_book_no, exit_bid_yes, exit_bid_no) =
+            match exit_sig {
+                Some(s) => (s.sigma, s.book_yes, s.book_no, s.bid_yes, s.bid_no),
+                None    => (0.0, 0.0, 0.0, 0.0, 0.0),
+            };
+
         let log = TradeLog {
             config:            self.config.name.clone(),
             trade_id:          pos.trade_id.clone(),
@@ -476,10 +519,19 @@ impl ConfigRunner {
             book_spread_entry: pos.book_spread,
             book_depth_entry:  pos.book_depth,
             book_age_entry:    pos.book_age,
+            book_yes_at_entry: pos.book_yes_at_entry,
+            book_no_at_entry:  pos.book_no_at_entry,
+            bid_yes_at_entry:  pos.bid_yes_at_entry,
+            bid_no_at_entry:   pos.bid_no_at_entry,
             exit_price,
             exit_reason:       exit_reason.to_string(),
             fair_at_exit,
             cl_at_exit,
+            exit_sigma,
+            exit_book_yes,
+            exit_book_no,
+            exit_bid_yes,
+            exit_bid_no,
             secs_left_exit:    secs_left,
             gross_pnl:         gross,
             entry_fee,
@@ -546,6 +598,34 @@ impl ConfigRunner {
 
     pub fn open_exposure(&self) -> f64 {
         self.positions.values().map(|p| p.stake).sum()
+    }
+
+    /// Generate mark-to-market log entries for all open positions
+    pub fn get_mtm_entries(&self, sig: &Signal) -> Vec<MtmLog> {
+        self.positions
+            .values()
+            .filter(|p| p.slug == sig.slug)
+            .map(|pos| {
+                let (current_fair, current_bid) = match pos.side {
+                    Side::Yes => (sig.fair_yes, sig.bid_yes),
+                    Side::No  => (sig.fair_no,  sig.bid_no),
+                };
+                let unrealised_pnl = (current_bid - pos.entry_price) * pos.shares;
+                MtmLog {
+                    ts:             sig.ts,
+                    config:         self.config.name.clone(),
+                    trade_id:       pos.trade_id.clone(),
+                    slug:           pos.slug.clone(),
+                    side:           pos.side.to_string(),
+                    entry_price:    pos.entry_price,
+                    shares:         pos.shares,
+                    current_fair,
+                    current_bid,
+                    unrealised_pnl,
+                    secs_left:      sig.secs_left,
+                }
+            })
+            .collect()
     }
 }
 
