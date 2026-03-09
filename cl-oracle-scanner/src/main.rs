@@ -373,10 +373,11 @@ async fn main() -> Result<()> {
                 None    => continue,
             };
 
-            if sig.best_edge > 0.05 {
-                debug!(
-                    "[SCAN] {} cl={:.2} fair_y={:.3} bk_y={:.3} bk_n={:.3} edge={:+.3} secs={:.0}",
-                    slug, cl, sig.fair_yes, book_yes, book_no, sig.best_edge, secs_left
+            // Log any positive edge at INFO for diagnostics
+            if sig.best_edge > 0.01 {
+                info!(
+                    "[SCAN] {} cl={:.2} open={:.2} fair_y={:.3} bk_y={:.3} bk_n={:.3} edge={:+.3} sigma={:.4} secs={:.0}",
+                    slug, cl, meta.open_price, sig.fair_yes, book_yes, book_no, sig.best_edge, sigma, secs_left
                 );
             }
 
