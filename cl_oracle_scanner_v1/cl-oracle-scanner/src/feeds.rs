@@ -24,7 +24,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-// ── Constants (overridden by config in main) ──────────────────────────────────
+// ── Constants ────────────────────────────────────────────────────────────────
 
 const BOOK_BATCH_SIZE:   usize = 20;
 const REST_THROTTLE_MS:  u64   = 500;
@@ -35,7 +35,7 @@ const WS_RECONNECT_SECS: u64   = 5;
 /// CL oracle prices: asset → (unix_ts, price)
 pub type ClPrices = Arc<DashMap<String, (f64, f64)>>;
 
-/// PM order book: token_id → (best_ask, best_bid, timestamp)
+/// PM order book: token_id → BookEntry
 pub type BookState = Arc<DashMap<String, BookEntry>>;
 
 /// CL price history for sigma: asset → Vec<(ts, price)>
@@ -71,11 +71,8 @@ struct GammaEvent {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct GammaMarket {
-    condition_id:   Option<String>,
     clob_token_ids: Option<Vec<String>>,
     outcomes:       Option<Vec<String>>,
-    start_date_iso: Option<String>,
-    end_date_iso:   Option<String>,
 }
 
 // ── CLOB REST book response ───────────────────────────────────────────────────
@@ -129,7 +126,6 @@ pub fn build_slug(asset: &str, tf_mins: u32, window_start: u64) -> String {
 pub fn current_window_starts(tf_mins: u32, now_secs: u64) -> Vec<u64> {
     let interval = (tf_mins as u64) * 60;
     let current  = (now_secs / interval) * interval;
-    // Return current and next window (next may not have markets yet but safe to try)
     vec![current, current + interval]
 }
 
@@ -155,7 +151,7 @@ pub async fn fetch_market_meta(
         .context("gamma API request failed")?;
 
     if resp.status() == 404 {
-        return Ok(None); // market doesn't exist yet
+        return Ok(None);
     }
 
     let event: GammaEvent = resp
@@ -183,7 +179,6 @@ pub async fn fetch_market_meta(
         return Ok(None);
     }
 
-    // Map YES/NO to token IDs
     let yes_idx = outcomes
         .iter()
         .position(|o| o.eq_ignore_ascii_case("yes"))
@@ -196,7 +191,6 @@ pub async fn fetch_market_meta(
     let token_yes = tokens[yes_idx].clone();
     let token_no  = tokens[no_idx].clone();
 
-    // Parse window times
     let window_start = slug
         .rsplit('-')
         .next()
@@ -212,15 +206,12 @@ pub async fn fetch_market_meta(
         window_end,
         token_yes,
         token_no,
-        open_price: 0.0, // filled in by CL feed at window_start
+        open_price: 0.0,
     }))
 }
 
 // ── Batch book fetcher ────────────────────────────────────────────────────────
 
-/// Fetch order books for a batch of token IDs in a single REST request.
-/// Polymarket CLOB supports ?token_id=X&token_id=Y... multi-token queries.
-/// Returns map of token_id → BookEntry
 pub async fn fetch_books_batch(
     client:   &Client,
     clob_rest: &str,
@@ -233,8 +224,6 @@ pub async fn fetch_books_batch(
 
     limiter.wait().await;
 
-    // Build query: /books?token_id=X&token_id=Y
-    // Split into batches of BOOK_BATCH_SIZE
     let mut result = HashMap::new();
 
     for chunk in token_ids.chunks(BOOK_BATCH_SIZE) {
@@ -262,7 +251,6 @@ pub async fn fetch_books_batch(
             continue;
         }
 
-        // Response is array of books, one per token_id, same order as request
         let books: Vec<Option<ClobBook>> = resp
             .json()
             .await
@@ -298,7 +286,6 @@ pub async fn fetch_books_batch(
             }
         }
 
-        // Throttle between batch chunks
         if token_ids.len() > BOOK_BATCH_SIZE {
             tokio::time::sleep(Duration::from_millis(REST_THROTTLE_MS)).await;
         }
@@ -309,9 +296,6 @@ pub async fn fetch_books_batch(
 
 // ── CL price WebSocket feed ───────────────────────────────────────────────────
 
-/// Spawn a task that maintains a CL price WebSocket connection.
-/// Writes to cl_prices: asset → (ts, price)
-/// Writes to price_history: asset → Vec<(ts, price)>
 pub async fn run_cl_feed(
     live_ws:       String,
     assets:        Vec<String>,
@@ -339,7 +323,6 @@ async fn connect_cl_feed(
     let url = Url::parse(live_ws).context("invalid live WS URL")?;
     let (mut ws, _) = connect_async(url).await.context("CL WS connect failed")?;
 
-    // Subscribe to chainlink topic for each asset
     for asset in assets {
         let symbol = format!("{}usd", asset.to_uppercase());
         let sub = serde_json::json!({
@@ -370,7 +353,6 @@ fn process_cl_message(
     cl_prices:     &ClPrices,
     price_history: &PriceHistory,
 ) {
-    // Expected: {"channel":"crypto_prices_chainlink","symbol":"BTCUSD","price":"67321.5","ts":1234567890}
     let channel = v.get("channel").and_then(|c| c.as_str()).unwrap_or("");
     if channel != "crypto_prices_chainlink" {
         return;
@@ -381,7 +363,7 @@ fn process_cl_message(
         None    => return,
     };
 
-    // "BTCUSD" → "btc"
+    // "btcusd" → "btc"
     let asset = symbol.trim_end_matches("usd").to_string();
 
     let price_str = v.get("price").and_then(|p| p.as_str()).unwrap_or("0");
@@ -413,24 +395,21 @@ fn process_cl_message(
 
 // ── PM book WebSocket feed ────────────────────────────────────────────────────
 
-/// Spawn a task that maintains a PM CLOB book WebSocket subscription.
-/// Subscribes to all token IDs in `token_ids`.
-/// Updates book_state: token_id → BookEntry
 pub async fn run_book_feed(
     clob_ws:    String,
-    token_ids:  Arc<DashMap<String, ()>>, // set of token IDs to subscribe
+    token_ids:  Arc<DashMap<String, ()>>,
     book_state: BookState,
     book_live:  Arc<std::sync::atomic::AtomicU64>,
+    mut sub_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
 ) {
     loop {
         info!("[BOOK] Connecting to {}", clob_ws);
 
-        match connect_book_feed(&clob_ws, &token_ids, &book_state, &book_live).await {
+        match connect_book_feed(&clob_ws, &token_ids, &book_state, &book_live, &mut sub_rx).await {
             Ok(_)  => warn!("[BOOK] Feed closed cleanly, reconnecting..."),
             Err(e) => error!("[BOOK] Feed error: {}, reconnecting in {}s", e, WS_RECONNECT_SECS),
         }
 
-        // Reset live timestamp on disconnect
         book_live.store(0, std::sync::atomic::Ordering::Relaxed);
         tokio::time::sleep(Duration::from_secs(WS_RECONNECT_SECS)).await;
     }
@@ -441,9 +420,11 @@ async fn connect_book_feed(
     token_ids:  &DashMap<String, ()>,
     book_state: &BookState,
     book_live:  &Arc<std::sync::atomic::AtomicU64>,
+    sub_rx:     &mut tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
 ) -> Result<()> {
     let url = Url::parse(clob_ws).context("invalid CLOB WS URL")?;
-    let (mut ws, _) = connect_async(url).await.context("CLOB WS connect failed")?;
+    let (ws, _) = connect_async(url).await.context("CLOB WS connect failed")?;
+    let (mut ws_tx, mut ws_rx) = ws.split();
 
     // Subscribe all known token IDs
     let ids: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
@@ -453,33 +434,54 @@ async fn connect_book_feed(
             "type": "subscribe",
             "markets": ids
         });
-        ws.send(Message::Text(sub.to_string())).await?;
+        ws_tx.send(Message::Text(sub.to_string())).await?;
         info!("[BOOK] Subscribed to {} token IDs", ids.len());
     }
 
-    // Record connect time for warmup gate
     let connect_ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     book_live.store(connect_ts, std::sync::atomic::Ordering::Relaxed);
 
-    while let Some(msg) = ws.next().await {
-        let msg = msg.context("CLOB WS message error")?;
-        if let Message::Text(text) = msg {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                process_book_message(&v, book_state);
+    loop {
+        tokio::select! {
+            // Handle incoming WS messages
+            msg = ws_rx.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            process_book_message(&v, book_state);
+                        }
+                    }
+                    Some(Ok(_)) => {} // ping/pong/binary
+                    Some(Err(e)) => return Err(e.into()),
+                    None => return Ok(()), // stream closed
+                }
+            }
+            // Handle new token subscription requests
+            new_tokens = sub_rx.recv() => {
+                if let Some(tokens) = new_tokens {
+                    if !tokens.is_empty() {
+                        let sub = serde_json::json!({
+                            "auth": {},
+                            "type": "subscribe",
+                            "markets": tokens
+                        });
+                        ws_tx.send(Message::Text(sub.to_string())).await?;
+                        info!("[BOOK] Subscribed {} new tokens", tokens.len());
+                    }
+                }
             }
         }
     }
-
-    Ok(())
 }
 
 fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
-    // Polymarket CLOB WS sends book snapshots and delta updates
-    // Format: {"event_type":"book","asset_id":"<token_id>","asks":[...],"bids":[...]}
-    // Or:     {"event_type":"price_change","asset_id":"...","changes":[...]}
+    // Polymarket CLOB WS sends:
+    // 1. "book" events: full snapshot with asks[] and bids[]
+    // 2. "price_change" events: delta with changes[] array
+    //    changes format: [{"side":"BUY"|"SELL","price":"0.55","size":"10"}]
 
     let event_type = v.get("event_type").and_then(|e| e.as_str()).unwrap_or("");
     let asset_id   = match v.get("asset_id").and_then(|a| a.as_str()) {
@@ -494,7 +496,7 @@ fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
 
     match event_type {
         "book" => {
-            // Full book snapshot
+            // Full book snapshot — safe to overwrite
             let best_ask = extract_best_ask(v);
             let best_bid = extract_best_bid(v);
             if best_ask > 0.0 {
@@ -502,12 +504,72 @@ fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
             }
         }
         "price_change" => {
-            // Incremental update — recompute best from changes
-            // For simplicity: treat as full update if ask/bid present
-            let best_ask = extract_best_ask(v);
-            let best_bid = extract_best_bid(v);
-            if best_ask > 0.0 {
-                book_state.insert(asset_id, BookEntry { best_ask, best_bid, ts: now });
+            // Incremental update — merge with existing state
+            // PM sends changes[] with side/price/size entries
+            if let Some(changes) = v.get("changes").and_then(|c| c.as_array()) {
+                // Get existing entry or create default
+                let mut entry = book_state
+                    .get(&asset_id)
+                    .map(|e| e.clone())
+                    .unwrap_or(BookEntry { best_ask: 0.0, best_bid: 0.0, ts: now });
+
+                // Parse all changes to find new best ask/bid
+                let mut sell_prices: Vec<f64> = Vec::new();
+                let mut buy_prices: Vec<f64> = Vec::new();
+
+                for change in changes {
+                    let side = change.get("side").and_then(|s| s.as_str()).unwrap_or("");
+                    let price = change.get("price")
+                        .and_then(|p| p.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+                    let size = change.get("size")
+                        .and_then(|s| s.as_str())
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .unwrap_or(0.0);
+
+                    if price <= 0.0 {
+                        continue;
+                    }
+
+                    // size=0 means level removed, size>0 means level updated
+                    match side {
+                        "SELL" => {
+                            if size > 0.0 {
+                                sell_prices.push(price);
+                            }
+                            // If size=0 and this was our best ask, we can't know the new best
+                            // without the full book. REST fallback will correct this.
+                        }
+                        "BUY" => {
+                            if size > 0.0 {
+                                buy_prices.push(price);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
+                // Update best ask: new minimum of existing + new sell levels
+                if !sell_prices.is_empty() {
+                    let new_min = sell_prices.iter().copied().reduce(f64::min).unwrap();
+                    if entry.best_ask <= 0.0 || new_min < entry.best_ask {
+                        entry.best_ask = new_min;
+                    }
+                }
+
+                // Update best bid: new maximum of existing + new buy levels
+                if !buy_prices.is_empty() {
+                    let new_max = buy_prices.iter().copied().reduce(f64::max).unwrap();
+                    if new_max > entry.best_bid {
+                        entry.best_bid = new_max;
+                    }
+                }
+
+                entry.ts = now;
+                if entry.best_ask > 0.0 {
+                    book_state.insert(asset_id, entry);
+                }
             }
         }
         _ => {}
@@ -566,8 +628,6 @@ mod tests {
 
     #[test]
     fn current_window_starts_5m() {
-        // 1772788230 = some ts that is 30s into a 5m window
-        // window start should be 1772788200 (rounded down to 300s boundary)
         let starts = current_window_starts(5, 1772788230);
         assert_eq!(starts[0], 1772788200);
         assert_eq!(starts[1], 1772788500);
@@ -589,8 +649,68 @@ mod tests {
     }
 
     #[test]
+    fn price_change_merges_correctly() {
+        let book_state: BookState = Arc::new(DashMap::new());
+
+        // First: full snapshot
+        let snap = serde_json::json!({
+            "event_type": "book",
+            "asset_id": "token1",
+            "asks": [{"price": "0.55", "size": "10"}],
+            "bids": [{"price": "0.45", "size": "5"}]
+        });
+        process_book_message(&snap, &book_state);
+
+        let entry = book_state.get("token1").unwrap();
+        assert_eq!(entry.best_ask, 0.55);
+        assert_eq!(entry.best_bid, 0.45);
+        drop(entry);
+
+        // Then: price_change with better ask
+        let delta = serde_json::json!({
+            "event_type": "price_change",
+            "asset_id": "token1",
+            "changes": [
+                {"side": "SELL", "price": "0.52", "size": "3"}
+            ]
+        });
+        process_book_message(&delta, &book_state);
+
+        let entry = book_state.get("token1").unwrap();
+        assert_eq!(entry.best_ask, 0.52, "ask should improve to 0.52");
+        assert_eq!(entry.best_bid, 0.45, "bid should be preserved");
+    }
+
+    #[test]
+    fn price_change_bid_only_preserves_ask() {
+        let book_state: BookState = Arc::new(DashMap::new());
+
+        // Snapshot first
+        let snap = serde_json::json!({
+            "event_type": "book",
+            "asset_id": "token2",
+            "asks": [{"price": "0.60", "size": "10"}],
+            "bids": [{"price": "0.40", "size": "5"}]
+        });
+        process_book_message(&snap, &book_state);
+
+        // Bid-only delta
+        let delta = serde_json::json!({
+            "event_type": "price_change",
+            "asset_id": "token2",
+            "changes": [
+                {"side": "BUY", "price": "0.42", "size": "8"}
+            ]
+        });
+        process_book_message(&delta, &book_state);
+
+        let entry = book_state.get("token2").unwrap();
+        assert_eq!(entry.best_ask, 0.60, "ask should be preserved");
+        assert_eq!(entry.best_bid, 0.42, "bid should improve to 0.42");
+    }
+
+    #[test]
     fn batch_book_url_construction() {
-        // Verify we can construct multi-token URLs without panic
         let base = "https://clob.polymarket.com";
         let mut url = Url::parse(&format!("{}/books", base)).unwrap();
         {

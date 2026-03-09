@@ -1,9 +1,9 @@
-# CL Scanner — external config
+# CL Oracle Scanner — external config
 # All thresholds here, nothing hardcoded in binary
 
 [feed]
 # Assets to scan
-assets = ["btc", "eth", "sol"]
+assets = ["btc", "eth", "sol", "xrp"]
 
 # Window timeframes in minutes
 timeframes = [5, 15]
@@ -43,11 +43,7 @@ min_secs = 60
 # Stake per trade in USD (paper only)
 stake = 5.0
 
-# Taker fee rate (Polymarket curve approximation)
-taker_fee_rate = 0.015
-
-# Maker fee rate
-maker_fee_rate = 0.0
+# Fee model: Polymarket curve p*(1-p)*3.14% — computed in code, not configurable
 
 [configs]
 # Config 1 — Base
@@ -82,7 +78,7 @@ max_secs_left  = 840
 stop_loss      = true
 take_profit    = false
 
-# Config 5 — CL Target Exit (exit when book >= fair_at_entry)
+# Config 5 — CL Target Exit (exit when bid >= fair_at_entry)
 [configs.c5]
 name           = "CL_TARGET"
 min_edge       = 0.12

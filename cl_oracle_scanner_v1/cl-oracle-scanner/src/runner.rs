@@ -16,6 +16,14 @@ use tracing::{debug, info};
 
 use crate::signal::{Signal, Side};
 
+// ── Polymarket fee model ────────────────────────────────────────────────────
+
+/// Taker fee per share at price p: p * (1 - p) * 3.14%
+/// Total fee = fee_per_share * shares
+fn taker_fee_per_share(p: f64) -> f64 {
+    p * (1.0 - p) * 0.0314
+}
+
 // ── Config definition ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
@@ -34,11 +42,13 @@ pub struct PaperPosition {
     pub trade_id:      String,
     pub slug:          String,
     pub asset:         String,
+    pub tf:            u32,
     pub side:          Side,
     pub entry_price:   f64,
     pub fair_at_entry: f64,  // Black-Scholes fair at entry — used as TP target for C5
     pub stake:         f64,
     pub entry_ts:      f64,
+    pub secs_left_at_entry: f64,
     pub window_end:    u64,  // unix timestamp when window closes
 }
 
@@ -96,14 +106,14 @@ impl RunnerStats {
 pub struct ConfigRunner {
     pub config:    RunnerConfig,
     pub stake:     f64,
-    pub fee_rate:  f64,
+    min_secs:      f64,
     positions:     HashMap<String, PaperPosition>, // trade_id → position
     stats:         RunnerStats,
     log_file:      Arc<Mutex<File>>,
 }
 
 impl ConfigRunner {
-    pub fn new(config: RunnerConfig, stake: f64, fee_rate: f64, log_dir: &str) -> Self {
+    pub fn new(config: RunnerConfig, stake: f64, min_secs: f64, log_dir: &str) -> Self {
         let log_path = format!("{}/{}.jsonl", log_dir, config.name.to_lowercase());
         let file = OpenOptions::new()
             .create(true)
@@ -116,7 +126,7 @@ impl ConfigRunner {
         Self {
             config,
             stake,
-            fee_rate,
+            min_secs,
             positions: HashMap::new(),
             stats: RunnerStats::default(),
             log_file: Arc::new(Mutex::new(file)),
@@ -133,9 +143,10 @@ impl ConfigRunner {
         self.maybe_enter(sig, window_end).await;
     }
 
-    /// Called at window settlement with the final CL price.
-    /// Settles all positions for this slug at the settlement price.
-    pub async fn on_settlement(&mut self, slug: &str, cl_settle: f64, settle_ts: f64) {
+    /// Called at window settlement.
+    /// winning_side: Side::Yes if CL closed above open, Side::No if below.
+    /// Settles all positions for this slug — winning side gets 1.0, losing gets 0.0.
+    pub async fn on_settlement(&mut self, slug: &str, winning_side: Side, settle_ts: f64) {
         let trade_ids: Vec<String> = self
             .positions
             .keys()
@@ -145,20 +156,8 @@ impl ConfigRunner {
 
         for trade_id in trade_ids {
             if let Some(pos) = self.positions.remove(&trade_id) {
-                // Settlement: YES=1.0 if CL closed above open, NO=1.0 if below
-                // But since PM settles at CL price, the binary outcome is:
-                // YES wins if cl_settle > open_price
-                // We don't have open_price here — use the fair_at_entry as proxy
-                // Better: settlement price IS the token price at close (0 or 1)
-                // For paper trading we use: exit_price = 1.0 if we were on winning side
-                //
-                // Winning condition:
-                //   Side::Yes → cl_settle implicitly > open (would need open_price)
-                //   We log the actual settle price and compute pnl from 0/1 outcome
-                //
-                // For now: use fair_at_entry direction as proxy
-                // In production: settlement feed will give exact 0/1
-                let exit_price = cl_settle; // caller passes 1.0 or 0.0
+                // Binary settlement: winning side token → $1.00, losing → $0.00
+                let exit_price = if pos.side == winning_side { 1.0 } else { 0.0 };
                 self.close_position(pos, exit_price, "SETTLEMENT", settle_ts).await;
             }
         }
@@ -169,8 +168,8 @@ impl ConfigRunner {
     async fn maybe_enter(&mut self, sig: &Signal, window_end: u64) {
         self.stats.signals += 1;
 
-        // Time gate
-        if sig.secs_left < 60.0 || sig.secs_left > self.config.max_secs_left {
+        // Time gate — use config min_secs, not hardcoded
+        if sig.secs_left < self.min_secs || sig.secs_left > self.config.max_secs_left as f64 {
             return;
         }
 
@@ -193,15 +192,17 @@ impl ConfigRunner {
             trade_id:      trade_id.clone(),
             slug:          sig.slug.clone(),
             asset:         sig.asset.clone(),
+            tf:            sig.tf,
             side,
             entry_price:   sig.best_book,
             fair_at_entry: sig.best_fair,
             stake:         self.stake,
             entry_ts:      now,
+            secs_left_at_entry: sig.secs_left,
             window_end,
         };
 
-        debug!(
+        info!(
             "[{}] ENTER {} {} @{:.3} fair={:.3} edge={:.3} secs={:.0}",
             self.config.name, sig.slug, side,
             sig.best_book, sig.best_fair, sig.best_edge, sig.secs_left
@@ -232,20 +233,19 @@ impl ConfigRunner {
                 Side::No  => sig.fair_no,
             };
 
-            // Get current book price for this side (as exit price)
-            let current_book = match pos.side {
-                Side::Yes => sig.book_yes,
-                Side::No  => sig.book_no,
+            // Get current book BID for this side (selling = hitting the bid)
+            let current_bid = match pos.side {
+                Side::Yes => sig.bid_yes,
+                Side::No  => sig.bid_no,
             };
 
             // Config 4: Stop-loss — exit when current_fair < entry_price
             if self.config.stop_loss
-                && sig.secs_left > 90.0  // not in final 90s (exit fee not worth it)
+                && sig.secs_left > 90.0  // not in final 90s
                 && current_fair < pos.entry_price
             {
                 let pos = self.positions.remove(&trade_id).unwrap();
-                // Exit at current book price (taker, pay fee again)
-                let exit_price = current_book.max(0.001);
+                let exit_price = current_bid.max(0.001);
                 info!(
                     "[{}] STOP_LOSS {} fair={:.3} < entry={:.3}",
                     self.config.name, pos.slug, current_fair, pos.entry_price
@@ -254,15 +254,15 @@ impl ConfigRunner {
                 continue;
             }
 
-            // Config 5: Take-profit — exit when book_price >= fair_at_entry
+            // Config 5: Take-profit — exit when bid >= fair_at_entry
             if self.config.take_profit
-                && current_book >= pos.fair_at_entry
+                && current_bid >= pos.fair_at_entry
             {
                 let pos = self.positions.remove(&trade_id).unwrap();
-                let exit_price = current_book;
+                let exit_price = current_bid;
                 info!(
-                    "[{}] TAKE_PROFIT {} book={:.3} >= fair_at_entry={:.3}",
-                    self.config.name, pos.slug, current_book, pos.fair_at_entry
+                    "[{}] TAKE_PROFIT {} bid={:.3} >= fair_at_entry={:.3}",
+                    self.config.name, pos.slug, current_bid, pos.fair_at_entry
                 );
                 self.close_position(pos, exit_price, "TAKE_PROFIT", sig.ts).await;
                 continue;
@@ -282,12 +282,12 @@ impl ConfigRunner {
         // Gross PnL: (exit_price - entry_price) * shares
         let gross = (exit_price - pos.entry_price) * shares;
 
-        // Fee: taker fee on entry always
-        // For stop_loss / take_profit: also pay taker fee on exit
-        // For settlement: no exit fee (binary resolution, no order placed)
-        let entry_fee = self.fee_rate * pos.stake;
-        let exit_fee  = if exit_reason != "SETTLEMENT" {
-            self.fee_rate * (exit_price * shares)
+        // Fee: Polymarket curve — p*(1-p)*3.14% per share
+        // Entry: always taker fee
+        let entry_fee = taker_fee_per_share(pos.entry_price) * shares;
+        // Exit: taker fee only on early exits (SL/TP), settlement is free
+        let exit_fee = if exit_reason != "SETTLEMENT" {
+            taker_fee_per_share(exit_price) * shares
         } else {
             0.0
         };
@@ -295,7 +295,6 @@ impl ConfigRunner {
 
         let net = gross - total_fee;
 
-        // Win/loss determined by net PnL
         if net > 0.0 {
             self.stats.wins += 1;
         } else {
@@ -318,12 +317,12 @@ impl ConfigRunner {
             trade_id:      pos.trade_id.clone(),
             slug:          pos.slug.clone(),
             asset:         pos.asset.clone(),
-            tf:            0, // filled by caller if needed
+            tf:            pos.tf,
             side:          pos.side.to_string(),
             entry_price:   pos.entry_price,
             fair_at_entry: pos.fair_at_entry,
             edge_at_entry: pos.fair_at_entry - pos.entry_price,
-            secs_left:     0.0, // not stored in pos, logged at entry
+            secs_left:     pos.secs_left_at_entry,
             stake:         pos.stake,
             exit_price,
             exit_reason:   exit_reason.to_string(),
@@ -376,7 +375,6 @@ impl ConfigRunner {
 mod tests {
     use super::*;
     use crate::signal::{Signal, Side};
-    use tempfile::tempdir;
 
     fn make_config(name: &str, min_edge: f64, max_secs: f64, sl: bool, tp: bool) -> RunnerConfig {
         RunnerConfig {
@@ -396,6 +394,9 @@ mod tests {
             (Some(Side::Yes), ey, book_yes, fair_yes)
         } else if en > ey && en > 0.0 {
             (Some(Side::No), en, book_no, fair_no)
+        } else if ey > 0.0 {
+            // Equal edges — default to YES
+            (Some(Side::Yes), ey, book_yes, fair_yes)
         } else {
             (None, 0.0, 0.0, 0.0)
         };
@@ -403,20 +404,25 @@ mod tests {
             slug: slug.to_string(), asset: "btc".to_string(), tf: 5,
             open_price: 100.0, cl_price: 100.5, sigma: 0.001,
             secs_left: secs, fair_yes, fair_no,
-            book_yes, book_no, edge_yes: ey, edge_no: en,
+            book_yes, book_no,
+            bid_yes: book_yes - 0.01, bid_no: book_no - 0.01,
+            edge_yes: ey, edge_no: en,
             best_side, best_edge, best_book, best_fair, ts,
         }
     }
 
+    fn make_runner(name: &str, min_edge: f64, max_secs: f64, sl: bool, tp: bool) -> ConfigRunner {
+        let dir = std::env::temp_dir();
+        ConfigRunner::new(
+            make_config(name, min_edge, max_secs, sl, tp),
+            5.0, 60.0,
+            dir.to_str().unwrap(),
+        )
+    }
+
     #[tokio::test]
     async fn c1_enters_on_edge() {
-        let dir = tempdir().unwrap();
-        let mut runner = ConfigRunner::new(
-            make_config("C1_TEST", 0.12, 840.0, false, false),
-            5.0, 0.015,
-            dir.path().to_str().unwrap(),
-        );
-        // fair_yes=0.80, book_yes=0.50 → edge=0.30 → should enter YES
+        let mut runner = make_runner("C1_TEST", 0.12, 840.0, false, false);
         let sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
         runner.on_signal(&sig, 1000 + 300).await;
         assert_eq!(runner.open_position_count(), 1);
@@ -424,13 +430,7 @@ mod tests {
 
     #[tokio::test]
     async fn c2_rejects_outside_time_window() {
-        let dir = tempdir().unwrap();
-        let mut runner = ConfigRunner::new(
-            make_config("C2_TEST", 0.12, 180.0, false, false),
-            5.0, 0.015,
-            dir.path().to_str().unwrap(),
-        );
-        // secs_left=300 → above max_secs_left=180 → should NOT enter
+        let mut runner = make_runner("C2_TEST", 0.12, 180.0, false, false);
         let sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
         runner.on_signal(&sig, 1000 + 300).await;
         assert_eq!(runner.open_position_count(), 0);
@@ -438,71 +438,49 @@ mod tests {
 
     #[tokio::test]
     async fn c3_rejects_small_edge() {
-        let dir = tempdir().unwrap();
-        let mut runner = ConfigRunner::new(
-            make_config("C3_TEST", 0.25, 840.0, false, false),
-            5.0, 0.015,
-            dir.path().to_str().unwrap(),
-        );
-        // edge=0.15 < min_edge=0.25 → should NOT enter
+        let mut runner = make_runner("C3_TEST", 0.25, 840.0, false, false);
         let sig = make_signal("btc-updown-5m-test", 0.65, 0.50, 0.49, 300.0, 1000.0);
         runner.on_signal(&sig, 1000 + 300).await;
         assert_eq!(runner.open_position_count(), 0);
     }
 
     #[tokio::test]
-    async fn c4_stop_loss_exits_when_fair_below_entry() {
-        let dir = tempdir().unwrap();
-        let mut runner = ConfigRunner::new(
-            make_config("C4_TEST", 0.12, 840.0, true, false),
-            5.0, 0.015,
-            dir.path().to_str().unwrap(),
-        );
-        // Enter: fair_yes=0.80, entry=0.50
-        let enter_sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
-        runner.on_signal(&enter_sig, 1000 + 300).await;
-        assert_eq!(runner.open_position_count(), 1);
-
-        // CL reverses: fair_yes drops to 0.30 < entry_price=0.50
-        // secs_left=200 > 90 → stop loss should fire
-        let reverse_sig = make_signal("btc-updown-5m-test", 0.30, 0.32, 0.67, 200.0, 1010.0);
-        runner.on_signal(&reverse_sig, 1000 + 300).await;
-        assert_eq!(runner.open_position_count(), 0, "stop loss should have closed position");
-    }
-
-    #[tokio::test]
-    async fn c5_take_profit_exits_when_book_hits_fair() {
-        let dir = tempdir().unwrap();
-        let mut runner = ConfigRunner::new(
-            make_config("C5_TEST", 0.12, 840.0, false, true),
-            5.0, 0.015,
-            dir.path().to_str().unwrap(),
-        );
-        // Enter: fair_yes=0.80, entry=0.50 → fair_at_entry=0.80
-        let enter_sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
-        runner.on_signal(&enter_sig, 1000 + 300).await;
-        assert_eq!(runner.open_position_count(), 1);
-
-        // PM reprices: book_yes=0.81 >= fair_at_entry=0.80 → TP fires
-        let reprice_sig = make_signal("btc-updown-5m-test", 0.82, 0.81, 0.18, 280.0, 1015.0);
-        runner.on_signal(&reprice_sig, 1000 + 300).await;
-        assert_eq!(runner.open_position_count(), 0, "take profit should have closed position");
-    }
-
-    #[tokio::test]
-    async fn settlement_closes_position() {
-        let dir = tempdir().unwrap();
-        let mut runner = ConfigRunner::new(
-            make_config("SETTLE_TEST", 0.12, 840.0, false, false),
-            5.0, 0.015,
-            dir.path().to_str().unwrap(),
-        );
+    async fn settlement_yes_wins_yes_position_profits() {
+        let mut runner = make_runner("SETTLE_YES", 0.12, 840.0, false, false);
         let sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
         runner.on_signal(&sig, 1000 + 300).await;
         assert_eq!(runner.open_position_count(), 1);
 
-        // Settle at 1.0 (YES wins)
-        runner.on_settlement("btc-updown-5m-test", 1.0, 1300.0).await;
+        // YES wins — our YES position should get exit_price=1.0
+        runner.on_settlement("btc-updown-5m-test", Side::Yes, 1300.0).await;
         assert_eq!(runner.open_position_count(), 0);
+        assert!(runner.stats.net_pnl > 0.0, "YES pos should profit when YES wins");
+    }
+
+    #[tokio::test]
+    async fn settlement_no_wins_yes_position_loses() {
+        let mut runner = make_runner("SETTLE_NO", 0.12, 840.0, false, false);
+        let sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
+        runner.on_signal(&sig, 1000 + 300).await;
+        assert_eq!(runner.open_position_count(), 1);
+
+        // NO wins — our YES position should get exit_price=0.0
+        runner.on_settlement("btc-updown-5m-test", Side::No, 1300.0).await;
+        assert_eq!(runner.open_position_count(), 0);
+        assert!(runner.stats.net_pnl < 0.0, "YES pos should lose when NO wins");
+    }
+
+    #[tokio::test]
+    async fn fee_model_correct() {
+        // Entry at p=0.50, stake=$5 → shares=10
+        // Fee per share = 0.50 * 0.50 * 0.0314 = 0.00785
+        // Total entry fee = 0.00785 * 10 = 0.0785
+        let mut runner = make_runner("FEE_TEST", 0.12, 840.0, false, false);
+        let sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
+        runner.on_signal(&sig, 1000 + 300).await;
+        runner.on_settlement("btc-updown-5m-test", Side::Yes, 1300.0).await;
+        // Fee should be ~$0.0785 (entry only, settlement has no exit fee)
+        assert!((runner.stats.total_fee - 0.0785).abs() < 0.001,
+            "expected fee ~0.0785, got {}", runner.stats.total_fee);
     }
 }

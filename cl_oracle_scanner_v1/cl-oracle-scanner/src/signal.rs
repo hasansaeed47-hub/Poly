@@ -41,6 +41,8 @@ pub struct Signal {
     pub fair_no:     f64,         // = 1 - fair_yes
     pub book_yes:    f64,         // current PM best ask for YES
     pub book_no:     f64,         // current PM best ask for NO
+    pub bid_yes:     f64,         // current PM best bid for YES (for exits)
+    pub bid_no:      f64,         // current PM best bid for NO  (for exits)
     pub edge_yes:    f64,         // fair_yes - book_yes
     pub edge_no:     f64,         // fair_no  - book_no
     pub best_side:   Option<Side>,// which side has edge (if any above threshold)
@@ -68,32 +70,45 @@ pub fn fair_yes(cl: f64, open: f64, sigma: f64, secs_left: f64) -> f64 {
 /// Rolling annualised volatility from a price history slice.
 /// prices: Vec of (unix_ts, price) sorted ascending.
 /// window_secs: how far back to look.
+///
+/// Uses actual time deltas between samples to properly annualise,
+/// since CL WS updates arrive at irregular intervals.
 pub fn estimate_sigma(prices: &[(f64, f64)], window_secs: f64, now: f64) -> f64 {
     // Filter to window
     let cutoff = now - window_secs;
-    let window: Vec<f64> = prices
+    let window: Vec<(f64, f64)> = prices
         .iter()
         .filter(|(ts, _)| *ts >= cutoff)
-        .map(|(_, p)| *p)
+        .copied()
         .collect();
 
     if window.len() < 2 {
-        return 0.001; // fallback — very low vol, wide time gate will filter this out
+        return 0.001; // fallback
     }
 
-    // Log returns
-    let returns: Vec<f64> = window
-        .windows(2)
-        .map(|w| (w[1] / w[0]).ln())
-        .collect();
+    // Log returns with time deltas
+    let mut sum_var = 0.0;
+    let mut count = 0u32;
 
-    let n    = returns.len() as f64;
-    let mean = returns.iter().sum::<f64>() / n;
-    let var  = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0).max(1.0);
-    let std  = var.sqrt();
+    for pair in window.windows(2) {
+        let (t0, p0) = pair[0];
+        let (t1, p1) = pair[1];
+        let dt = (t1 - t0).max(0.01); // avoid division by zero
+        let log_ret = (p1 / p0).ln();
 
-    // Annualise: assume 1-second samples
-    let annualised = std * SECS_PER_YEAR.sqrt();
+        // Variance per second: (log_ret^2) / dt
+        // This normalises each return to a per-second basis
+        sum_var += (log_ret * log_ret) / dt;
+        count += 1;
+    }
+
+    if count == 0 {
+        return 0.001;
+    }
+
+    // Average variance per second, then annualise
+    let var_per_sec = sum_var / count as f64;
+    let annualised = var_per_sec.sqrt() * SECS_PER_YEAR.sqrt();
     annualised.max(MIN_SIGMA)
 }
 
@@ -111,6 +126,8 @@ pub fn compute(
     secs_left:  f64,
     book_yes:   f64,  // best ask for YES (what you pay to buy YES)
     book_no:    f64,  // best ask for NO
+    bid_yes:    f64,  // best bid for YES (what you get selling YES)
+    bid_no:     f64,  // best bid for NO
     ts:         f64,
 ) -> Option<Signal> {
     // Guard: need valid inputs
@@ -128,7 +145,8 @@ pub fn compute(
     let edge_no  = fn_ - book_no;
 
     // Determine best side (only positive edge matters)
-    let best_side = if edge_yes > edge_no && edge_yes > 0.0 {
+    // When equal, default to YES to avoid dropping the signal
+    let best_side = if edge_yes >= edge_no && edge_yes > 0.0 {
         Some(Side::Yes)
     } else if edge_no > edge_yes && edge_no > 0.0 {
         Some(Side::No)
@@ -154,6 +172,8 @@ pub fn compute(
         fair_no:   fn_,
         book_yes,
         book_no,
+        bid_yes,
+        bid_no,
         edge_yes,
         edge_no,
         best_side,
@@ -172,7 +192,6 @@ mod tests {
 
     #[test]
     fn fair_yes_at_open_is_half() {
-        // When CL == open, fair should be ~0.50
         let f = fair_yes(100.0, 100.0, 0.01, 300.0);
         assert!((f - 0.5).abs() < 0.01, "fair_yes at open = {}", f);
     }
@@ -191,11 +210,10 @@ mod tests {
 
     #[test]
     fn edge_yes_positive_when_book_stale() {
-        // CL up 0.5%, book still at 0.50 — YES should have edge
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 100.5, 0.001, 300.0,
-            0.50, 0.49, 0.0,
+            0.50, 0.49, 0.49, 0.48, 0.0,
         ).unwrap();
         assert!(sig.edge_yes > 0.0, "expected positive edge_yes, got {}", sig.edge_yes);
         assert_eq!(sig.best_side, Some(Side::Yes));
@@ -203,11 +221,10 @@ mod tests {
 
     #[test]
     fn edge_no_positive_when_cl_down() {
-        // CL down 0.5%, book still at 0.50 — NO should have edge
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 99.5, 0.001, 300.0,
-            0.49, 0.50, 0.0,
+            0.49, 0.50, 0.48, 0.49, 0.0,
         ).unwrap();
         assert!(sig.edge_no > 0.0, "expected positive edge_no, got {}", sig.edge_no);
         assert_eq!(sig.best_side, Some(Side::No));
@@ -215,21 +232,44 @@ mod tests {
 
     #[test]
     fn no_edge_when_book_fair() {
-        // Book perfectly priced — no edge
         let f = fair_yes(100.5, 100.0, 0.001, 300.0);
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 100.5, 0.001, 300.0,
-            f, 1.0 - f, 0.0,
+            f, 1.0 - f, f - 0.01, (1.0 - f) - 0.01, 0.0,
         ).unwrap();
         assert!(sig.best_edge < 0.001, "expected ~0 edge, got {}", sig.best_edge);
     }
 
     #[test]
-    fn sigma_estimation_basic() {
-        // Flat prices → near-zero sigma
+    fn equal_edges_picks_yes() {
+        // Both sides have same positive edge — should pick YES, not None
+        let sig = compute(
+            "btc-updown-5m-test", "btc", 5,
+            100.0, 100.0, 0.01, 300.0,
+            0.48, 0.48, 0.47, 0.47, 0.0,
+        ).unwrap();
+        // fair_yes ≈ 0.50, edge_yes ≈ 0.02, edge_no ≈ 0.02
+        assert_eq!(sig.best_side, Some(Side::Yes), "equal edges should default to YES");
+    }
+
+    #[test]
+    fn sigma_estimation_with_real_deltas() {
+        // 1-second spaced flat prices → near-zero sigma
         let prices: Vec<(f64, f64)> = (0..60).map(|i| (i as f64, 100.0)).collect();
         let s = estimate_sigma(&prices, 300.0, 59.0);
         assert!(s < 0.01, "flat prices should give low sigma, got {}", s);
+    }
+
+    #[test]
+    fn sigma_estimation_irregular_intervals() {
+        // Irregular intervals should still produce reasonable sigma
+        let prices = vec![
+            (0.0, 100.0), (0.5, 100.01), (3.0, 100.02),
+            (3.1, 100.01), (10.0, 100.03), (15.0, 100.0),
+        ];
+        let s = estimate_sigma(&prices, 300.0, 15.0);
+        assert!(s > MIN_SIGMA, "should get positive sigma from varied prices");
+        assert!(s < 10.0, "sigma shouldn't be insanely large, got {}", s);
     }
 }

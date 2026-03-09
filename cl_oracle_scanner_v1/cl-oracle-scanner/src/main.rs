@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{error, info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use feeds::{
@@ -34,7 +34,7 @@ use feeds::{
     run_book_feed, run_cl_feed,
 };
 use runner::{ConfigRunner, RunnerConfig};
-use signal::{compute, estimate_sigma};
+use signal::{compute, estimate_sigma, Side};
 
 // ── Config file types ─────────────────────────────────────────────────────────
 
@@ -69,7 +69,6 @@ struct ScanConfig {
 #[derive(Deserialize, Debug)]
 struct PaperConfig {
     stake:          f64,
-    taker_fee_rate: f64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -184,24 +183,28 @@ async fn main() -> Result<()> {
         });
     }
 
+    // Book WS sender for subscribing new tokens dynamically
+    let (book_sub_tx, book_sub_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+
     {
         let bs = book_state.clone();
         let ti = token_ids.clone();
         let bl = book_live.clone();
         let ws = cfg.feed.clob_ws.clone();
         tokio::spawn(async move {
-            run_book_feed(ws, ti, bs, bl).await;
+            run_book_feed(ws, ti, bs, bl, book_sub_rx).await;
         });
     }
 
     // ── Build runners ─────────────────────────────────────────────────────────
 
+    let min_secs = cfg.scan.min_secs;
     let mut runners = vec![
-        ConfigRunner::new(cfg.configs.c1.clone(), cfg.paper.stake, cfg.paper.taker_fee_rate, "logs"),
-        ConfigRunner::new(cfg.configs.c2.clone(), cfg.paper.stake, cfg.paper.taker_fee_rate, "logs"),
-        ConfigRunner::new(cfg.configs.c3.clone(), cfg.paper.stake, cfg.paper.taker_fee_rate, "logs"),
-        ConfigRunner::new(cfg.configs.c4.clone(), cfg.paper.stake, cfg.paper.taker_fee_rate, "logs"),
-        ConfigRunner::new(cfg.configs.c5.clone(), cfg.paper.stake, cfg.paper.taker_fee_rate, "logs"),
+        ConfigRunner::new(cfg.configs.c1.clone(), cfg.paper.stake, min_secs, "logs"),
+        ConfigRunner::new(cfg.configs.c2.clone(), cfg.paper.stake, min_secs, "logs"),
+        ConfigRunner::new(cfg.configs.c3.clone(), cfg.paper.stake, min_secs, "logs"),
+        ConfigRunner::new(cfg.configs.c4.clone(), cfg.paper.stake, min_secs, "logs"),
+        ConfigRunner::new(cfg.configs.c5.clone(), cfg.paper.stake, min_secs, "logs"),
     ];
 
     // ── Warmup gate ───────────────────────────────────────────────────────────
@@ -220,6 +223,10 @@ async fn main() -> Result<()> {
     // Track which markets have been settled (slug → settled)
     let mut settled: HashMap<String, bool> = HashMap::new();
 
+    // Record CL price at window close for accurate settlement
+    // slug → (cl_price_at_close, timestamp)
+    let mut close_prices: HashMap<String, (f64, f64)> = HashMap::new();
+
     loop {
         tokio::time::sleep(tick).await;
         tick_count += 1;
@@ -232,6 +239,7 @@ async fn main() -> Result<()> {
 
         if now - last_discover > 60.0 {
             last_discover = now;
+            let mut new_tokens: Vec<String> = Vec::new();
             for asset in &cfg.feed.assets {
                 for &tf in &cfg.feed.timeframes {
                     for window_start in current_window_starts(tf, now_u) {
@@ -243,11 +251,17 @@ async fn main() -> Result<()> {
                                 info!("[DISCOVER] New market: {}", slug);
                                 token_ids.insert(meta.token_yes.clone(), ());
                                 token_ids.insert(meta.token_no.clone(),  ());
+                                new_tokens.push(meta.token_yes.clone());
+                                new_tokens.push(meta.token_no.clone());
                                 markets.insert(slug, meta);
                             }
                         }
                     }
                 }
+            }
+            // Subscribe new tokens on the book WS (BUG 13 fix)
+            if !new_tokens.is_empty() {
+                let _ = book_sub_tx.send(new_tokens);
             }
         }
 
@@ -268,6 +282,20 @@ async fn main() -> Result<()> {
             }
         }
 
+        // ── Capture CL price at window close (before settlement grace) ────
+        for (slug, meta) in &markets {
+            if close_prices.contains_key(slug) || settled.get(slug).copied().unwrap_or(false) {
+                continue;
+            }
+            // Capture CL price as close to window_end as possible
+            if now_u >= meta.window_end && now_u < meta.window_end + 3 {
+                if let Some(cl_ref) = cl_prices.get(&meta.asset) {
+                    close_prices.insert(slug.clone(), (cl_ref.1, now));
+                    info!("[CLOSE_PRICE] {} cl={:.2}", slug, cl_ref.1);
+                }
+            }
+        }
+
         // ── Check settlements ─────────────────────────────────────────────────
 
         for (slug, meta) in &markets {
@@ -275,30 +303,33 @@ async fn main() -> Result<()> {
                 continue;
             }
             if now_u >= meta.window_end + 5 {
-                // Window closed — settle using current CL price as proxy
-                // In production: listen to settlement event from PM
-                let cl_settle = cl_prices
-                    .get(&meta.asset)
-                    .map(|v| v.1)
+                if meta.open_price <= 0.0 {
+                    continue;
+                }
+
+                // Use captured close price, fall back to current CL
+                let cl_settle = close_prices
+                    .get(slug)
+                    .map(|(p, _)| *p)
+                    .or_else(|| cl_prices.get(&meta.asset).map(|v| v.1))
                     .unwrap_or(0.0);
 
                 if cl_settle <= 0.0 {
-                    continue; // no CL price yet, wait
+                    continue;
                 }
 
-                // Determine binary outcome: YES=1.0 if cl_settle > open_price
-                let outcome = if meta.open_price > 0.0 {
-                    if cl_settle > meta.open_price { 1.0 } else { 0.0 }
+                // Determine winning side
+                let winning_side = if cl_settle > meta.open_price {
+                    Side::Yes
                 } else {
-                    // open_price not set yet (market was just discovered)
-                    continue;
+                    Side::No
                 };
 
-                info!("[SETTLE] {} cl={:.2} open={:.2} outcome={}",
-                    slug, cl_settle, meta.open_price, if outcome == 1.0 { "YES" } else { "NO" });
+                info!("[SETTLE] {} cl={:.2} open={:.2} winner={}",
+                    slug, cl_settle, meta.open_price, winning_side);
 
                 for runner in &mut runners {
-                    runner.on_settlement(slug, outcome, now).await;
+                    runner.on_settlement(slug, winning_side, now).await;
                 }
 
                 settled.insert(slug.clone(), true);
@@ -339,12 +370,12 @@ async fn main() -> Result<()> {
             }
 
             // Get book prices for YES and NO tokens
-            let book_yes = match book_state.get(&meta.token_yes) {
-                Some(b) => b.best_ask,
+            let (book_yes, bid_yes) = match book_state.get(&meta.token_yes) {
+                Some(b) => (b.best_ask, b.best_bid),
                 None    => continue,
             };
-            let book_no = match book_state.get(&meta.token_no) {
-                Some(b) => b.best_ask,
+            let (book_no, bid_no) = match book_state.get(&meta.token_no) {
+                Some(b) => (b.best_ask, b.best_bid),
                 None    => continue,
             };
 
@@ -361,7 +392,7 @@ async fn main() -> Result<()> {
             let sig = match compute(
                 slug, &meta.asset, meta.tf,
                 meta.open_price, cl, sigma, secs_left,
-                book_yes, book_no, now,
+                book_yes, book_no, bid_yes, bid_no, now,
             ) {
                 Some(s) => s,
                 None    => continue,
