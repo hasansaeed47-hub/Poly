@@ -266,15 +266,16 @@ mod tests {
 
     #[test]
     fn fee_kills_small_edge() {
-        // Tiny move: fair_yes ~ 0.52, book = 0.51 → raw edge 0.01
-        // After 1.5% fee: cost = 0.51*1.015 = 0.51765, net edge ~ 0.002
-        // That's below typical min_edge thresholds
+        // Book nearly matches fair — raw edge is small, fee wipes it out
+        // fair_yes ~0.55 for a small move, book_yes=0.54 → raw edge ~0.01
+        // After 1.5% fee: cost = 0.54*1.015 = 0.5481, net edge ~ 0.002
+        let f = fair_yes(100.1, 100.0, 0.5, 300.0);
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
-            100.0, 100.02, 0.001, 300.0,
-            0.51, 0.50, 0.015, 0.0,
+            100.0, 100.1, 0.5, 300.0,
+            f - 0.005, 1.0 - f - 0.005, 0.015, 0.0,
         ).unwrap();
-        assert!(sig.best_edge < 0.05, "small move edge should be tiny after fees, got {}", sig.best_edge);
+        assert!(sig.best_edge < 0.02, "near-fair book should have tiny edge after fees, got {}", sig.best_edge);
     }
 
     #[test]
