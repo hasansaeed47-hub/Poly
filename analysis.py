@@ -624,3 +624,177 @@ for name, filt in scenarios:
     delta = total - base_net
     print('  {:<30s} {:>6d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f} {:>+10.2f}'.format(
         name, n, wins / n * 100, total, avg, sharpe, delta))
+
+# ============================================================
+# SNIPER DEEP DIVE
+# ============================================================
+print()
+print('=' * 120)
+print('SNIPER v6 — ENTRY PRICE & ASSET ANALYSIS')
+print('=' * 120)
+
+sniper_detail = []
+for t in sniper_trades:
+    pnl = float(t['pnl'])
+    price = float(t['price'])
+    asset = t['asset'].strip()
+    sniper_detail.append({'pnl': pnl, 'price': price, 'asset': asset})
+
+print()
+print('  --- ENTRY PRICE DISTRIBUTION ---')
+sn_buckets = [(0.85, 0.88), (0.88, 0.91), (0.91, 0.94), (0.94, 0.97), (0.97, 1.00)]
+print('  {:<14s} {:>6s} {:>5s} {:>6s} {:>10s} {:>8s} {:>7s}'.format(
+    'Price Range', 'Count', '  %', 'WR%', 'TotalPnL', 'AvgPnL', 'AvgPx'))
+print('  ' + '-' * 62)
+for lo, hi in sn_buckets:
+    bt = [t for t in sniper_detail if lo <= t['price'] < hi]
+    if not bt:
+        continue
+    n = len(bt)
+    wins = sum(1 for t in bt if t['pnl'] > 0)
+    total = sum(t['pnl'] for t in bt)
+    avg_px = sum(t['price'] for t in bt) / n
+    print('  [{:.2f}, {:.2f})   {:>6d} {:>5.1f} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.3f}'.format(
+        lo, hi, n, n / len(sniper_detail) * 100, wins / n * 100, total, total / n, avg_px))
+
+print()
+print('  --- BY ASSET ---')
+print('  {:<6s} {:>6s} {:>6s} {:>10s} {:>8s} {:>7s}'.format(
+    'Asset', 'Count', 'WR%', 'TotalPnL', 'AvgPnL', 'AvgPx'))
+print('  ' + '-' * 50)
+for asset in ['BTC', 'ETH', 'SOL', 'XRP']:
+    bt = [t for t in sniper_detail if t['asset'] == asset]
+    if not bt:
+        continue
+    n = len(bt)
+    wins = sum(1 for t in bt if t['pnl'] > 0)
+    total = sum(t['pnl'] for t in bt)
+    avg_px = sum(t['price'] for t in bt) / n
+    print('  {:<6s} {:>6d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.3f}'.format(
+        asset, n, wins / n * 100, total, total / n, avg_px))
+
+print()
+print('  --- LOSS/SL DETAIL ---')
+for t in sniper_detail:
+    if t['pnl'] <= 0:
+        print('    {} px={:.3f} pnl={:+.2f}'.format(t['asset'], t['price'], t['pnl']))
+
+# Sniper entry price grid search
+print()
+print('  --- SNIPER ENTRY PRICE FILTER (min/max) ---')
+sn_min_prices = [0.85, 0.88, 0.90, 0.93, 0.94, 0.95]
+sn_max_prices = [0.93, 0.95, 0.96, 0.97, 0.98]
+print('  {:>5s} {:>5s} {:>7s} {:>6s} {:>10s} {:>8s} {:>7s}'.format(
+    'MinPx', 'MaxPx', 'Trades', 'WR%', 'TotalPnL', 'AvgPnL', 'Sharpe'))
+print('  ' + '-' * 56)
+for minp in sn_min_prices:
+    for maxp in sn_max_prices:
+        if minp >= maxp:
+            continue
+        bt = [t for t in sniper_detail if minp <= t['price'] <= maxp]
+        if len(bt) < 5:
+            continue
+        n = len(bt)
+        wins = sum(1 for t in bt if t['pnl'] > 0)
+        pnls = [t['pnl'] for t in bt]
+        total = sum(pnls)
+        avg = total / n
+        var = sum((x - avg) ** 2 for x in pnls) / n
+        std = var ** 0.5
+        sharpe = avg / std if std > 0 else 0
+        print('  {:>5.2f} {:>5.2f} {:>7d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f}'.format(
+            minp, maxp, n, wins / n * 100, total, avg, sharpe))
+
+# ============================================================
+# BEST MIX: HYDRA + SNIPER COMBINED
+# ============================================================
+print()
+print('=' * 120)
+print('BEST MIX: HYDRA + SNIPER COMBINED OPTIMIZATION')
+print('=' * 120)
+print()
+print('  Grid: P2_min_dump x Sniper_min_px x Sniper_max_px x Sniper_stake_mult')
+print('  Hydra P1/P3 unfiltered | Hydra stake=$10 fixed')
+
+h_thresholds = [0.00, 0.05, 0.08, 0.10, 0.15, 0.20]
+s_min_pxs = [0.85, 0.88, 0.90, 0.93, 0.94, 0.95]
+s_max_pxs = [0.93, 0.95, 0.96, 0.97, 0.98]
+s_mults = [1, 2, 3, 5]
+
+# Precompute
+h_cache2 = {}
+for p in ['P1', 'P2', 'P3']:
+    pt = [t for t in all_trades if t['path'] == p]
+    for thr in h_thresholds:
+        h_cache2[(p, thr)] = [t['net'] for t in pt if t['dump_px'] >= thr]
+
+s_cache2 = {}
+for smin in s_min_pxs:
+    for smax in s_max_pxs:
+        if smin >= smax:
+            continue
+        s_cache2[(smin, smax)] = [t['pnl'] for t in sniper_detail if smin <= t['price'] <= smax]
+
+mix_results = []
+for p2_thr in h_thresholds:
+    h_nets = h_cache2[('P1', 0.00)] + h_cache2[('P2', p2_thr)] + h_cache2[('P3', 0.00)]
+    h_n = len(h_nets)
+    h_total = sum(h_nets)
+    h_wager = h_n * 10
+
+    for smin in s_min_pxs:
+        for smax in s_max_pxs:
+            if smin >= smax:
+                continue
+            s_nets = s_cache2.get((smin, smax), [])
+            if not s_nets:
+                continue
+
+            for mult in s_mults:
+                s_scaled = [p * mult for p in s_nets]
+                s_n = len(s_scaled)
+                s_total = sum(s_scaled)
+                s_wager = s_n * 5 * mult
+
+                combined_net = h_total + s_total
+                combined_wager = h_wager + s_wager
+                edge = combined_net / combined_wager * 100 if combined_wager else 0
+
+                normalized = [x / 10 for x in h_nets] + [x / (5 * mult) for x in s_scaled]
+                m = sum(normalized) / len(normalized)
+                v = sum((x - m) ** 2 for x in normalized) / len(normalized)
+                sharpe = m / (v ** 0.5) if v > 0 else 0
+
+                mix_results.append((p2_thr, smin, smax, mult, h_n, s_n,
+                                    h_total, s_total, combined_net, edge, sharpe,
+                                    combined_net / 12.0))
+
+mix_hdr = '  {:>5s} {:>5s} {:>5s} {:>3s} {:>5s} {:>5s} {:>8s} {:>8s} {:>9s} {:>6s} {:>6s} {:>6s}'.format(
+    'P2min', 'S_mn', 'S_mx', 'S_x', 'H_tr', 'S_tr', 'H_net', 'S_net', 'Total', 'Edge%', 'Shrpe', '$/hr')
+
+mix_results.sort(key=lambda x: x[8], reverse=True)
+print()
+print('  TOP 10 BY TOTAL NET PNL:')
+print(mix_hdr)
+print('  ' + '-' * 80)
+for r in mix_results[:10]:
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>2d}x {:>5d} {:>5d} {:>+8.2f} {:>+8.2f} {:>+9.2f} {:>5.2f}% {:>6.2f} {:>+6.1f}'.format(*r))
+
+mix_results.sort(key=lambda x: x[10], reverse=True)
+print()
+print('  TOP 10 BY SHARPE:')
+print(mix_hdr)
+print('  ' + '-' * 80)
+for r in mix_results[:10]:
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>2d}x {:>5d} {:>5d} {:>+8.2f} {:>+8.2f} {:>+9.2f} {:>5.2f}% {:>6.2f} {:>+6.1f}'.format(*r))
+
+net_sorted = sorted(mix_results, key=lambda x: x[8], reverse=True)
+net_cut = net_sorted[max(1, len(net_sorted) // 10)][8]
+balanced = [r for r in mix_results if r[8] >= net_cut]
+balanced.sort(key=lambda x: x[10], reverse=True)
+print()
+print('  BEST BALANCED (top 10% net, best Sharpe):')
+print(mix_hdr)
+print('  ' + '-' * 80)
+for r in balanced[:10]:
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>2d}x {:>5d} {:>5d} {:>+8.2f} {:>+8.2f} {:>+9.2f} {:>5.2f}% {:>6.2f} {:>+6.1f}'.format(*r))
