@@ -209,10 +209,24 @@ pub async fn fetch_market_meta(
         return Ok(None);
     }
 
-    let event: GammaEvent = resp
-        .json()
-        .await
-        .context("gamma API JSON parse failed")?;
+    let text = resp.text().await.context("gamma API read body failed")?;
+
+    let event: GammaEvent = match serde_json::from_str(&text) {
+        Ok(e) => e,
+        Err(e) => {
+            // Try parsing as array — some endpoints return [event] instead of event
+            if let Ok(mut arr) = serde_json::from_str::<Vec<GammaEvent>>(&text) {
+                if let Some(ev) = arr.pop() {
+                    ev
+                } else {
+                    return Ok(None);
+                }
+            } else {
+                warn!("gamma parse error: {}  body[..200]: {}", e, &text[..text.len().min(200)]);
+                return Err(anyhow::anyhow!("gamma API JSON parse failed: {}", e));
+            }
+        }
+    };
 
     let market = event.markets.iter().find(|m| {
         m.outcomes
