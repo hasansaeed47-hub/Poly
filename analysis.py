@@ -394,3 +394,233 @@ print('  Hydra actual PnL (cum_pnl): ${:.2f} | ROI: {:.1f}%'.format(
 print('  Sniper PnL (cumulative col): ${:.2f}'.format(
     float(sniper_trades[-1]['cumulative']) if sniper_trades else 0))
 print('  Combined: ${:.2f}'.format(actual_pnl + sn_net))
+
+# ============================================================
+# DUMP PRICE RANGE ANALYSIS
+# ============================================================
+
+# Rebuild per-trade records for dump price analysis
+all_trades = []
+for s in all_settles:
+    skey = s['run_id'] + '_' + s['slug'] + '_' + s['asset']
+    e = entries_by_key.get(skey)
+    d = dumps_by_key.get(skey)
+    if not e or not d:
+        continue
+    fill_up = float(e['fill_up'])
+    fill_dn = float(e['fill_dn'])
+    dump_px = float(d['dump_px'])
+    dump_side = d['dump_side']
+    settle_src = float(s['settle_src']) if s['settle_src'].strip() else 0
+    dump_fill_type = d.get('', '').strip()
+    dump_src = d.get('dump_bid_src', '').strip()
+    winner_px = 1.0 if settle_src == 0 else settle_src
+    shares_up = 5.0 / fill_up
+    shares_dn = 5.0 / fill_dn
+    if dump_side == 'UP':
+        gross = shares_up * dump_px + shares_dn * winner_px - 10.0
+    else:
+        gross = shares_up * winner_px + shares_dn * dump_px - 10.0
+    entry_fee_up = shares_up * fill_up * (1 - fill_up) * FEE_RATE
+    entry_fee_dn = shares_dn * fill_dn * (1 - fill_dn) * FEE_RATE
+    if 'MAKER' in dump_fill_type:
+        dump_fee = 0
+    else:
+        if dump_side == 'UP':
+            dump_fee = shares_up * dump_px * (1 - dump_px) * FEE_RATE
+        else:
+            dump_fee = shares_dn * dump_px * (1 - dump_px) * FEE_RATE
+    poly_fee = entry_fee_up + entry_fee_dn + dump_fee
+
+    if dump_fill_type == 'MAKER_FILL':
+        path = 'P1'
+    elif dump_fill_type == 'TAKER_FORCE' and dump_src == 'REAL':
+        path = 'P2'
+    elif 'EST' in dump_fill_type or dump_src == 'EST':
+        path = 'P3'
+    else:
+        path = 'P?'
+    all_trades.append({
+        'path': path, 'gross': gross, 'fee': poly_fee, 'net': gross - poly_fee,
+        'dump_px': dump_px, 'winner_px': winner_px, 'asset': e['asset'].upper(),
+    })
+
+print()
+print('=' * 120)
+print('DUMP PRICE DISTRIBUTION BY PATH')
+print('=' * 120)
+
+buckets = [(0, 0.02), (0.02, 0.05), (0.05, 0.10), (0.10, 0.20), (0.20, 0.30), (0.30, 0.50), (0.50, 1.0)]
+
+for p_name in ['P1', 'P2', 'P3']:
+    pt = [t for t in all_trades if t['path'] == p_name]
+    print()
+    print('  {} ({} trades)'.format(p_name, len(pt)))
+    print('  {:<16s} {:>6s} {:>5s} {:>6s} {:>8s} {:>10s} {:>8s} {:>10s}'.format(
+        'Dump Px Range', 'Count', '  %', 'WR%', 'AvgNet', 'TotalNet', 'AvgDump', 'AvgWinner'))
+    print('  ' + '-' * 75)
+    for lo, hi in buckets:
+        bt = [t for t in pt if lo <= t['dump_px'] < hi]
+        if not bt:
+            continue
+        n = len(bt)
+        wins = sum(1 for t in bt if t['gross'] > 0)
+        total_net = sum(t['net'] for t in bt)
+        avg_net = total_net / n
+        avg_dp = sum(t['dump_px'] for t in bt) / n
+        avg_wp = sum(t['winner_px'] for t in bt) / n
+        print('  [{:.2f}, {:.2f})     {:>6d} {:>5.1f} {:>5.1f}% {:>+8.4f} {:>+10.2f} {:>8.4f} {:>10.4f}'.format(
+            lo, hi, n, n / len(pt) * 100, wins / n * 100, avg_net, total_net, avg_dp, avg_wp))
+
+# ============================================================
+# GRID SEARCH: min dump_px threshold per path
+# ============================================================
+print()
+print('=' * 120)
+print('GRID SEARCH: MINIMUM DUMP PRICE FILTER (skip trade if dump_px < threshold)')
+print('=' * 120)
+
+thresholds = [0.00, 0.01, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30]
+
+for p_name in ['P1', 'P2', 'P3']:
+    pt = [t for t in all_trades if t['path'] == p_name]
+    print()
+    print('  {}'.format(p_name))
+    print('  {:>6s} {:>7s} {:>6s} {:>6s} {:>10s} {:>8s} {:>7s}'.format(
+        'MinDP', 'Trades', 'Kept%', 'WR%', 'NetPnL', 'Avg/Tr', 'Sharpe'))
+    print('  ' + '-' * 56)
+    for thr in thresholds:
+        bt = [t for t in pt if t['dump_px'] >= thr]
+        if not bt:
+            continue
+        n = len(bt)
+        wins = sum(1 for t in bt if t['gross'] > 0)
+        nets = [t['net'] for t in bt]
+        total = sum(nets)
+        avg = total / n
+        var = sum((x - avg) ** 2 for x in nets) / n
+        std = var ** 0.5
+        sharpe = avg / std if std > 0 else 0
+        print('  {:>6.2f} {:>7d} {:>5.1f}% {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f}'.format(
+            thr, n, n / len(pt) * 100, wins / n * 100, total, avg, sharpe))
+
+# ============================================================
+# COMBINED OPTIMIZATION: Best (P1_min, P2_min, P3_min) thresholds
+# ============================================================
+print()
+print('=' * 120)
+print('COMBINED OPTIMIZATION: Best (P1_min, P2_min, P3_min) dump price thresholds')
+print('=' * 120)
+
+# Precompute filtered results for each path x threshold
+cache = {}
+for p_name in ['P1', 'P2', 'P3']:
+    pt = [t for t in all_trades if t['path'] == p_name]
+    for thr in thresholds:
+        bt = [t for t in pt if t['dump_px'] >= thr]
+        n = len(bt)
+        if n == 0:
+            cache[(p_name, thr)] = (0, 0, 0, 0, 0, [])
+            continue
+        wins = sum(1 for t in bt if t['gross'] > 0)
+        nets = [t['net'] for t in bt]
+        total = sum(nets)
+        mean = total / n
+        var = sum((x - mean) ** 2 for x in nets) / n
+        std = var ** 0.5
+        cache[(p_name, thr)] = (n, wins, total, mean, std, nets)
+
+results = []
+for t1 in thresholds:
+    for t2 in thresholds:
+        for t3 in thresholds:
+            n1, w1, net1, _, _, nets1 = cache[('P1', t1)]
+            n2, w2, net2, _, _, nets2 = cache[('P2', t2)]
+            n3, w3, net3, _, _, nets3 = cache[('P3', t3)]
+            total_n = n1 + n2 + n3
+            if total_n < 100:
+                continue
+            total_net = net1 + net2 + net3
+            total_w = w1 + w2 + w3
+            all_nets = nets1 + nets2 + nets3
+            m = sum(all_nets) / len(all_nets)
+            v = sum((x - m) ** 2 for x in all_nets) / len(all_nets)
+            combined_sharpe = m / (v ** 0.5) if v > 0 else 0
+            results.append((t1, t2, t3, total_n, total_w, total_net,
+                            total_net / total_n, combined_sharpe))
+
+fmt_hdr = '  {:>5s} {:>5s} {:>5s} {:>7s} {:>6s} {:>10s} {:>8s} {:>7s}'.format(
+    'P1min', 'P2min', 'P3min', 'Trades', 'WR%', 'NetPnL', 'Avg/Tr', 'Sharpe')
+
+results.sort(key=lambda x: x[5], reverse=True)
+print()
+print('  TOP 10 BY NET PNL:')
+print(fmt_hdr)
+print('  ' + '-' * 60)
+for r in results[:10]:
+    t1, t2, t3, n, w, net, avg, sh = r
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>7d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f}'.format(
+        t1, t2, t3, n, w / n * 100, net, avg, sh))
+
+results.sort(key=lambda x: x[7], reverse=True)
+print()
+print('  TOP 10 BY SHARPE:')
+print(fmt_hdr)
+print('  ' + '-' * 60)
+for r in results[:10]:
+    t1, t2, t3, n, w, net, avg, sh = r
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>7d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f}'.format(
+        t1, t2, t3, n, w / n * 100, net, avg, sh))
+
+net_cutoff = sorted(results, key=lambda x: x[5], reverse=True)[max(1, len(results) // 20)][5]
+balanced = [r for r in results if r[5] >= net_cutoff]
+balanced.sort(key=lambda x: x[7], reverse=True)
+print()
+print('  BEST BALANCED (top 5% net, then best Sharpe):')
+print(fmt_hdr)
+print('  ' + '-' * 60)
+for r in balanced[:5]:
+    t1, t2, t3, n, w, net, avg, sh = r
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>7d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f}'.format(
+        t1, t2, t3, n, w / n * 100, net, avg, sh))
+
+# ============================================================
+# SCENARIO COMPARISON
+# ============================================================
+print()
+print('=' * 120)
+print('SCENARIO COMPARISON: DUMP PRICE FILTERS')
+print('=' * 120)
+
+scenarios = [
+    ('ALL (no filter)', lambda t: True),
+    ('Drop P2 entirely', lambda t: t['path'] != 'P2'),
+    ('P2 >= 0.05 only', lambda t: t['path'] != 'P2' or t['dump_px'] >= 0.05),
+    ('P2 >= 0.10 only', lambda t: t['path'] != 'P2' or t['dump_px'] >= 0.10),
+    ('P2 >= 0.20 only', lambda t: t['path'] != 'P2' or t['dump_px'] >= 0.20),
+    ('BEST: P1>=0, P2>=0.08, P3>=0', lambda t: (
+        (t['path'] == 'P1') or
+        (t['path'] == 'P2' and t['dump_px'] >= 0.08) or
+        (t['path'] == 'P3') or
+        (t['path'] == 'P?'))),
+]
+
+print('  {:<30s} {:>6s} {:>6s} {:>10s} {:>8s} {:>7s} {:>10s}'.format(
+    'Scenario', 'Trades', 'WR%', 'NetPnL', 'Avg/Tr', 'Sharpe', 'vs Base'))
+print('  ' + '-' * 83)
+base_net = None
+for name, filt in scenarios:
+    bt = [t for t in all_trades if filt(t)]
+    n = len(bt)
+    wins = sum(1 for t in bt if t['gross'] > 0)
+    nets = [t['net'] for t in bt]
+    total = sum(nets)
+    avg = total / n
+    var = sum((x - avg) ** 2 for x in nets) / n
+    std = var ** 0.5
+    sharpe = avg / std if std > 0 else 0
+    if base_net is None:
+        base_net = total
+    delta = total - base_net
+    print('  {:<30s} {:>6d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f} {:>+10.2f}'.format(
+        name, n, wins / n * 100, total, avg, sharpe, delta))
