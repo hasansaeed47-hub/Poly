@@ -11,6 +11,7 @@
 /// - WebSocket feeds are event-driven — no polling
 
 use std::collections::HashMap;
+use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,11 +19,34 @@ use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use url::Url;
+
+// ── JSONL log types ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct ClPriceLog {
+    pub asset:  String,
+    pub price:  f64,
+    pub ts:     f64,
+    pub source: String,  // "ws"
+}
+
+#[derive(Debug, Serialize)]
+pub struct BookUpdateLog {
+    pub token_id:  String,
+    pub best_ask:  f64,
+    pub best_bid:  f64,
+    pub ts:        f64,
+    pub source:    String,  // "ws_book" | "ws_delta" | "rest"
+    pub event_type: String,
+}
+
+/// Shared log writer type
+pub type LogWriter = Arc<Mutex<std::fs::File>>;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -217,6 +241,7 @@ pub async fn fetch_books_batch(
     clob_rest: &str,
     token_ids: &[String],
     limiter:   &RateLimiter,
+    book_log:  &LogWriter,
 ) -> Result<HashMap<String, BookEntry>> {
     if token_ids.is_empty() {
         return Ok(HashMap::new());
@@ -282,6 +307,17 @@ pub async fn fetch_books_batch(
                         tid.clone(),
                         BookEntry { best_ask, best_bid, ts: now },
                     );
+                    // Log REST book fetch
+                    let log_entry = BookUpdateLog {
+                        token_id: tid.clone(),
+                        best_ask, best_bid, ts: now,
+                        source: "rest".to_string(),
+                        event_type: "batch_fetch".to_string(),
+                    };
+                    if let Ok(line) = serde_json::to_string(&log_entry) {
+                        let mut file = book_log.lock().await;
+                        let _ = writeln!(file, "{}", line);
+                    }
                 }
             }
         }
@@ -301,11 +337,12 @@ pub async fn run_cl_feed(
     assets:        Vec<String>,
     cl_prices:     ClPrices,
     price_history: PriceHistory,
+    cl_log:        LogWriter,
 ) {
     loop {
         info!("[CL] Connecting to {}", live_ws);
 
-        match connect_cl_feed(&live_ws, &assets, &cl_prices, &price_history).await {
+        match connect_cl_feed(&live_ws, &assets, &cl_prices, &price_history, &cl_log).await {
             Ok(_)  => warn!("[CL] Feed closed cleanly, reconnecting..."),
             Err(e) => error!("[CL] Feed error: {}, reconnecting in {}s", e, WS_RECONNECT_SECS),
         }
@@ -319,6 +356,7 @@ async fn connect_cl_feed(
     assets:        &[String],
     cl_prices:     &ClPrices,
     price_history: &PriceHistory,
+    cl_log:        &LogWriter,
 ) -> Result<()> {
     let url = Url::parse(live_ws).context("invalid live WS URL")?;
     let (mut ws, _) = connect_async(url).await.context("CL WS connect failed")?;
@@ -340,7 +378,7 @@ async fn connect_cl_feed(
         let msg = msg.context("CL WS message error")?;
         if let Message::Text(text) = msg {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                process_cl_message(&v, cl_prices, price_history);
+                process_cl_message(&v, cl_prices, price_history, cl_log).await;
             }
         }
     }
@@ -348,10 +386,11 @@ async fn connect_cl_feed(
     Ok(())
 }
 
-fn process_cl_message(
+async fn process_cl_message(
     v:             &serde_json::Value,
     cl_prices:     &ClPrices,
     price_history: &PriceHistory,
+    cl_log:        &LogWriter,
 ) {
     let channel = v.get("channel").and_then(|c| c.as_str()).unwrap_or("");
     if channel != "crypto_prices_chainlink" {
@@ -384,6 +423,20 @@ fn process_cl_message(
 
     cl_prices.insert(asset.clone(), (ts, price));
 
+    // Log every CL price update to JSONL
+    {
+        let log_entry = ClPriceLog {
+            asset: asset.clone(),
+            price,
+            ts,
+            source: "ws".to_string(),
+        };
+        if let Ok(line) = serde_json::to_string(&log_entry) {
+            let mut file = cl_log.lock().await;
+            let _ = writeln!(file, "{}", line);
+        }
+    }
+
     // Append to price history (cap at 1000 entries per asset)
     let mut hist = price_history.entry(asset).or_default();
     hist.push((ts, price));
@@ -401,11 +454,12 @@ pub async fn run_book_feed(
     book_state: BookState,
     book_live:  Arc<std::sync::atomic::AtomicU64>,
     mut sub_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
+    book_log:   LogWriter,
 ) {
     loop {
         info!("[BOOK] Connecting to {}", clob_ws);
 
-        match connect_book_feed(&clob_ws, &token_ids, &book_state, &book_live, &mut sub_rx).await {
+        match connect_book_feed(&clob_ws, &token_ids, &book_state, &book_live, &mut sub_rx, &book_log).await {
             Ok(_)  => warn!("[BOOK] Feed closed cleanly, reconnecting..."),
             Err(e) => error!("[BOOK] Feed error: {}, reconnecting in {}s", e, WS_RECONNECT_SECS),
         }
@@ -421,6 +475,7 @@ async fn connect_book_feed(
     book_state: &BookState,
     book_live:  &Arc<std::sync::atomic::AtomicU64>,
     sub_rx:     &mut tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
+    book_log:   &LogWriter,
 ) -> Result<()> {
     let url = Url::parse(clob_ws).context("invalid CLOB WS URL")?;
     let (ws, _) = connect_async(url).await.context("CLOB WS connect failed")?;
@@ -451,7 +506,7 @@ async fn connect_book_feed(
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                            process_book_message(&v, book_state);
+                            process_book_message(&v, book_state, book_log).await;
                         }
                     }
                     Some(Ok(_)) => {} // ping/pong/binary
@@ -477,7 +532,7 @@ async fn connect_book_feed(
     }
 }
 
-fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
+async fn process_book_message(v: &serde_json::Value, book_state: &BookState, book_log: &LogWriter) {
     // Polymarket CLOB WS sends:
     // 1. "book" events: full snapshot with asks[] and bids[]
     // 2. "price_change" events: delta with changes[] array
@@ -500,7 +555,17 @@ fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
             let best_ask = extract_best_ask(v);
             let best_bid = extract_best_bid(v);
             if best_ask > 0.0 {
-                book_state.insert(asset_id, BookEntry { best_ask, best_bid, ts: now });
+                book_state.insert(asset_id.clone(), BookEntry { best_ask, best_bid, ts: now });
+                // Log book snapshot
+                let log_entry = BookUpdateLog {
+                    token_id: asset_id, best_ask, best_bid, ts: now,
+                    source: "ws_book".to_string(),
+                    event_type: "snapshot".to_string(),
+                };
+                if let Ok(line) = serde_json::to_string(&log_entry) {
+                    let mut file = book_log.lock().await;
+                    let _ = writeln!(file, "{}", line);
+                }
             }
         }
         "price_change" => {
@@ -568,6 +633,19 @@ fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
 
                 entry.ts = now;
                 if entry.best_ask > 0.0 {
+                    // Log price change delta
+                    let log_entry = BookUpdateLog {
+                        token_id: asset_id.clone(),
+                        best_ask: entry.best_ask,
+                        best_bid: entry.best_bid,
+                        ts: now,
+                        source: "ws_delta".to_string(),
+                        event_type: "price_change".to_string(),
+                    };
+                    if let Ok(line) = serde_json::to_string(&log_entry) {
+                        let mut file = book_log.lock().await;
+                        let _ = writeln!(file, "{}", line);
+                    }
                     book_state.insert(asset_id, entry);
                 }
             }
@@ -648,9 +726,17 @@ mod tests {
         assert_eq!(extract_best_ask(&v), 0.52);
     }
 
-    #[test]
-    fn price_change_merges_correctly() {
+    fn test_book_log() -> LogWriter {
+        let f = std::fs::OpenOptions::new()
+            .create(true).write(true).truncate(true)
+            .open(std::env::temp_dir().join("test_book.jsonl")).unwrap();
+        Arc::new(Mutex::new(f))
+    }
+
+    #[tokio::test]
+    async fn price_change_merges_correctly() {
         let book_state: BookState = Arc::new(DashMap::new());
+        let log = test_book_log();
 
         // First: full snapshot
         let snap = serde_json::json!({
@@ -659,7 +745,7 @@ mod tests {
             "asks": [{"price": "0.55", "size": "10"}],
             "bids": [{"price": "0.45", "size": "5"}]
         });
-        process_book_message(&snap, &book_state);
+        process_book_message(&snap, &book_state, &log).await;
 
         let entry = book_state.get("token1").unwrap();
         assert_eq!(entry.best_ask, 0.55);
@@ -674,16 +760,17 @@ mod tests {
                 {"side": "SELL", "price": "0.52", "size": "3"}
             ]
         });
-        process_book_message(&delta, &book_state);
+        process_book_message(&delta, &book_state, &log).await;
 
         let entry = book_state.get("token1").unwrap();
         assert_eq!(entry.best_ask, 0.52, "ask should improve to 0.52");
         assert_eq!(entry.best_bid, 0.45, "bid should be preserved");
     }
 
-    #[test]
-    fn price_change_bid_only_preserves_ask() {
+    #[tokio::test]
+    async fn price_change_bid_only_preserves_ask() {
         let book_state: BookState = Arc::new(DashMap::new());
+        let log = test_book_log();
 
         // Snapshot first
         let snap = serde_json::json!({
@@ -692,7 +779,7 @@ mod tests {
             "asks": [{"price": "0.60", "size": "10"}],
             "bids": [{"price": "0.40", "size": "5"}]
         });
-        process_book_message(&snap, &book_state);
+        process_book_message(&snap, &book_state, &log).await;
 
         // Bid-only delta
         let delta = serde_json::json!({
@@ -702,7 +789,7 @@ mod tests {
                 {"side": "BUY", "price": "0.42", "size": "8"}
             ]
         });
-        process_book_message(&delta, &book_state);
+        process_book_message(&delta, &book_state, &log).await;
 
         let entry = book_state.get("token2").unwrap();
         assert_eq!(entry.best_ask, 0.60, "ask should be preserved");

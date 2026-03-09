@@ -17,6 +17,8 @@ mod runner;
 mod signal;
 
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -29,12 +31,38 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use feeds::{
-    BookState, ClPrices, MarketMeta, PriceHistory, RateLimiter,
+    BookState, ClPrices, LogWriter, MarketMeta, PriceHistory, RateLimiter,
     build_slug, current_window_starts, fetch_books_batch, fetch_market_meta,
     run_book_feed, run_cl_feed,
 };
 use runner::{ConfigRunner, RunnerConfig};
 use signal::{compute, estimate_sigma, Side};
+
+// ── Tick-level signal log ────────────────────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct TickLog {
+    tick:       u64,
+    ts:         f64,
+    slug:       String,
+    asset:      String,
+    tf:         u32,
+    cl_price:   f64,
+    open_price: f64,
+    sigma:      f64,
+    secs_left:  f64,
+    book_yes:   f64,
+    book_no:    f64,
+    bid_yes:    f64,
+    bid_no:     f64,
+    fair_yes:   f64,
+    fair_no:    f64,
+    edge_yes:   f64,
+    edge_no:    f64,
+    best_side:  String,
+    best_edge:  f64,
+}
+
 
 // ── Config file types ─────────────────────────────────────────────────────────
 
@@ -119,6 +147,26 @@ async fn main() -> Result<()> {
     // Create log directory
     std::fs::create_dir_all("logs").context("cannot create logs/")?;
 
+    // Open JSONL log files for comprehensive data capture
+    let cl_log: LogWriter = Arc::new(tokio::sync::Mutex::new(
+        OpenOptions::new().create(true).append(true)
+            .open("logs/cl_prices.jsonl").context("cannot open logs/cl_prices.jsonl")?
+    ));
+    let book_log: LogWriter = Arc::new(tokio::sync::Mutex::new(
+        OpenOptions::new().create(true).append(true)
+            .open("logs/books.jsonl").context("cannot open logs/books.jsonl")?
+    ));
+    let tick_log_file = Arc::new(tokio::sync::Mutex::new(
+        OpenOptions::new().create(true).append(true)
+            .open("logs/ticks.jsonl").context("cannot open logs/ticks.jsonl")?
+    ));
+    let mtm_log_file = Arc::new(tokio::sync::Mutex::new(
+        OpenOptions::new().create(true).append(true)
+            .open("logs/mtm.jsonl").context("cannot open logs/mtm.jsonl")?
+    ));
+
+    info!("Logging to: logs/cl_prices.jsonl, logs/books.jsonl, logs/ticks.jsonl, logs/mtm.jsonl");
+
     // Shared state
     let cl_prices:     ClPrices      = Arc::new(DashMap::new());
     let book_state:    BookState     = Arc::new(DashMap::new());
@@ -178,8 +226,9 @@ async fn main() -> Result<()> {
         let ph = price_history.clone();
         let assets = cfg.feed.assets.clone();
         let ws = cfg.feed.live_ws.clone();
+        let cl_log = cl_log.clone();
         tokio::spawn(async move {
-            run_cl_feed(ws, assets, cp, ph).await;
+            run_cl_feed(ws, assets, cp, ph, cl_log).await;
         });
     }
 
@@ -191,8 +240,9 @@ async fn main() -> Result<()> {
         let ti = token_ids.clone();
         let bl = book_live.clone();
         let ws = cfg.feed.clob_ws.clone();
+        let book_log = book_log.clone();
         tokio::spawn(async move {
-            run_book_feed(ws, ti, bs, bl, book_sub_rx).await;
+            run_book_feed(ws, ti, bs, bl, book_sub_rx, book_log).await;
         });
     }
 
@@ -271,7 +321,7 @@ async fn main() -> Result<()> {
         if tick_count % 4 == 0 {
             let all_tokens: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
             if !all_tokens.is_empty() {
-                match fetch_books_batch(&http, &cfg.feed.clob_rest, &all_tokens, &limiter).await {
+                match fetch_books_batch(&http, &cfg.feed.clob_rest, &all_tokens, &limiter, &book_log).await {
                     Ok(books) => {
                         for (tid, entry) in books {
                             book_state.insert(tid, entry);
@@ -398,6 +448,35 @@ async fn main() -> Result<()> {
                 None    => continue,
             };
 
+            // Log EVERY signal computation to ticks.jsonl — zero gaps
+            {
+                let tick_entry = TickLog {
+                    tick: tick_count,
+                    ts: now,
+                    slug: sig.slug.clone(),
+                    asset: sig.asset.clone(),
+                    tf: sig.tf,
+                    cl_price: sig.cl_price,
+                    open_price: sig.open_price,
+                    sigma: sig.sigma,
+                    secs_left: sig.secs_left,
+                    book_yes: sig.book_yes,
+                    book_no: sig.book_no,
+                    bid_yes: sig.bid_yes,
+                    bid_no: sig.bid_no,
+                    fair_yes: sig.fair_yes,
+                    fair_no: sig.fair_no,
+                    edge_yes: sig.edge_yes,
+                    edge_no: sig.edge_no,
+                    best_side: sig.best_side.map(|s| s.to_string()).unwrap_or_default(),
+                    best_edge: sig.best_edge,
+                };
+                if let Ok(line) = serde_json::to_string(&tick_entry) {
+                    let mut f = tick_log_file.lock().await;
+                    let _ = writeln!(f, "{}", line);
+                }
+            }
+
             if sig.best_edge > 0.05 {
                 debug!(
                     "[SCAN] {} cl={:.2} fair_y={:.3} bk_y={:.3} bk_n={:.3} dev={:+.3} secs={:.0}",
@@ -405,8 +484,15 @@ async fn main() -> Result<()> {
                 );
             }
 
-            // Dispatch to all 5 runners
+            // Dispatch to all 5 runners + log mark-to-market for open positions
             for runner in &mut runners {
+                // Log MTM for any open positions in this slug before processing
+                for mtm in runner.get_mtm_entries(&sig) {
+                    if let Ok(line) = serde_json::to_string(&mtm) {
+                        let mut f = mtm_log_file.lock().await;
+                        let _ = writeln!(f, "{}", line);
+                    }
+                }
                 runner.on_signal(&sig, meta.window_end).await;
             }
         }
