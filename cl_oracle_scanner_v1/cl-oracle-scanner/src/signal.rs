@@ -103,6 +103,9 @@ pub fn estimate_sigma(prices: &[(f64, f64)], window_secs: f64, now: f64) -> f64 
     for pair in window.windows(2) {
         let (t0, p0) = pair[0];
         let (t1, p1) = pair[1];
+        if p0 <= 0.0 || p1 <= 0.0 {
+            continue; // skip invalid prices to avoid NaN
+        }
         let dt = (t1 - t0).max(0.01); // avoid division by zero
         let log_ret = (p1 / p0).ln();
 

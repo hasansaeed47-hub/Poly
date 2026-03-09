@@ -226,9 +226,9 @@ impl ConfigRunner {
     pub async fn on_settlement(&mut self, slug: &str, winning_side: Side, settle_ts: f64) {
         let trade_ids: Vec<String> = self
             .positions
-            .keys()
-            .filter(|k| k.starts_with(slug))
-            .cloned()
+            .iter()
+            .filter(|(_, pos)| pos.slug == slug)
+            .map(|(k, _)| k.clone())
             .collect();
 
         for trade_id in trade_ids {
@@ -261,7 +261,7 @@ impl ConfigRunner {
         };
 
         // Already in this slug? (one position per slug per config)
-        let already_in = self.positions.keys().any(|k| k.starts_with(&sig.slug));
+        let already_in = self.positions.values().any(|p| p.slug == sig.slug);
         if already_in {
             self.stats.reject_duplicate += 1;
             return;
@@ -333,9 +333,9 @@ impl ConfigRunner {
         // Only check positions for this slug
         let trade_ids: Vec<String> = self
             .positions
-            .keys()
-            .filter(|k| k.starts_with(&sig.slug))
-            .cloned()
+            .iter()
+            .filter(|(_, pos)| pos.slug == sig.slug)
+            .map(|(k, _)| k.clone())
             .collect();
 
         for trade_id in trade_ids {

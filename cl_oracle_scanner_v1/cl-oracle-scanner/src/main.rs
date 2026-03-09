@@ -354,6 +354,29 @@ async fn main() -> Result<()> {
             if !new_tokens.is_empty() {
                 let _ = book_sub_tx.send(new_tokens);
             }
+
+            // Cleanup settled markets to prevent memory leak
+            let stale_slugs: Vec<String> = settled.keys()
+                .filter(|slug| {
+                    markets.get(*slug)
+                        .map(|m| now_u > m.window_end + 120) // keep for 2 min after end
+                        .unwrap_or(true)
+                })
+                .cloned()
+                .collect();
+            for slug in &stale_slugs {
+                if let Some(meta) = markets.remove(slug) {
+                    token_ids.remove(&meta.token_yes);
+                    token_ids.remove(&meta.token_no);
+                    book_state.remove(&meta.token_yes);
+                    book_state.remove(&meta.token_no);
+                }
+                settled.remove(slug);
+                close_prices.remove(slug);
+            }
+            if !stale_slugs.is_empty() {
+                debug!("[CLEANUP] Removed {} stale markets", stale_slugs.len());
+            }
         }
 
         // ── Batch book refresh (every 2s via REST as fallback) ────────────────
@@ -456,11 +479,11 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            // Record open price at window start (first CL price we see)
+            // Record open price at window start (first fresh CL price we see)
             if meta.open_price <= 0.0 {
-                if now_u >= meta.window_start {
+                if now_u >= meta.window_start && cl_ts >= meta.window_start as f64 {
                     meta.open_price = cl;
-                    info!("[OPEN] {} open_price={:.2}", slug, cl);
+                    info!("[OPEN] {} open_price={:.2} cl_ts={:.0}", slug, cl, cl_ts);
                 }
                 continue; // don't trade until open price is set
             }
