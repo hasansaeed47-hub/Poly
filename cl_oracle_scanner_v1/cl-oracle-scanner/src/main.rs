@@ -396,22 +396,25 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── Capture CL price at window close (before settlement grace) ────
+        // ── Capture CL price at exact window close ────────────────────────
+        // Take the LAST CL price update before or at window_end.
+        // Keep overwriting until settlement fires at window_end+5.
         for (slug, meta) in &markets {
-            if close_prices.contains_key(slug) || settled.get(slug).copied().unwrap_or(false) {
+            if settled.get(slug).copied().unwrap_or(false) {
                 continue;
             }
-            // Capture CL price as close to window_end as possible
-            // Use 5s window to ensure we don't miss it (matches settlement grace)
             if now_u >= meta.window_end && now_u < meta.window_end + 5 {
                 if let Some(cl_ref) = cl_prices.get(&meta.asset) {
-                    // Only update if this is a fresher price than what we have
-                    let should_update = close_prices.get(slug)
-                        .map(|(_, prev_ts)| now > *prev_ts)
-                        .unwrap_or(true);
-                    if should_update {
-                        close_prices.insert(slug.clone(), (cl_ref.1, now));
-                        info!("[CLOSE_PRICE] {} cl={:.2} age={:.1}s", slug, cl_ref.1, now - cl_ref.0);
+                    let cl_ts = cl_ref.0;
+                    let cl_price = cl_ref.1;
+                    // Only use CL prices that arrived at or before window_end
+                    if cl_ts <= meta.window_end as f64 + 1.0 {
+                        // Always overwrite — want the freshest pre-close price
+                        let prev = close_prices.get(slug).map(|(p, _)| *p);
+                        close_prices.insert(slug.clone(), (cl_price, cl_ts));
+                        if prev.is_none() {
+                            info!("[CLOSE_PRICE] {} cl={:.6} cl_ts={:.3}", slug, cl_price, cl_ts);
+                        }
                     }
                 }
             }
@@ -428,12 +431,14 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Use captured close price, fall back to current CL
-                let cl_settle = close_prices
-                    .get(slug)
-                    .map(|(p, _)| *p)
-                    .or_else(|| cl_prices.get(&meta.asset).map(|v| v.1))
-                    .unwrap_or(0.0);
+                // Use captured close price only — no fallback to post-window CL
+                let cl_settle = match close_prices.get(slug) {
+                    Some((p, _)) => *p,
+                    None => {
+                        warn!("[SETTLE] {} no close price captured, deferring", slug);
+                        continue;
+                    }
+                };
 
                 if cl_settle <= 0.0 {
                     continue;
