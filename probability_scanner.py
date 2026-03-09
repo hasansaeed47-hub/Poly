@@ -44,8 +44,10 @@ BN_SYMBOLS = {
 }
 BINANCE_API = "https://api.binance.com/api/v3"
 
-# S1 window: both sides must fill within this many seconds to count as S1
-S1_WINDOW = 3.0
+# S1 window: both sides must fill within this many seconds to count as S1.
+# NOTE: With POLL_SEC=5, S1 only triggers on same-tick fills (gap=0).
+# Real bot would see more S1s via WebSocket. This undercounts S1.
+S1_WINDOW = float(POLL_SEC)  # match poll interval — same tick = S1
 
 # Fee model: maker=0%, taker=p*(1-p)*3.14%, settlement=0%
 def taker_fee(px: float) -> float:
@@ -940,7 +942,9 @@ def display(active: list[WindowTracker]):
 
     print()
     print(f"  {GRAY}Ctrl+C → save & exit | Poll {POLL_SEC}s | "
-          f"S1 window={S1_WINDOW}s | BASE=${BASE_BID} ASYM=${ASYM_TIGHT}/{ASYM_WIDE}{RST}")
+          f"S1 window={S1_WINDOW:.0f}s | BASE=${BASE_BID} ASYM=${ASYM_TIGHT}/{ASYM_WIDE}{RST}")
+    print(f"  {GRAY}BIAS: hedge asks are LATE (pessimistic), fills may be missed between polls.{RST}")
+    print(f"  {GRAY}      Real bot via WebSocket would have better hedge asks + more S1 fills.{RST}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────
