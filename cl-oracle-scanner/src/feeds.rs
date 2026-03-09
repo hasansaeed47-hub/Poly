@@ -438,41 +438,63 @@ async fn connect_cl_feed(
     let url = Url::parse(live_ws).context("invalid live WS URL")?;
     let (mut ws, _) = connect_async(url).await.context("CL WS connect failed")?;
 
-    // RTDS subscription format: action + subscriptions array
-    // Symbol format: "btc/usd" (lowercase, slash separated)
-    // Note: RTDS may only support one symbol per subscription but we send all
-    // in one subscriptions array — if this doesn't work, we'll need separate connections.
-    let filters: Vec<String> = assets.iter().map(|a| format!("{}/usd", a.to_lowercase())).collect();
+    // RTDS subscription format per Polymarket docs:
+    //   filters: "" for all symbols, or JSON string like '{"symbol":"btc/usd"}'
+    //   type: "*" for all message types, or "update" for price updates only
+    // Subscribe once per asset with proper JSON filter format.
+    let subs: Vec<serde_json::Value> = assets.iter().map(|a| {
+        let symbol = format!("{}/usd", a.to_lowercase());
+        let filter_json = serde_json::json!({"symbol": symbol}).to_string();
+        serde_json::json!({
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+            "filters": filter_json
+        })
+    }).collect();
     let sub = serde_json::json!({
         "action": "subscribe",
-        "subscriptions": filters.iter().map(|f| {
-            serde_json::json!({
-                "topic": "crypto_prices_chainlink",
-                "type": "update",
-                "filters": f
-            })
-        }).collect::<Vec<_>>()
+        "subscriptions": subs
     });
     ws.send(Message::Text(sub.to_string())).await?;
     debug!("[CL] Subscribe msg: {}", serde_json::to_string(&sub).unwrap_or_default());
 
     info!("[CL] Feed connected, {} assets", assets.len());
 
-    while let Some(msg) = ws.next().await {
-        let msg = msg.context("CL WS message error")?;
-        match msg {
-            Message::Text(text) => {
-                if text.contains("payload") {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                        process_cl_message(&v, cl_prices, price_history);
+    // Polymarket RTDS requires text "ping" every 5s to keep connection alive.
+    // Use select! to interleave keepalive pings with message processing.
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = ping_interval.tick() => {
+                ws.send(Message::Text("ping".to_string())).await?;
+            }
+            msg = ws.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        // Ignore "pong" keepalive responses
+                        if text == "pong" {
+                            continue;
+                        }
+                        if text.contains("payload") {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                process_cl_message(&v, cl_prices, price_history);
+                            }
+                        }
                     }
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = ws.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Close(frame))) => {
+                        warn!("[CL] WS close frame: {:?}", frame);
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(anyhow::anyhow!("CL WS message error: {}", e)),
+                    None => break,
                 }
             }
-            Message::Ping(data) => {
-                // Respond to server pings to keep connection alive
-                let _ = ws.send(Message::Pong(data)).await;
-            }
-            _ => {}
         }
     }
 
@@ -531,7 +553,12 @@ fn process_cl_message(
                 .as_secs_f64()
         });
 
+    // Log first price per asset at INFO level for diagnostics
+    let is_new = !cl_prices.contains_key(&asset);
     cl_prices.insert(asset.clone(), (ts, price));
+    if is_new {
+        info!("[CL] First price for {}: {:.2} at ts={:.0}", asset, price, ts);
+    }
 
     let mut hist = price_history.entry(asset).or_default();
     hist.push((ts, price));
@@ -573,12 +600,14 @@ async fn connect_book_feed(
 
     let ids: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
     if !ids.is_empty() {
-        // Polymarket CLOB Market Channel subscription format:
-        // {"type": "market", "assets_ids": ["token1", "token2", ...]}
+        // Polymarket CLOB Market Channel subscription format per docs:
+        // {"type": "market", "assets_ids": [...], "custom_feature_enabled": true}
+        // custom_feature_enabled gives us best_bid_ask events.
         // No auth needed for market channel. Max 500 instruments per connection.
         let sub = serde_json::json!({
             "type": "market",
-            "assets_ids": ids
+            "assets_ids": ids,
+            "custom_feature_enabled": true
         });
         debug!("[BOOK] Subscribe msg: {} tokens", ids.len());
         ws.send(Message::Text(sub.to_string())).await?;
@@ -591,35 +620,53 @@ async fn connect_book_feed(
         .as_secs();
     book_live.store(connect_ts, std::sync::atomic::Ordering::Relaxed);
 
-    let mut msg_count = 0u64;
-    while let Some(msg) = ws.next().await {
-        let msg = msg.context("CLOB WS message error")?;
-        match msg {
-            Message::Text(text) => {
-                msg_count += 1;
-                if msg_count <= 5 {
-                    debug!("[BOOK] WS msg #{}: {}", msg_count, &text[..text.len().min(500)]);
-                }
+    // Polymarket CLOB WS requires ping every 10 seconds to keep connection alive.
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(10));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-                // CLOB WS may send messages as JSON arrays
-                if text.starts_with('[') {
-                    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
-                        for v in &arr {
-                            process_book_message(v, book_state);
+    let mut msg_count = 0u64;
+
+    loop {
+        tokio::select! {
+            _ = ping_interval.tick() => {
+                ws.send(Message::Text("ping".to_string())).await?;
+            }
+            msg = ws.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        // Ignore keepalive responses
+                        if text == "pong" || text == "PONG" {
+                            continue;
+                        }
+
+                        msg_count += 1;
+                        if msg_count <= 5 {
+                            debug!("[BOOK] WS msg #{}: {}", msg_count, &text[..text.len().min(500)]);
+                        }
+
+                        // CLOB WS may send messages as JSON arrays
+                        if text.starts_with('[') {
+                            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+                                for v in &arr {
+                                    process_book_message(v, book_state);
+                                }
+                            }
+                        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            process_book_message(&v, book_state);
                         }
                     }
-                } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    process_book_message(&v, book_state);
+                    Some(Ok(Message::Ping(data))) => {
+                        let _ = ws.send(Message::Pong(data)).await;
+                    }
+                    Some(Ok(Message::Close(frame))) => {
+                        warn!("[BOOK] WS close frame: {:?}", frame);
+                        break;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(anyhow::anyhow!("CLOB WS message error: {}", e)),
+                    None => break,
                 }
             }
-            Message::Ping(data) => {
-                let _ = ws.send(Message::Pong(data)).await;
-            }
-            Message::Close(frame) => {
-                warn!("[BOOK] WS close frame: {:?}", frame);
-                break;
-            }
-            _ => {}
         }
     }
 
@@ -635,6 +682,27 @@ fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
         .as_secs_f64();
 
     match event_type {
+        "best_bid_ask" => {
+            // Fast path: direct top-of-book update (requires custom_feature_enabled)
+            // {"event_type":"best_bid_ask","asset_id":"...","best_bid":"0.50","best_ask":"0.52",...}
+            let asset_id = match v.get("asset_id").and_then(|a| a.as_str()) {
+                Some(id) => id.to_string(),
+                None     => return,
+            };
+            let best_ask = v.get("best_ask").and_then(|b| b.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            let best_bid = v.get("best_bid").and_then(|b| b.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+
+            if best_ask > 0.0 {
+                let mut entry = book_state
+                    .get(&asset_id)
+                    .map(|e| e.clone())
+                    .unwrap_or_else(BookEntry::new);
+                entry.best_ask = best_ask;
+                if best_bid > 0.0 { entry.best_bid = best_bid; }
+                entry.ts = now;
+                book_state.insert(asset_id, entry);
+            }
+        }
         "book" => {
             // Full book snapshot: {"event_type":"book","asset_id":"...","asks":[...],"bids":[...]}
             let asset_id = match v.get("asset_id").and_then(|a| a.as_str()) {
