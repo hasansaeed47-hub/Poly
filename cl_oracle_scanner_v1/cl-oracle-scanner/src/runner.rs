@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::signal::{Signal, Side};
 

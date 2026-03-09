@@ -149,10 +149,10 @@ async fn main() -> Result<()> {
                     &http, &cfg.feed.gamma_api, &slug, asset, tf, &limiter,
                 ).await {
                     Ok(Some(meta)) => {
+                        let yes_short = &meta.token_yes[..meta.token_yes.len().min(8)];
+                        let no_short  = &meta.token_no[..meta.token_no.len().min(8)];
                         info!("[DISCOVER] {} YES={} NO={}",
-                            slug,
-                            &meta.token_yes[..8],
-                            &meta.token_no[..8]
+                            slug, yes_short, no_short
                         );
                         // Register token IDs for book WS subscription
                         token_ids.insert(meta.token_yes.clone(), ());
