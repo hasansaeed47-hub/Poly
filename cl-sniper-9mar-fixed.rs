@@ -272,6 +272,9 @@ fn all_engines() -> Vec<EngCfg> {
 struct PT {
     dir: String, asset: &'static str, px: f64, shares: f64,
     sl_px: f64, end_ts: i64, tid: String, cl_open: f64, delta: f64,
+    slug: String, bn_px: f64, bn_trend_15s: f64, cl_trend_10s: f64,
+    hour_range: f64, best_bid: f64, best_ask: f64, cl_open_dist_s: i64,
+    left_s: i64, fill_type: &'static str,
 }
 
 struct Tracker {
@@ -301,21 +304,42 @@ struct CsvLog {
     file: std::fs::File,
 }
 
+struct CsvRow<'a> {
+    engine: &'a str, event: &'a str, asset: &'a str, wmin: u32, dir: &'a str,
+    slug: &'a str, px: f64, delta: f64, cl_open: f64, cl_close: f64,
+    pnl: f64, cum: f64, cap: f64, consec: u32,
+    bn_px: f64, bn_trend_15s: f64, cl_trend_10s: f64, hour_range: f64,
+    best_bid: f64, best_ask: f64, cl_open_dist_s: i64, cl_close_dist_s: i64,
+    left_s: i64, fill_type: &'a str, settle_src: &'a str,
+    clob_up_bid: f64, clob_dn_bid: f64,
+}
+
 impl CsvLog {
     fn new() -> Result<Self> {
         let exists = std::path::Path::new(CSV_PATH).exists();
         let file = std::fs::OpenOptions::new().create(true).append(true).open(CSV_PATH)?;
         let mut log = CsvLog { file };
         if !exists {
-            writeln!(log.file, "timestamp,engine,event,asset,window,direction,price,delta_pct,cl_open,cl_close,pnl,cumulative,consec_loss")?;
+            writeln!(log.file, "timestamp,engine,event,asset,window,direction,slug,\
+                price,delta_pct,cl_open,cl_close,pnl,cumulative,cap,consec_loss,\
+                bn_px,bn_trend_15s,cl_trend_10s,hour_range,\
+                best_bid,best_ask,cl_open_dist_s,cl_close_dist_s,\
+                left_s,fill_type,settle_src,clob_up_bid,clob_dn_bid")?;
         }
         Ok(log)
     }
-    fn write(&mut self, engine: &str, event: &str, asset: &str, wmin: u32, dir: &str,
-             px: f64, delta: f64, cl_open: f64, cl_close: f64, pnl: f64, cum: f64, consec: u32) {
+    fn write(&mut self, r: &CsvRow) {
         let ts = Utc::now().to_rfc3339();
-        let _ = writeln!(self.file, "{},{},{},{},{}m,{},{:.3},{:.4},{:.2},{:.2},{:.2},{:.2},{}",
-            ts, engine, event, asset.to_uppercase(), wmin, dir, px, delta, cl_open, cl_close, pnl, cum, consec);
+        let _ = writeln!(self.file, "{},{},{},{},{}m,{},{},\
+            {:.3},{:.4},{:.2},{:.2},{:.2},{:.2},{:.2},{},\
+            {:.2},{:.4},{:.4},{:.3},\
+            {:.3},{:.3},{},{},\
+            {},{},{},{:.3},{:.3}",
+            ts, r.engine, r.event, r.asset.to_uppercase(), r.wmin, r.dir, r.slug,
+            r.px, r.delta, r.cl_open, r.cl_close, r.pnl, r.cum, r.cap, r.consec,
+            r.bn_px, r.bn_trend_15s, r.cl_trend_10s, r.hour_range,
+            r.best_bid, r.best_ask, r.cl_open_dist_s, r.cl_close_dist_s,
+            r.left_s, r.fill_type, r.settle_src, r.clob_up_bid, r.clob_dn_bid);
         let _ = self.file.flush();
     }
 }
@@ -454,10 +478,17 @@ impl Sniper {
             // === SETTLE active trade ===
             if tr.active.is_some() {
                 // Extract fields before mutable operations (borrow checker)
-                let (slug, pt_dir, pt_asset, pt_px, pt_shares, pt_sl_px, pt_end_ts, pt_tid, pt_cl_open, pt_delta) = {
+                let pt_snap = {
                     let (slug, pt) = tr.active.as_ref().unwrap();
-                    (slug.clone(), pt.dir.clone(), pt.asset, pt.px, pt.shares, pt.sl_px, pt.end_ts, pt.tid.clone(), pt.cl_open, pt.delta)
+                    (slug.clone(), pt.dir.clone(), pt.asset, pt.px, pt.shares, pt.sl_px,
+                     pt.end_ts, pt.tid.clone(), pt.cl_open, pt.delta,
+                     pt.bn_px, pt.bn_trend_15s, pt.cl_trend_10s, pt.hour_range,
+                     pt.best_bid, pt.best_ask, pt.cl_open_dist_s, pt.left_s, pt.fill_type)
                 };
+                let (slug, pt_dir, pt_asset, pt_px, pt_shares, pt_sl_px,
+                     pt_end_ts, pt_tid, pt_cl_open, pt_delta,
+                     pt_bn_px, pt_bn_trend, pt_cl_trend, pt_hour_range,
+                     pt_best_bid, pt_best_ask, pt_cl_open_dist, pt_left_s, pt_fill_type) = pt_snap;
                 let now = Utc::now().timestamp();
 
                 // SL check: bid <= 50% of fill price (single confirm, no CL flip)
@@ -467,8 +498,15 @@ impl Sniper {
                     let pnl = recovery - STAKE;
                     info!("[{}] SL {} {} bid={:.3}<={:.3} ${:+.2}", tr.cfg.id, pt_dir, pt_asset.to_uppercase(), bk.bb, pt_sl_px, pnl);
                     tr.record_sl(pnl);
-                    self.csv.write(tr.cfg.id, "SL", pt_asset, tr.cfg.wmin, &pt_dir,
-                        pt_px, pt_delta, pt_cl_open, 0.0, pnl, tr.pnl, tr.consec_loss);
+                    self.csv.write(&CsvRow {
+                        engine: tr.cfg.id, event: "SL", asset: pt_asset, wmin: tr.cfg.wmin, dir: &pt_dir,
+                        slug: &slug, px: pt_px, delta: pt_delta, cl_open: pt_cl_open, cl_close: 0.0,
+                        pnl, cum: tr.pnl, cap: tr.cap, consec: tr.consec_loss,
+                        bn_px: pt_bn_px, bn_trend_15s: pt_bn_trend, cl_trend_10s: pt_cl_trend,
+                        hour_range: pt_hour_range, best_bid: bk.bb, best_ask: pt_best_ask,
+                        cl_open_dist_s: pt_cl_open_dist, cl_close_dist_s: 0, left_s: pt_left_s,
+                        fill_type: pt_fill_type, settle_src: "SL", clob_up_bid: 0.0, clob_dn_bid: 0.0,
+                    });
                     tr.active = None;
                     continue;
                 }
@@ -510,12 +548,31 @@ impl Sniper {
                             info!("[{}] LOSS {} {} @{:.3} ${:+.2}", tr.cfg.id, pt_asset.to_uppercase(), pt_dir, pt_px, pnl);
                             tr.record_loss(pnl);
                         }
-                        self.csv.write(tr.cfg.id, event, pt_asset, tr.cfg.wmin, &pt_dir,
-                            pt_px, pt_delta, pt_cl_open, cl_close, pnl, tr.pnl, tr.consec_loss);
+                        let cl_close_dist = self.cl_close_ts.get(&slug)
+                            .map(|&ts| (ts - pt_end_ts).abs()).unwrap_or(-1);
+                        let settle_src = if cl_dir.is_some() { "CL" } else { "CLOB" };
+                        self.csv.write(&CsvRow {
+                            engine: tr.cfg.id, event, asset: pt_asset, wmin: tr.cfg.wmin, dir: &pt_dir,
+                            slug: &slug, px: pt_px, delta: pt_delta, cl_open: pt_cl_open, cl_close,
+                            pnl, cum: tr.pnl, cap: tr.cap, consec: tr.consec_loss,
+                            bn_px: pt_bn_px, bn_trend_15s: pt_bn_trend, cl_trend_10s: pt_cl_trend,
+                            hour_range: pt_hour_range, best_bid: pt_best_bid, best_ask: pt_best_ask,
+                            cl_open_dist_s: pt_cl_open_dist, cl_close_dist_s: cl_close_dist,
+                            left_s: pt_left_s, fill_type: pt_fill_type, settle_src,
+                            clob_up_bid: bk_up.bb, clob_dn_bid: bk_dn.bb,
+                        });
                     } else {
                         warn!("[{}] NO_SETTLE {} — returning stake", tr.cfg.id, slug);
-                        self.csv.write(tr.cfg.id, "NO_SETTLE", pt_asset, tr.cfg.wmin, &pt_dir,
-                            pt_px, pt_delta, pt_cl_open, cl_close, 0.0, tr.pnl, tr.consec_loss);
+                        self.csv.write(&CsvRow {
+                            engine: tr.cfg.id, event: "NO_SETTLE", asset: pt_asset, wmin: tr.cfg.wmin, dir: &pt_dir,
+                            slug: &slug, px: pt_px, delta: pt_delta, cl_open: pt_cl_open, cl_close,
+                            pnl: 0.0, cum: tr.pnl, cap: tr.cap, consec: tr.consec_loss,
+                            bn_px: pt_bn_px, bn_trend_15s: pt_bn_trend, cl_trend_10s: pt_cl_trend,
+                            hour_range: pt_hour_range, best_bid: pt_best_bid, best_ask: pt_best_ask,
+                            cl_open_dist_s: pt_cl_open_dist, cl_close_dist_s: 0,
+                            left_s: pt_left_s, fill_type: pt_fill_type, settle_src: "NONE",
+                            clob_up_bid: bk_up.bb, clob_dn_bid: bk_dn.bb,
+                        });
                     }
                     tr.active = None;
                 }
@@ -594,16 +651,35 @@ impl Sniper {
                 let shares = STAKE / fp;
                 let sl_px = fp * SL_SHARE_PCT;
 
+                // Capture context at entry for logging
+                let bn_px_now = s.bn.get(w.asset).copied().unwrap_or(0.0);
+                let bn_trend_now = s.bn_trend(w.asset, 15).unwrap_or(0.0);
+                let cl_trend_now = s.cl_trend(w.asset, 10).unwrap_or(0.0);
+                let hr = hour_ranges.get(w.asset).copied().unwrap_or(0.0);
+                let cl_open_dist = self.cl_open_ts.get(&w.slug)
+                    .map(|&ts| (ts - w.start_ts).abs()).unwrap_or(-1);
+                let fill_type: &'static str = if left <= 45 { "TAKER" } else { "MAKER" };
+
                 tr.active = Some((w.slug.clone(), PT {
                     dir: dir.to_string(), asset: w.asset, px: fp, shares,
                     sl_px, end_ts: w.end_ts, tid: tid.to_string(),
-                    cl_open, delta,
+                    cl_open, delta, slug: w.slug.clone(),
+                    bn_px: bn_px_now, bn_trend_15s: bn_trend_now, cl_trend_10s: cl_trend_now,
+                    hour_range: hr, best_bid: bk.bb, best_ask: bk.ba,
+                    cl_open_dist_s: cl_open_dist, left_s: left, fill_type,
                 }));
                 tr.done.insert(w.slug.clone());
                 tr.delta_ticks.remove(&w.slug);
 
-                self.csv.write(tr.cfg.id, "ENTRY", w.asset, w.wmin, dir,
-                    fp, delta, cl_open, 0.0, 0.0, tr.pnl, tr.consec_loss);
+                self.csv.write(&CsvRow {
+                    engine: tr.cfg.id, event: "ENTRY", asset: w.asset, wmin: w.wmin, dir,
+                    slug: &w.slug, px: fp, delta, cl_open, cl_close: 0.0,
+                    pnl: 0.0, cum: tr.pnl, cap: tr.cap, consec: tr.consec_loss,
+                    bn_px: bn_px_now, bn_trend_15s: bn_trend_now, cl_trend_10s: cl_trend_now,
+                    hour_range: hr, best_bid: bk.bb, best_ask: bk.ba,
+                    cl_open_dist_s: cl_open_dist, cl_close_dist_s: 0,
+                    left_s: left, fill_type, settle_src: "", clob_up_bid: 0.0, clob_dn_bid: 0.0,
+                });
 
                 info!("[{}] {} {} {}m @{:.3} d={:+.3}%", tr.cfg.id, dir, w.asset.to_uppercase(), w.wmin, fp, delta);
                 break; // one entry per tracker per tick
