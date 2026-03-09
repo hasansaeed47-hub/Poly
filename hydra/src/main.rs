@@ -472,17 +472,23 @@ impl Hydra {
                             self.log.dump(st.id, t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, bn_px, &loser_bk, flags);
                             info!("[S3] DUMP {} {} @{:.3} MAKER  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
                         } else if left<=27 {
-                            // Depth-adjusted taker: penalize if bid_sz can't absorb our dump
-                            let depth_penalty = if loser_bk.bid_sz > 0.0 && loser_bk.bid_sz < ls {
-                                0.01 // walk the book ~1 tick when thin
-                            } else { 0.0 };
-                            let dp = (loser_bid - LATENCY_TICKS - depth_penalty).max(0.01);
-                            if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
-                            let mut fv = vec!["TAKER_FORCE"];
-                            if bid_source=="EST" { fv.push("EST_BID"); }
-                            if depth_penalty > 0.0 { fv.push("THIN_DUMP"); }
-                            self.log.dump(st.id, t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, bn_px, &loser_bk, &fv.join("|"));
-                            info!("[S3] DUMP {} {} @{:.3} TAKER  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
+                            // Guard: skip dump if real bid < $0.08 — hold to settlement instead
+                            if bid_source == "REAL" && loser_bid < 0.08 {
+                                info!("[S3] SKIP_DUMP {} {} bid={:.3} < $0.08 (REAL)  T-{}s", t.asset.to_uppercase(), loser_side, loser_bid, left);
+                                // Don't dump — let it ride to settlement undumped
+                            } else {
+                                // Depth-adjusted taker: penalize if bid_sz can't absorb our dump
+                                let depth_penalty = if loser_bk.bid_sz > 0.0 && loser_bk.bid_sz < ls {
+                                    0.01 // walk the book ~1 tick when thin
+                                } else { 0.0 };
+                                let dp = (loser_bid - LATENCY_TICKS - depth_penalty).max(0.01);
+                                if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
+                                let mut fv = vec!["TAKER_FORCE"];
+                                if bid_source=="EST" { fv.push("EST_BID"); }
+                                if depth_penalty > 0.0 { fv.push("THIN_DUMP"); }
+                                self.log.dump(st.id, t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, bn_px, &loser_bk, &fv.join("|"));
+                                info!("[S3] DUMP {} {} @{:.3} TAKER  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
+                            }
                         } else {
                             // Chase: reprice maker to current bid+0.01
                             if let Some(tm) = st.active.get_mut(&slug) { tm.maker_px = mpx; }
@@ -495,16 +501,21 @@ impl Hydra {
                             info!("[S3] MAKER {} {} @{:.3}  T-{}s", t.asset.to_uppercase(), loser_side, mpx, left);
                         } else {
                             // Missed chase window — go straight to taker
-                            let depth_penalty = if loser_bk.bid_sz > 0.0 && loser_bk.bid_sz < ls {
-                                0.01
-                            } else { 0.0 };
-                            let dp = (loser_bid - LATENCY_TICKS - depth_penalty).max(0.01);
-                            if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
-                            let mut fv = vec!["TAKER_DIRECT"];
-                            if bid_source=="EST" { fv.push("EST_BID"); }
-                            if depth_penalty > 0.0 { fv.push("THIN_DUMP"); }
-                            self.log.dump(st.id, t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, bn_px, &loser_bk, &fv.join("|"));
-                            info!("[S3] DUMP {} {} @{:.3} TAKER  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
+                            // Guard: skip dump if real bid < $0.08
+                            if bid_source == "REAL" && loser_bid < 0.08 {
+                                info!("[S3] SKIP_DUMP {} {} bid={:.3} < $0.08 (REAL)  T-{}s", t.asset.to_uppercase(), loser_side, loser_bid, left);
+                            } else {
+                                let depth_penalty = if loser_bk.bid_sz > 0.0 && loser_bk.bid_sz < ls {
+                                    0.01
+                                } else { 0.0 };
+                                let dp = (loser_bid - LATENCY_TICKS - depth_penalty).max(0.01);
+                                if let Some(tm) = st.active.get_mut(&slug) { tm.dumped=true; tm.dump_px=dp; }
+                                let mut fv = vec!["TAKER_DIRECT"];
+                                if bid_source=="EST" { fv.push("EST_BID"); }
+                                if depth_penalty > 0.0 { fv.push("THIN_DUMP"); }
+                                self.log.dump(st.id, t.asset, &slug, left, loser_side, dp, loser_bid, bid_source, ls*dp, co, cn, bn_px, &loser_bk, &fv.join("|"));
+                                info!("[S3] DUMP {} {} @{:.3} TAKER  T-{}s", t.asset.to_uppercase(), loser_side, dp, left);
+                            }
                         }
                     }
                 }
@@ -815,6 +826,22 @@ mod tests {
         let pnl_good = pnl_dumped(0.50, taker_px(0.05));
         assert!(pnl_good > 0.0, "taker@$0.05 bid profitable");
         println!("    taker breakeven ~$0.05 bid: OK (3-tick latency)");
+
+        // Guard: TAKER_FORCE + REAL bid < $0.08 → skip dump
+        // Below $0.08, dump recovery is too low/marginal — better to hold to settlement
+        println!("\n  ── DUMP GUARD (TAKER_FORCE + REAL < $0.08) ──");
+        for &bid in &[0.01, 0.03, 0.05, 0.07, 0.08, 0.10, 0.15] {
+            let tp = taker_px(bid);
+            let pnl_dump = pnl_dumped(0.50, tp);
+            let skipped = bid < 0.08;
+            let label = if skipped { "SKIP" } else { "PROCEED" };
+            println!("    bid={:.2}: dump_pnl={:+.4} → {}", bid, pnl_dump, label);
+        }
+        // Confirm guard boundaries: at $0.01-$0.03 dump is negative, at $0.08+ clearly positive
+        assert!(pnl_dumped(0.50, taker_px(0.01)) < 0.0, "bid=0.01 must be negative");
+        assert!(pnl_dumped(0.50, taker_px(0.03)) < 0.0, "bid=0.03 must be negative");
+        assert!(pnl_dumped(0.50, taker_px(0.08)) > 0.0, "bid=0.08 must be positive");
+        println!("    TAKER_FORCE+REAL < $0.08 guard: OK");
 
         println!("  ═══ ALL CHAIN CHECKS PASSED ═══\n");
     }
