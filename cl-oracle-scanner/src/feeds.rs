@@ -357,60 +357,72 @@ pub async fn fetch_books_batch(
             }
         }
 
-        debug!("Batch book fetch: {} tokens", chunk.len());
+        debug!("Batch book fetch: {} tokens, url={}", chunk.len(), url.as_str());
 
-        let resp = client
-            .get(url.as_str())
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-            .context("CLOB batch book request failed")?;
+        // Polymarket CLOB uses /book (singular) with one token_id at a time
+        // Fetch each token individually
+        for tid in chunk {
+            limiter.wait().await;
 
-        if !resp.status().is_success() {
-            warn!("CLOB batch book returned {}", resp.status());
-            continue;
-        }
+            let single_url = format!("{}/book?token_id={}", clob_rest, tid);
+            debug!("Book fetch: {}", single_url);
 
-        let books: Vec<Option<ClobBook>> = resp
-            .json()
-            .await
-            .context("CLOB batch book JSON parse failed")?;
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-
-        for (tid, book_opt) in chunk.iter().zip(books.iter()) {
-            if let Some(book) = book_opt {
-                let asks: Vec<(f64, f64)> = book.asks.iter()
-                    .filter_map(|l| {
-                        let p = l.price.parse::<f64>().ok()?;
-                        let s = l.size.parse::<f64>().ok()?;
-                        Some((p, s))
-                    })
-                    .collect();
-
-                let bids: Vec<(f64, f64)> = book.bids.iter()
-                    .filter_map(|l| {
-                        let p = l.price.parse::<f64>().ok()?;
-                        let s = l.size.parse::<f64>().ok()?;
-                        Some((p, s))
-                    })
-                    .collect();
-
-                let mut entry = BookEntry::new();
-                entry.set_snapshot(asks, bids, now);
-
-                if entry.best_ask > 0.0 {
-                    result.insert(tid.clone(), entry);
+            let resp = match client
+                .get(&single_url)
+                .timeout(Duration::from_secs(5))
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("CLOB book request failed for {}: {}", &tid[..8.min(tid.len())], e);
+                    continue;
                 }
-            }
-        }
+            };
 
-        if token_ids.len() > BOOK_BATCH_SIZE {
-            tokio::time::sleep(Duration::from_millis(REST_THROTTLE_MS)).await;
-        }
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                warn!("CLOB book returned {} for {}: {}", status, &tid[..8.min(tid.len())], &body[..body.len().min(200)]);
+                continue;
+            }
+
+            let book: ClobBook = match resp.json().await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("CLOB book parse failed for {}: {}", &tid[..8.min(tid.len())], e);
+                    continue;
+                }
+            };
+
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64();
+
+            let asks: Vec<(f64, f64)> = book.asks.iter()
+                .filter_map(|l| {
+                    let p = l.price.parse::<f64>().ok()?;
+                    let s = l.size.parse::<f64>().ok()?;
+                    Some((p, s))
+                })
+                .collect();
+
+            let bids: Vec<(f64, f64)> = book.bids.iter()
+                .filter_map(|l| {
+                    let p = l.price.parse::<f64>().ok()?;
+                    let s = l.size.parse::<f64>().ok()?;
+                    Some((p, s))
+                })
+                .collect();
+
+            let mut entry = BookEntry::new();
+            entry.set_snapshot(asks, bids, now);
+
+            if entry.best_ask > 0.0 {
+                result.insert(tid.clone(), entry);
+            }
+        } // end per-token loop
     }
 
     Ok(result)
@@ -545,11 +557,14 @@ async fn connect_book_feed(
 
     let ids: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
     if !ids.is_empty() {
+        // Polymarket CLOB WS subscription format uses "assets_ids"
         let sub = serde_json::json!({
             "auth": {},
             "type": "subscribe",
-            "markets": ids
+            "channel": "book",
+            "assets_ids": ids
         });
+        debug!("[BOOK] Sending subscribe: {} tokens", ids.len());
         ws.send(Message::Text(sub.to_string())).await?;
         info!("[BOOK] Subscribed to {} token IDs", ids.len());
     }
@@ -560,12 +575,20 @@ async fn connect_book_feed(
         .as_secs();
     book_live.store(connect_ts, std::sync::atomic::Ordering::Relaxed);
 
+    let mut msg_count = 0u64;
     while let Some(msg) = ws.next().await {
         let msg = msg.context("CLOB WS message error")?;
         if let Message::Text(text) = msg {
+            msg_count += 1;
+            if msg_count <= 3 {
+                debug!("[BOOK] WS msg #{}: {}", msg_count, &text[..text.len().min(300)]);
+            }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                 process_book_message(&v, book_state);
             }
+        } else if let Message::Close(frame) = msg {
+            warn!("[BOOK] WS close frame: {:?}", frame);
+            break;
         }
     }
 
