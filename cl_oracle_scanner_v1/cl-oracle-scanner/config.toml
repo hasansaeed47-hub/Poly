@@ -1,4 +1,4 @@
-# CL Oracle Scanner — external config
+# CL Oracle Scanner v2 — external config
 # All thresholds here, nothing hardcoded in binary
 
 [feed]
@@ -29,6 +29,18 @@ rest_throttle_ms = 500
 # Book warmup: wait this many seconds after WS connect before trading
 book_warmup_secs = 5
 
+# WebSocket reconnect delay in seconds
+ws_reconnect_secs = 5
+
+# Max CL price history entries per asset
+price_history_cap = 1000
+
+# CL price staleness threshold — skip market if CL price older than this (seconds)
+cl_stale_secs = 10.0
+
+# Book staleness threshold — skip market if book data older than this (seconds)
+book_stale_secs = 30.0
+
 [scan]
 # Scan tick interval in milliseconds
 tick_ms = 500
@@ -53,6 +65,8 @@ min_edge       = 0.12
 max_secs_left  = 840
 stop_loss      = false
 take_profit    = false
+max_positions  = 10
+max_exposure   = 100.0
 
 # Config 2 — Base + Time Filter (last 3 minutes only)
 [configs.c2]
@@ -61,6 +75,8 @@ min_edge       = 0.12
 max_secs_left  = 180
 stop_loss      = false
 take_profit    = false
+max_positions  = 10
+max_exposure   = 100.0
 
 # Config 3 — Base + Edge Filter (large gaps only)
 [configs.c3]
@@ -69,6 +85,8 @@ min_edge       = 0.25
 max_secs_left  = 840
 stop_loss      = false
 take_profit    = false
+max_positions  = 10
+max_exposure   = 100.0
 
 # Config 4 — Base + Stop Loss (exit when fair < entry_price)
 [configs.c4]
@@ -77,6 +95,8 @@ min_edge       = 0.12
 max_secs_left  = 840
 stop_loss      = true
 take_profit    = false
+max_positions  = 10
+max_exposure   = 100.0
 
 # Config 5 — CL Target Exit (exit when bid >= fair_at_entry)
 [configs.c5]
@@ -85,3 +105,5 @@ min_edge       = 0.12
 max_secs_left  = 840
 stop_loss      = false
 take_profit    = true
+max_positions  = 10
+max_exposure   = 100.0

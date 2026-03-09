@@ -6,13 +6,14 @@
 /// 3. Market discovery: Batched REST via Gamma API (slug → token IDs)
 ///
 /// Batching rules:
-/// - Book REST requests: max BOOK_BATCH_SIZE token IDs per request
-/// - Minimum REST_THROTTLE_MS between any two REST calls
+/// - Book REST requests: max batch_size token IDs per request
+/// - Minimum throttle_ms between any two REST calls
 /// - WebSocket feeds are event-driven — no polling
 
 use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
@@ -22,37 +23,48 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
 // ── JSONL log types ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
 pub struct ClPriceLog {
-    pub asset:  String,
-    pub price:  f64,
-    pub ts:     f64,
-    pub source: String,  // "ws"
+    pub asset:      String,
+    pub price:      f64,
+    pub prev_price: f64,
+    pub delta:      f64,      // price - prev_price
+    pub pct_change: f64,      // (price - prev_price) / prev_price * 100
+    pub ts:         f64,
+    pub source:     String,   // "ws"
 }
 
 #[derive(Debug, Serialize)]
 pub struct BookUpdateLog {
-    pub token_id:  String,
-    pub best_ask:  f64,
-    pub best_bid:  f64,
-    pub ts:        f64,
-    pub source:    String,  // "ws_book" | "ws_delta" | "rest"
+    pub token_id:   String,
+    pub best_ask:   f64,
+    pub best_bid:   f64,
+    pub spread:     f64,      // best_ask - best_bid
+    pub mid:        f64,      // (best_ask + best_bid) / 2
+    pub ask_depth:  f64,      // size at best ask
+    pub bid_depth:  f64,      // size at best bid
+    pub ts:         f64,
+    pub source:     String,   // "ws_book" | "ws_delta" | "rest"
     pub event_type: String,
 }
 
 /// Shared log writer type
 pub type LogWriter = Arc<Mutex<std::fs::File>>;
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// ── Feed parameters (from config) ───────────────────────────────────────────
 
-const BOOK_BATCH_SIZE:   usize = 20;
-const REST_THROTTLE_MS:  u64   = 500;
-const WS_RECONNECT_SECS: u64   = 5;
+#[derive(Debug, Clone)]
+pub struct FeedParams {
+    pub book_batch_size:    usize,
+    pub rest_throttle_ms:   u64,
+    pub ws_reconnect_secs:  u64,
+    pub price_history_cap:  usize,
+}
 
 // ── Shared state types ────────────────────────────────────────────────────────
 
@@ -67,9 +79,12 @@ pub type PriceHistory = Arc<DashMap<String, Vec<(f64, f64)>>>;
 
 #[derive(Debug, Clone)]
 pub struct BookEntry {
-    pub best_ask: f64,
-    pub best_bid: f64,
-    pub ts:       f64,
+    pub best_ask:  f64,
+    pub best_bid:  f64,
+    pub ask_depth: f64,    // size at best ask level
+    pub bid_depth: f64,    // size at best bid level
+    pub ts:        f64,
+    pub source:    String, // "ws_book" | "ws_delta" | "rest"
 }
 
 /// Market metadata fetched once at startup
@@ -83,6 +98,22 @@ pub struct MarketMeta {
     pub token_yes:    String, // clobTokenId for YES
     pub token_no:     String, // clobTokenId for NO
     pub open_price:   f64,
+}
+
+// ── Feed health counters ─────────────────────────────────────────────────────
+
+pub struct FeedHealth {
+    pub cl_msg_count:   AtomicU64,
+    pub book_msg_count: AtomicU64,
+}
+
+impl FeedHealth {
+    pub fn new() -> Self {
+        Self {
+            cl_msg_count:   AtomicU64::new(0),
+            book_msg_count: AtomicU64::new(0),
+        }
+    }
 }
 
 // ── Gamma API response types ──────────────────────────────────────────────────
@@ -237,11 +268,12 @@ pub async fn fetch_market_meta(
 // ── Batch book fetcher ────────────────────────────────────────────────────────
 
 pub async fn fetch_books_batch(
-    client:   &Client,
+    client:    &Client,
     clob_rest: &str,
     token_ids: &[String],
     limiter:   &RateLimiter,
     book_log:  &LogWriter,
+    params:    &FeedParams,
 ) -> Result<HashMap<String, BookEntry>> {
     if token_ids.is_empty() {
         return Ok(HashMap::new());
@@ -251,7 +283,7 @@ pub async fn fetch_books_batch(
 
     let mut result = HashMap::new();
 
-    for chunk in token_ids.chunks(BOOK_BATCH_SIZE) {
+    for chunk in token_ids.chunks(params.book_batch_size) {
         let mut url = Url::parse(&format!("{}/books", clob_rest))
             .context("invalid CLOB REST URL")?;
 
@@ -288,29 +320,44 @@ pub async fn fetch_books_batch(
 
         for (tid, book_opt) in chunk.iter().zip(books.iter()) {
             if let Some(book) = book_opt {
-                let best_ask = book
+                let (best_ask, ask_depth) = book
                     .asks
                     .iter()
-                    .filter_map(|l| l.price.parse::<f64>().ok())
-                    .reduce(f64::min)
-                    .unwrap_or(0.0);
+                    .filter_map(|l| {
+                        let p = l.price.parse::<f64>().ok()?;
+                        let s = l.size.parse::<f64>().ok()?;
+                        Some((p, s))
+                    })
+                    .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or((0.0, 0.0));
 
-                let best_bid = book
+                let (best_bid, bid_depth) = book
                     .bids
                     .iter()
-                    .filter_map(|l| l.price.parse::<f64>().ok())
-                    .reduce(f64::max)
-                    .unwrap_or(0.0);
+                    .filter_map(|l| {
+                        let p = l.price.parse::<f64>().ok()?;
+                        let s = l.size.parse::<f64>().ok()?;
+                        Some((p, s))
+                    })
+                    .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or((0.0, 0.0));
 
                 if best_ask > 0.0 {
                     result.insert(
                         tid.clone(),
-                        BookEntry { best_ask, best_bid, ts: now },
+                        BookEntry {
+                            best_ask, best_bid, ask_depth, bid_depth,
+                            ts: now, source: "rest".to_string(),
+                        },
                     );
                     // Log REST book fetch
                     let log_entry = BookUpdateLog {
                         token_id: tid.clone(),
-                        best_ask, best_bid, ts: now,
+                        best_ask, best_bid,
+                        spread: best_ask - best_bid,
+                        mid: (best_ask + best_bid) / 2.0,
+                        ask_depth, bid_depth,
+                        ts: now,
                         source: "rest".to_string(),
                         event_type: "batch_fetch".to_string(),
                     };
@@ -322,8 +369,8 @@ pub async fn fetch_books_batch(
             }
         }
 
-        if token_ids.len() > BOOK_BATCH_SIZE {
-            tokio::time::sleep(Duration::from_millis(REST_THROTTLE_MS)).await;
+        if token_ids.len() > params.book_batch_size {
+            tokio::time::sleep(Duration::from_millis(params.rest_throttle_ms)).await;
         }
     }
 
@@ -338,16 +385,18 @@ pub async fn run_cl_feed(
     cl_prices:     ClPrices,
     price_history: PriceHistory,
     cl_log:        LogWriter,
+    params:        FeedParams,
+    health:        Arc<FeedHealth>,
 ) {
     loop {
         info!("[CL] Connecting to {}", live_ws);
 
-        match connect_cl_feed(&live_ws, &assets, &cl_prices, &price_history, &cl_log).await {
+        match connect_cl_feed(&live_ws, &assets, &cl_prices, &price_history, &cl_log, &params, &health).await {
             Ok(_)  => warn!("[CL] Feed closed cleanly, reconnecting..."),
-            Err(e) => error!("[CL] Feed error: {}, reconnecting in {}s", e, WS_RECONNECT_SECS),
+            Err(e) => error!("[CL] Feed error: {}, reconnecting in {}s", e, params.ws_reconnect_secs),
         }
 
-        tokio::time::sleep(Duration::from_secs(WS_RECONNECT_SECS)).await;
+        tokio::time::sleep(Duration::from_secs(params.ws_reconnect_secs)).await;
     }
 }
 
@@ -357,6 +406,8 @@ async fn connect_cl_feed(
     cl_prices:     &ClPrices,
     price_history: &PriceHistory,
     cl_log:        &LogWriter,
+    params:        &FeedParams,
+    health:        &Arc<FeedHealth>,
 ) -> Result<()> {
     let url = Url::parse(live_ws).context("invalid live WS URL")?;
     let (mut ws, _) = connect_async(url).await.context("CL WS connect failed")?;
@@ -377,8 +428,10 @@ async fn connect_cl_feed(
     while let Some(msg) = ws.next().await {
         let msg = msg.context("CL WS message error")?;
         if let Message::Text(text) = msg {
+            // Log raw WS message at trace level for replay
+            trace!("[CL_RAW] {}", text);
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                process_cl_message(&v, cl_prices, price_history, cl_log).await;
+                process_cl_message(&v, cl_prices, price_history, cl_log, params, health).await;
             }
         }
     }
@@ -391,6 +444,8 @@ async fn process_cl_message(
     cl_prices:     &ClPrices,
     price_history: &PriceHistory,
     cl_log:        &LogWriter,
+    params:        &FeedParams,
+    health:        &Arc<FeedHealth>,
 ) {
     let channel = v.get("channel").and_then(|c| c.as_str()).unwrap_or("");
     if channel != "crypto_prices_chainlink" {
@@ -421,13 +476,27 @@ async fn process_cl_message(
                 .as_secs_f64()
         });
 
+    // Get previous price for delta calculation
+    let prev_price = cl_prices.get(&asset).map(|v| v.1).unwrap_or(price);
+
     cl_prices.insert(asset.clone(), (ts, price));
 
-    // Log every CL price update to JSONL
+    // Increment health counter + periodic log
+    let count = health.cl_msg_count.fetch_add(1, Ordering::Relaxed) + 1;
+    if count % 1000 == 0 {
+        info!("[CL_HEALTH] {} messages processed", count);
+    }
+
+    // Log every CL price update to JSONL with delta
     {
+        let delta = price - prev_price;
+        let pct_change = if prev_price > 0.0 { delta / prev_price * 100.0 } else { 0.0 };
         let log_entry = ClPriceLog {
             asset: asset.clone(),
             price,
+            prev_price,
+            delta,
+            pct_change,
             ts,
             source: "ws".to_string(),
         };
@@ -437,11 +506,11 @@ async fn process_cl_message(
         }
     }
 
-    // Append to price history (cap at 1000 entries per asset)
+    // Append to price history (cap from config)
     let mut hist = price_history.entry(asset).or_default();
     hist.push((ts, price));
-    if hist.len() > 1000 {
-        let drain_to = hist.len() - 1000;
+    if hist.len() > params.price_history_cap {
+        let drain_to = hist.len() - params.price_history_cap;
         hist.drain(0..drain_to);
     }
 }
@@ -452,20 +521,22 @@ pub async fn run_book_feed(
     clob_ws:    String,
     token_ids:  Arc<DashMap<String, ()>>,
     book_state: BookState,
-    book_live:  Arc<std::sync::atomic::AtomicU64>,
+    book_live:  Arc<AtomicU64>,
     mut sub_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
     book_log:   LogWriter,
+    params:     FeedParams,
+    health:     Arc<FeedHealth>,
 ) {
     loop {
         info!("[BOOK] Connecting to {}", clob_ws);
 
-        match connect_book_feed(&clob_ws, &token_ids, &book_state, &book_live, &mut sub_rx, &book_log).await {
+        match connect_book_feed(&clob_ws, &token_ids, &book_state, &book_live, &mut sub_rx, &book_log, &health).await {
             Ok(_)  => warn!("[BOOK] Feed closed cleanly, reconnecting..."),
-            Err(e) => error!("[BOOK] Feed error: {}, reconnecting in {}s", e, WS_RECONNECT_SECS),
+            Err(e) => error!("[BOOK] Feed error: {}, reconnecting in {}s", e, params.ws_reconnect_secs),
         }
 
-        book_live.store(0, std::sync::atomic::Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_secs(WS_RECONNECT_SECS)).await;
+        book_live.store(0, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_secs(params.ws_reconnect_secs)).await;
     }
 }
 
@@ -473,9 +544,10 @@ async fn connect_book_feed(
     clob_ws:    &str,
     token_ids:  &DashMap<String, ()>,
     book_state: &BookState,
-    book_live:  &Arc<std::sync::atomic::AtomicU64>,
+    book_live:  &Arc<AtomicU64>,
     sub_rx:     &mut tokio::sync::mpsc::UnboundedReceiver<Vec<String>>,
     book_log:   &LogWriter,
+    health:     &Arc<FeedHealth>,
 ) -> Result<()> {
     let url = Url::parse(clob_ws).context("invalid CLOB WS URL")?;
     let (ws, _) = connect_async(url).await.context("CLOB WS connect failed")?;
@@ -497,7 +569,7 @@ async fn connect_book_feed(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    book_live.store(connect_ts, std::sync::atomic::Ordering::Relaxed);
+    book_live.store(connect_ts, Ordering::Relaxed);
 
     loop {
         tokio::select! {
@@ -505,8 +577,10 @@ async fn connect_book_feed(
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
+                        // Log raw WS message at trace level for replay
+                        trace!("[BOOK_RAW] {}", text);
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                            process_book_message(&v, book_state, book_log).await;
+                            process_book_message(&v, book_state, book_log, health).await;
                         }
                     }
                     Some(Ok(_)) => {} // ping/pong/binary
@@ -532,7 +606,12 @@ async fn connect_book_feed(
     }
 }
 
-async fn process_book_message(v: &serde_json::Value, book_state: &BookState, book_log: &LogWriter) {
+async fn process_book_message(
+    v:          &serde_json::Value,
+    book_state: &BookState,
+    book_log:   &LogWriter,
+    health:     &Arc<FeedHealth>,
+) {
     // Polymarket CLOB WS sends:
     // 1. "book" events: full snapshot with asks[] and bids[]
     // 2. "price_change" events: delta with changes[] array
@@ -549,16 +628,29 @@ async fn process_book_message(v: &serde_json::Value, book_state: &BookState, boo
         .unwrap_or_default()
         .as_secs_f64();
 
+    // Increment health counter + periodic log
+    let count = health.book_msg_count.fetch_add(1, Ordering::Relaxed) + 1;
+    if count % 1000 == 0 {
+        info!("[BOOK_HEALTH] {} messages processed", count);
+    }
+
     match event_type {
         "book" => {
             // Full book snapshot — safe to overwrite
-            let best_ask = extract_best_ask(v);
-            let best_bid = extract_best_bid(v);
+            let (best_ask, ask_depth) = extract_best_ask_with_depth(v);
+            let (best_bid, bid_depth) = extract_best_bid_with_depth(v);
             if best_ask > 0.0 {
-                book_state.insert(asset_id.clone(), BookEntry { best_ask, best_bid, ts: now });
+                book_state.insert(asset_id.clone(), BookEntry {
+                    best_ask, best_bid, ask_depth, bid_depth,
+                    ts: now, source: "ws_book".to_string(),
+                });
                 // Log book snapshot
                 let log_entry = BookUpdateLog {
-                    token_id: asset_id, best_ask, best_bid, ts: now,
+                    token_id: asset_id, best_ask, best_bid,
+                    spread: best_ask - best_bid,
+                    mid: (best_ask + best_bid) / 2.0,
+                    ask_depth, bid_depth,
+                    ts: now,
                     source: "ws_book".to_string(),
                     event_type: "snapshot".to_string(),
                 };
@@ -576,11 +668,15 @@ async fn process_book_message(v: &serde_json::Value, book_state: &BookState, boo
                 let mut entry = book_state
                     .get(&asset_id)
                     .map(|e| e.clone())
-                    .unwrap_or(BookEntry { best_ask: 0.0, best_bid: 0.0, ts: now });
+                    .unwrap_or(BookEntry {
+                        best_ask: 0.0, best_bid: 0.0,
+                        ask_depth: 0.0, bid_depth: 0.0,
+                        ts: now, source: "ws_delta".to_string(),
+                    });
 
                 // Parse all changes to find new best ask/bid
-                let mut sell_prices: Vec<f64> = Vec::new();
-                let mut buy_prices: Vec<f64> = Vec::new();
+                let mut sell_prices: Vec<(f64, f64)> = Vec::new(); // (price, size)
+                let mut buy_prices: Vec<(f64, f64)> = Vec::new();
 
                 for change in changes {
                     let side = change.get("side").and_then(|s| s.as_str()).unwrap_or("");
@@ -601,14 +697,14 @@ async fn process_book_message(v: &serde_json::Value, book_state: &BookState, boo
                     match side {
                         "SELL" => {
                             if size > 0.0 {
-                                sell_prices.push(price);
+                                sell_prices.push((price, size));
                             }
                             // If size=0 and this was our best ask, we can't know the new best
                             // without the full book. REST fallback will correct this.
                         }
                         "BUY" => {
                             if size > 0.0 {
-                                buy_prices.push(price);
+                                buy_prices.push((price, size));
                             }
                         }
                         _ => {}
@@ -617,27 +713,44 @@ async fn process_book_message(v: &serde_json::Value, book_state: &BookState, boo
 
                 // Update best ask: new minimum of existing + new sell levels
                 if !sell_prices.is_empty() {
-                    let new_min = sell_prices.iter().copied().reduce(f64::min).unwrap();
+                    let (new_min, new_depth) = sell_prices.iter()
+                        .copied()
+                        .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap();
                     if entry.best_ask <= 0.0 || new_min < entry.best_ask {
                         entry.best_ask = new_min;
+                        entry.ask_depth = new_depth;
+                    } else if (new_min - entry.best_ask).abs() < 1e-9 {
+                        entry.ask_depth = new_depth; // same level, update depth
                     }
                 }
 
                 // Update best bid: new maximum of existing + new buy levels
                 if !buy_prices.is_empty() {
-                    let new_max = buy_prices.iter().copied().reduce(f64::max).unwrap();
+                    let (new_max, new_depth) = buy_prices.iter()
+                        .copied()
+                        .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
+                        .unwrap();
                     if new_max > entry.best_bid {
                         entry.best_bid = new_max;
+                        entry.bid_depth = new_depth;
+                    } else if (new_max - entry.best_bid).abs() < 1e-9 {
+                        entry.bid_depth = new_depth;
                     }
                 }
 
                 entry.ts = now;
+                entry.source = "ws_delta".to_string();
                 if entry.best_ask > 0.0 {
                     // Log price change delta
                     let log_entry = BookUpdateLog {
                         token_id: asset_id.clone(),
                         best_ask: entry.best_ask,
                         best_bid: entry.best_bid,
+                        spread: entry.best_ask - entry.best_bid,
+                        mid: (entry.best_ask + entry.best_bid) / 2.0,
+                        ask_depth: entry.ask_depth,
+                        bid_depth: entry.bid_depth,
                         ts: now,
                         source: "ws_delta".to_string(),
                         event_type: "price_change".to_string(),
@@ -654,36 +767,34 @@ async fn process_book_message(v: &serde_json::Value, book_state: &BookState, boo
     }
 }
 
-fn extract_best_ask(v: &serde_json::Value) -> f64 {
+fn extract_best_ask_with_depth(v: &serde_json::Value) -> (f64, f64) {
     v.get("asks")
         .and_then(|a| a.as_array())
-        .map(|asks| {
+        .and_then(|asks| {
             asks.iter()
                 .filter_map(|l| {
-                    l.get("price")
-                        .and_then(|p| p.as_str())
-                        .and_then(|s| s.parse::<f64>().ok())
+                    let p = l.get("price")?.as_str()?.parse::<f64>().ok()?;
+                    let s = l.get("size")?.as_str()?.parse::<f64>().ok()?;
+                    Some((p, s))
                 })
-                .reduce(f64::min)
-                .unwrap_or(0.0)
+                .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
         })
-        .unwrap_or(0.0)
+        .unwrap_or((0.0, 0.0))
 }
 
-fn extract_best_bid(v: &serde_json::Value) -> f64 {
+fn extract_best_bid_with_depth(v: &serde_json::Value) -> (f64, f64) {
     v.get("bids")
         .and_then(|b| b.as_array())
-        .map(|bids| {
+        .and_then(|bids| {
             bids.iter()
                 .filter_map(|l| {
-                    l.get("price")
-                        .and_then(|p| p.as_str())
-                        .and_then(|s| s.parse::<f64>().ok())
+                    let p = l.get("price")?.as_str()?.parse::<f64>().ok()?;
+                    let s = l.get("size")?.as_str()?.parse::<f64>().ok()?;
+                    Some((p, s))
                 })
-                .reduce(f64::max)
-                .unwrap_or(0.0)
+                .max_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal))
         })
-        .unwrap_or(0.0)
+        .unwrap_or((0.0, 0.0))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -723,7 +834,9 @@ mod tests {
             ],
             "bids": []
         });
-        assert_eq!(extract_best_ask(&v), 0.52);
+        let (ask, depth) = extract_best_ask_with_depth(&v);
+        assert_eq!(ask, 0.52);
+        assert_eq!(depth, 3.0);
     }
 
     fn test_book_log() -> LogWriter {
@@ -733,10 +846,15 @@ mod tests {
         Arc::new(Mutex::new(f))
     }
 
+    fn test_health() -> Arc<FeedHealth> {
+        Arc::new(FeedHealth::new())
+    }
+
     #[tokio::test]
     async fn price_change_merges_correctly() {
         let book_state: BookState = Arc::new(DashMap::new());
         let log = test_book_log();
+        let health = test_health();
 
         // First: full snapshot
         let snap = serde_json::json!({
@@ -745,7 +863,7 @@ mod tests {
             "asks": [{"price": "0.55", "size": "10"}],
             "bids": [{"price": "0.45", "size": "5"}]
         });
-        process_book_message(&snap, &book_state, &log).await;
+        process_book_message(&snap, &book_state, &log, &health).await;
 
         let entry = book_state.get("token1").unwrap();
         assert_eq!(entry.best_ask, 0.55);
@@ -760,7 +878,7 @@ mod tests {
                 {"side": "SELL", "price": "0.52", "size": "3"}
             ]
         });
-        process_book_message(&delta, &book_state, &log).await;
+        process_book_message(&delta, &book_state, &log, &health).await;
 
         let entry = book_state.get("token1").unwrap();
         assert_eq!(entry.best_ask, 0.52, "ask should improve to 0.52");
@@ -771,6 +889,7 @@ mod tests {
     async fn price_change_bid_only_preserves_ask() {
         let book_state: BookState = Arc::new(DashMap::new());
         let log = test_book_log();
+        let health = test_health();
 
         // Snapshot first
         let snap = serde_json::json!({
@@ -779,7 +898,7 @@ mod tests {
             "asks": [{"price": "0.60", "size": "10"}],
             "bids": [{"price": "0.40", "size": "5"}]
         });
-        process_book_message(&snap, &book_state, &log).await;
+        process_book_message(&snap, &book_state, &log, &health).await;
 
         // Bid-only delta
         let delta = serde_json::json!({
@@ -789,7 +908,7 @@ mod tests {
                 {"side": "BUY", "price": "0.42", "size": "8"}
             ]
         });
-        process_book_message(&delta, &book_state, &log).await;
+        process_book_message(&delta, &book_state, &log, &health).await;
 
         let entry = book_state.get("token2").unwrap();
         assert_eq!(entry.best_ask, 0.60, "ask should be preserved");

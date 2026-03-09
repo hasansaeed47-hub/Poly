@@ -50,6 +50,16 @@ pub struct Signal {
     pub best_book:   f64,         // entry price on best side
     pub best_fair:   f64,         // fair value on best side
     pub ts:          f64,         // unix timestamp of this signal
+    // Book microstructure
+    pub spread_yes:    f64,       // book_yes - bid_yes
+    pub spread_no:     f64,       // book_no - bid_no
+    pub depth_ask_yes: f64,       // size at best ask for YES
+    pub depth_bid_yes: f64,       // size at best bid for YES
+    pub depth_ask_no:  f64,       // size at best ask for NO
+    pub depth_bid_no:  f64,       // size at best bid for NO
+    pub book_age_yes:  f64,       // seconds since last YES book update
+    pub book_age_no:   f64,       // seconds since last NO book update
+    pub cl_age:        f64,       // seconds since last CL price update
 }
 
 // ── Black-Scholes binary call ─────────────────────────────────────────────────
@@ -114,6 +124,16 @@ pub fn estimate_sigma(prices: &[(f64, f64)], window_secs: f64, now: f64) -> f64 
 
 // ── Signal computation ────────────────────────────────────────────────────────
 
+/// Book snapshot for one token — passed into compute
+#[derive(Debug, Clone)]
+pub struct BookSnap {
+    pub best_ask:  f64,
+    pub best_bid:  f64,
+    pub ask_depth: f64,
+    pub bid_depth: f64,
+    pub book_age:  f64,  // seconds since last update
+}
+
 /// Compute one signal for a market.
 /// Returns None if data is insufficient (no open price, no book, etc.)
 pub fn compute(
@@ -124,12 +144,15 @@ pub fn compute(
     cl_price:   f64,
     sigma:      f64,
     secs_left:  f64,
-    book_yes:   f64,  // best ask for YES (what you pay to buy YES)
-    book_no:    f64,  // best ask for NO
-    bid_yes:    f64,  // best bid for YES (what you get selling YES)
-    bid_no:     f64,  // best bid for NO
+    yes_book:   &BookSnap,
+    no_book:    &BookSnap,
+    cl_age:     f64,
     ts:         f64,
 ) -> Option<Signal> {
+    let book_yes = yes_book.best_ask;
+    let book_no  = no_book.best_ask;
+    let bid_yes  = yes_book.best_bid;
+    let bid_no   = no_book.best_bid;
     // Guard: need valid inputs
     if open_price <= 0.0 || cl_price <= 0.0 || secs_left <= 0.0 {
         return None;
@@ -181,6 +204,15 @@ pub fn compute(
         best_book,
         best_fair,
         ts,
+        spread_yes:    book_yes - bid_yes,
+        spread_no:     book_no - bid_no,
+        depth_ask_yes: yes_book.ask_depth,
+        depth_bid_yes: yes_book.bid_depth,
+        depth_ask_no:  no_book.ask_depth,
+        depth_bid_no:  no_book.bid_depth,
+        book_age_yes:  yes_book.book_age,
+        book_age_no:   no_book.book_age,
+        cl_age,
     })
 }
 
@@ -208,12 +240,16 @@ mod tests {
         assert!(f < 0.5, "fair_yes when CL<open should be <0.5, got {}", f);
     }
 
+    fn snap(ask: f64, bid: f64) -> BookSnap {
+        BookSnap { best_ask: ask, best_bid: bid, ask_depth: 10.0, bid_depth: 10.0, book_age: 0.5 }
+    }
+
     #[test]
     fn edge_yes_positive_when_book_stale() {
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 100.5, 0.001, 300.0,
-            0.50, 0.49, 0.49, 0.48, 0.0,
+            &snap(0.50, 0.49), &snap(0.49, 0.48), 0.5, 0.0,
         ).unwrap();
         assert!(sig.edge_yes > 0.0, "expected positive edge_yes, got {}", sig.edge_yes);
         assert_eq!(sig.best_side, Some(Side::Yes));
@@ -224,7 +260,7 @@ mod tests {
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 99.5, 0.001, 300.0,
-            0.49, 0.50, 0.48, 0.49, 0.0,
+            &snap(0.49, 0.48), &snap(0.50, 0.49), 0.5, 0.0,
         ).unwrap();
         assert!(sig.edge_no > 0.0, "expected positive edge_no, got {}", sig.edge_no);
         assert_eq!(sig.best_side, Some(Side::No));
@@ -236,7 +272,7 @@ mod tests {
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 100.5, 0.001, 300.0,
-            f, 1.0 - f, f - 0.01, (1.0 - f) - 0.01, 0.0,
+            &snap(f, f - 0.01), &snap(1.0 - f, (1.0 - f) - 0.01), 0.5, 0.0,
         ).unwrap();
         assert!(sig.best_edge < 0.001, "expected ~0 edge, got {}", sig.best_edge);
     }
@@ -247,7 +283,7 @@ mod tests {
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 100.0, 0.01, 300.0,
-            0.48, 0.48, 0.47, 0.47, 0.0,
+            &snap(0.48, 0.47), &snap(0.48, 0.47), 0.5, 0.0,
         ).unwrap();
         // fair_yes ≈ 0.50, edge_yes ≈ 0.02, edge_no ≈ 0.02
         assert_eq!(sig.best_side, Some(Side::Yes), "equal edges should default to YES");

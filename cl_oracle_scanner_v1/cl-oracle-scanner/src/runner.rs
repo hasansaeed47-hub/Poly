@@ -33,6 +33,8 @@ pub struct RunnerConfig {
     pub max_secs_left: f64,
     pub stop_loss:     bool,  // exit when current_fair < entry_price
     pub take_profit:   bool,  // exit when book_price >= fair_at_entry (Config 5)
+    pub max_positions: usize, // max concurrent positions
+    pub max_exposure:  f64,   // max total USD exposure
 }
 
 // ── Paper position ─────────────────────────────────────────────────────────────
@@ -60,6 +62,10 @@ pub struct PaperPosition {
     pub bid_yes_at_entry:  f64,
     pub bid_no_at_entry:   f64,
     pub edge_at_entry:     f64,
+    pub spread_at_entry:   f64,
+    pub depth_at_entry:    f64,
+    pub book_age_at_entry: f64,
+    pub cl_age_at_entry:   f64,
 }
 
 // ── Trade log entry ───────────────────────────────────────────────────────────
@@ -81,8 +87,11 @@ pub struct TradeLog {
     pub exit_price:    f64,
     pub exit_reason:   String,  // "SETTLEMENT" | "STOP_LOSS" | "TAKE_PROFIT"
     pub pnl:           f64,
+    pub entry_fee:     f64,
+    pub exit_fee:      f64,
     pub fee:           f64,
     pub net_pnl:       f64,
+    pub roi_pct:       f64,     // net_pnl / stake * 100
     pub entry_ts:      f64,
     pub exit_ts:       f64,
     pub hold_secs:     f64,
@@ -94,6 +103,10 @@ pub struct TradeLog {
     pub book_no_at_entry:  f64,
     pub bid_yes_at_entry:  f64,
     pub bid_no_at_entry:   f64,
+    pub spread_at_entry:   f64,
+    pub depth_at_entry:    f64,
+    pub book_age_at_entry: f64,
+    pub cl_age_at_entry:   f64,
     // State at exit
     pub exit_fair:         f64,
     pub exit_cl_price:     f64,
@@ -137,12 +150,31 @@ pub struct RunnerStats {
     pub settlement_exits:   u64,
     pub stop_loss_exits:    u64,
     pub take_profit_exits:  u64,
+    // Rejection breakdown
+    pub reject_time:      u64,
+    pub reject_edge:      u64,
+    pub reject_duplicate: u64,
+    pub reject_max_pos:   u64,
+    pub reject_max_exp:   u64,
+    // Drawdown tracking
+    pub peak_pnl:     f64,
+    pub max_drawdown:  f64,
 }
 
 impl RunnerStats {
     pub fn wr(&self) -> f64 {
         let settled = self.wins + self.losses;
         if settled == 0 { 0.0 } else { self.wins as f64 / settled as f64 * 100.0 }
+    }
+
+    fn update_drawdown(&mut self) {
+        if self.net_pnl > self.peak_pnl {
+            self.peak_pnl = self.net_pnl;
+        }
+        let dd = self.peak_pnl - self.net_pnl;
+        if dd > self.max_drawdown {
+            self.max_drawdown = dd;
+        }
     }
 }
 
@@ -166,7 +198,7 @@ impl ConfigRunner {
             .open(&log_path)
             .unwrap_or_else(|e| panic!("Cannot open log {}: {}", log_path, e));
 
-        info!("[{}] Log: {}", config.name, log_path);
+        info!("[{}] Log: {} max_pos={} max_exp=${}", config.name, log_path, config.max_positions, config.max_exposure);
 
         Self {
             config,
@@ -215,18 +247,36 @@ impl ConfigRunner {
 
         // Time gate — use config min_secs, not hardcoded
         if sig.secs_left < self.min_secs || sig.secs_left > self.config.max_secs_left as f64 {
+            self.stats.reject_time += 1;
             return;
         }
 
         // Edge gate
         let side = match sig.best_side {
             Some(s) if sig.best_edge >= self.config.min_edge => s,
-            _ => return,
+            _ => {
+                self.stats.reject_edge += 1;
+                return;
+            }
         };
 
         // Already in this slug? (one position per slug per config)
         let already_in = self.positions.keys().any(|k| k.starts_with(&sig.slug));
         if already_in {
+            self.stats.reject_duplicate += 1;
+            return;
+        }
+
+        // Max positions gate
+        if self.positions.len() >= self.config.max_positions {
+            self.stats.reject_max_pos += 1;
+            return;
+        }
+
+        // Max exposure gate
+        let current_exposure: f64 = self.positions.values().map(|p| p.stake).sum();
+        if current_exposure + self.stake > self.config.max_exposure {
+            self.stats.reject_max_exp += 1;
             return;
         }
 
@@ -235,6 +285,12 @@ impl ConfigRunner {
 
         let entry_price = sig.best_book;
         let shares = self.stake / entry_price;
+
+        // Get spread/depth/age for the entry side
+        let (spread_at_entry, depth_at_entry, book_age_at_entry) = match side {
+            Side::Yes => (sig.spread_yes, sig.depth_ask_yes, sig.book_age_yes),
+            Side::No  => (sig.spread_no,  sig.depth_ask_no,  sig.book_age_no),
+        };
 
         let pos = PaperPosition {
             trade_id:      trade_id.clone(),
@@ -257,6 +313,10 @@ impl ConfigRunner {
             bid_yes_at_entry:  sig.bid_yes,
             bid_no_at_entry:   sig.bid_no,
             edge_at_entry:     sig.best_edge,
+            spread_at_entry,
+            depth_at_entry,
+            book_age_at_entry,
+            cl_age_at_entry:   sig.cl_age,
         };
 
         info!(
@@ -352,6 +412,7 @@ impl ConfigRunner {
         let total_fee = entry_fee + exit_fee;
 
         let net = gross - total_fee;
+        let roi_pct = if pos.stake > 0.0 { net / pos.stake * 100.0 } else { 0.0 };
 
         if net > 0.0 {
             self.stats.wins += 1;
@@ -362,6 +423,7 @@ impl ConfigRunner {
         self.stats.gross_pnl += gross;
         self.stats.total_fee += total_fee;
         self.stats.net_pnl   += net;
+        self.stats.update_drawdown();
 
         match exit_reason {
             "SETTLEMENT"   => self.stats.settlement_exits  += 1,
@@ -396,8 +458,11 @@ impl ConfigRunner {
             exit_price,
             exit_reason:   exit_reason.to_string(),
             pnl:           gross,
+            entry_fee,
+            exit_fee,
             fee:           total_fee,
             net_pnl:       net,
+            roi_pct,
             entry_ts:      pos.entry_ts,
             exit_ts,
             hold_secs:     exit_ts - pos.entry_ts,
@@ -408,6 +473,10 @@ impl ConfigRunner {
             book_no_at_entry:  pos.book_no_at_entry,
             bid_yes_at_entry:  pos.bid_yes_at_entry,
             bid_no_at_entry:   pos.bid_no_at_entry,
+            spread_at_entry:   pos.spread_at_entry,
+            depth_at_entry:    pos.depth_at_entry,
+            book_age_at_entry: pos.book_age_at_entry,
+            cl_age_at_entry:   pos.cl_age_at_entry,
             exit_fair,
             exit_cl_price:     exit_cl,
             exit_sigma,
@@ -425,15 +494,15 @@ impl ConfigRunner {
         }
 
         info!(
-            "[{}] CLOSE {} {} exit={:.3} reason={} net={:+.3}",
+            "[{}] CLOSE {} {} exit={:.3} reason={} net={:+.3} roi={:+.1}%",
             self.config.name, pos.slug, pos.side,
-            exit_price, exit_reason, net
+            exit_price, exit_reason, net, roi_pct
         );
     }
 
     pub fn print_stats(&self) {
         info!(
-            "[{}] sig={} entries={} W={} L={} WR={:.1}% net={:+.2} fee={:.2} settle={} sl={} tp={}",
+            "[{}] sig={} entries={} W={} L={} WR={:.1}% net={:+.2} fee={:.2} settle={} sl={} tp={} peak={:+.2} dd={:.2}",
             self.config.name,
             self.stats.signals,
             self.stats.entries,
@@ -445,6 +514,18 @@ impl ConfigRunner {
             self.stats.settlement_exits,
             self.stats.stop_loss_exits,
             self.stats.take_profit_exits,
+            self.stats.peak_pnl,
+            self.stats.max_drawdown,
+        );
+        info!(
+            "[{}] rejects: time={} edge={} dup={} max_pos={} max_exp={} open={}",
+            self.config.name,
+            self.stats.reject_time,
+            self.stats.reject_edge,
+            self.stats.reject_duplicate,
+            self.stats.reject_max_pos,
+            self.stats.reject_max_exp,
+            self.positions.len(),
         );
     }
 
@@ -482,6 +563,12 @@ impl ConfigRunner {
             })
             .collect()
     }
+
+    /// Flush log file (for graceful shutdown)
+    pub async fn flush(&self) {
+        let mut file = self.log_file.lock().await;
+        let _ = file.flush();
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -489,7 +576,7 @@ impl ConfigRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signal::{Signal, Side};
+    use crate::signal::{Signal, Side, BookSnap};
 
     fn make_config(name: &str, min_edge: f64, max_secs: f64, sl: bool, tp: bool) -> RunnerConfig {
         RunnerConfig {
@@ -498,6 +585,8 @@ mod tests {
             max_secs_left: max_secs,
             stop_loss:     sl,
             take_profit:   tp,
+            max_positions: 10,
+            max_exposure:  100.0,
         }
     }
 
@@ -523,6 +612,11 @@ mod tests {
             bid_yes: book_yes - 0.01, bid_no: book_no - 0.01,
             edge_yes: ey, edge_no: en,
             best_side, best_edge, best_book, best_fair, ts,
+            spread_yes: 0.01, spread_no: 0.01,
+            depth_ask_yes: 10.0, depth_bid_yes: 10.0,
+            depth_ask_no: 10.0, depth_bid_no: 10.0,
+            book_age_yes: 0.5, book_age_no: 0.5,
+            cl_age: 0.5,
         }
     }
 
@@ -549,6 +643,7 @@ mod tests {
         let sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
         runner.on_signal(&sig, 1000 + 300).await;
         assert_eq!(runner.open_position_count(), 0);
+        assert_eq!(runner.stats.reject_time, 1);
     }
 
     #[tokio::test]
@@ -557,6 +652,31 @@ mod tests {
         let sig = make_signal("btc-updown-5m-test", 0.65, 0.50, 0.49, 300.0, 1000.0);
         runner.on_signal(&sig, 1000 + 300).await;
         assert_eq!(runner.open_position_count(), 0);
+        assert_eq!(runner.stats.reject_edge, 1);
+    }
+
+    #[tokio::test]
+    async fn max_positions_enforced() {
+        let cfg = RunnerConfig {
+            name: "MAX_POS_TEST".to_string(),
+            min_edge: 0.12,
+            max_secs_left: 840.0,
+            stop_loss: false,
+            take_profit: false,
+            max_positions: 1,
+            max_exposure: 1000.0,
+        };
+        let dir = std::env::temp_dir();
+        let mut runner = ConfigRunner::new(cfg, 5.0, 60.0, dir.to_str().unwrap());
+
+        let sig1 = make_signal("btc-updown-5m-test1", 0.80, 0.50, 0.49, 300.0, 1000.0);
+        runner.on_signal(&sig1, 1300).await;
+        assert_eq!(runner.open_position_count(), 1);
+
+        let sig2 = make_signal("eth-updown-5m-test2", 0.80, 0.50, 0.49, 300.0, 1001.0);
+        runner.on_signal(&sig2, 1301).await;
+        assert_eq!(runner.open_position_count(), 1); // blocked
+        assert_eq!(runner.stats.reject_max_pos, 1);
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-/// main.rs — CL Scanner
+/// main.rs — CL Scanner v2.0
 ///
 /// Startup sequence:
 /// 1. Load config
@@ -11,6 +11,7 @@
 ///    b. Pass to all 5 runners
 ///    c. Check for window settlements
 /// 7. Print stats every 60s
+/// 8. Graceful shutdown on Ctrl-C
 
 mod feeds;
 mod runner;
@@ -31,12 +32,12 @@ use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use feeds::{
-    BookState, ClPrices, LogWriter, MarketMeta, PriceHistory, RateLimiter,
+    BookState, ClPrices, FeedHealth, FeedParams, LogWriter, MarketMeta, PriceHistory, RateLimiter,
     build_slug, current_window_starts, fetch_books_batch, fetch_market_meta,
     run_book_feed, run_cl_feed,
 };
 use runner::{ConfigRunner, RunnerConfig};
-use signal::{compute, estimate_sigma, Side};
+use signal::{compute, estimate_sigma, BookSnap, Side};
 
 // ── Tick-level signal log ────────────────────────────────────────────────────
 
@@ -61,6 +62,14 @@ struct TickLog {
     edge_no:    f64,
     best_side:  String,
     best_edge:  f64,
+    // v2: microstructure
+    spread_yes:    f64,
+    spread_no:     f64,
+    depth_ask_yes: f64,
+    depth_ask_no:  f64,
+    book_age_yes:  f64,
+    book_age_no:   f64,
+    cl_age:        f64,
 }
 
 
@@ -76,27 +85,31 @@ struct AppConfig {
 
 #[derive(Deserialize, Debug)]
 struct FeedConfig {
-    assets:           Vec<String>,
-    timeframes:       Vec<u32>,
-    clob_rest:        String,
-    clob_ws:          String,
-    live_ws:          String,
-    gamma_api:        String,
-    book_batch_size:  usize,
-    rest_throttle_ms: u64,
-    book_warmup_secs: u64,
+    assets:            Vec<String>,
+    timeframes:        Vec<u32>,
+    clob_rest:         String,
+    clob_ws:           String,
+    live_ws:           String,
+    gamma_api:         String,
+    book_batch_size:   usize,
+    rest_throttle_ms:  u64,
+    book_warmup_secs:  u64,
+    ws_reconnect_secs: u64,
+    price_history_cap: usize,
+    cl_stale_secs:     f64,
+    book_stale_secs:   f64,
 }
 
 #[derive(Deserialize, Debug)]
 struct ScanConfig {
-    tick_ms:          u64,
+    tick_ms:           u64,
     sigma_window_secs: f64,
-    min_secs:         f64,
+    min_secs:          f64,
 }
 
 #[derive(Deserialize, Debug)]
 struct PaperConfig {
-    stake:          f64,
+    stake: f64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -140,9 +153,21 @@ async fn main() -> Result<()> {
     let cfg: AppConfig = toml::from_str(&cfg_text)
         .context("invalid config.toml")?;
 
-    info!("CL Oracle Scanner starting");
+    info!("CL Oracle Scanner v2.0.0 starting");
     info!("Assets: {:?}", cfg.feed.assets);
     info!("Timeframes: {:?}m", cfg.feed.timeframes);
+    info!("Staleness gates: CL={:.0}s Book={:.0}s", cfg.feed.cl_stale_secs, cfg.feed.book_stale_secs);
+
+    // Build FeedParams from config
+    let feed_params = FeedParams {
+        book_batch_size:   cfg.feed.book_batch_size,
+        rest_throttle_ms:  cfg.feed.rest_throttle_ms,
+        ws_reconnect_secs: cfg.feed.ws_reconnect_secs,
+        price_history_cap: cfg.feed.price_history_cap,
+    };
+
+    // Feed health counters (shared across all feeds)
+    let feed_health = Arc::new(FeedHealth::new());
 
     // Create log directory
     std::fs::create_dir_all("logs").context("cannot create logs/")?;
@@ -227,8 +252,10 @@ async fn main() -> Result<()> {
         let assets = cfg.feed.assets.clone();
         let ws = cfg.feed.live_ws.clone();
         let cl_log = cl_log.clone();
+        let params = feed_params.clone();
+        let health = feed_health.clone();
         tokio::spawn(async move {
-            run_cl_feed(ws, assets, cp, ph, cl_log).await;
+            run_cl_feed(ws, assets, cp, ph, cl_log, params, health).await;
         });
     }
 
@@ -241,8 +268,10 @@ async fn main() -> Result<()> {
         let bl = book_live.clone();
         let ws = cfg.feed.clob_ws.clone();
         let book_log = book_log.clone();
+        let params = feed_params.clone();
+        let health = feed_health.clone();
         tokio::spawn(async move {
-            run_book_feed(ws, ti, bs, bl, book_sub_rx, book_log).await;
+            run_book_feed(ws, ti, bs, bl, book_sub_rx, book_log, params, health).await;
         });
     }
 
@@ -277,8 +306,20 @@ async fn main() -> Result<()> {
     // slug → (cl_price_at_close, timestamp)
     let mut close_prices: HashMap<String, (f64, f64)> = HashMap::new();
 
+    // Staleness thresholds from config
+    let cl_stale_secs   = cfg.feed.cl_stale_secs;
+    let book_stale_secs = cfg.feed.book_stale_secs;
+
     loop {
-        tokio::time::sleep(tick).await;
+        // Graceful shutdown — check for Ctrl-C alongside tick sleep
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl-C received — shutting down gracefully");
+                break;
+            }
+            _ = tokio::time::sleep(tick) => {}
+        }
+
         tick_count += 1;
 
         let now = now_secs();
@@ -309,7 +350,7 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            // Subscribe new tokens on the book WS (BUG 13 fix)
+            // Subscribe new tokens on the book WS
             if !new_tokens.is_empty() {
                 let _ = book_sub_tx.send(new_tokens);
             }
@@ -321,7 +362,7 @@ async fn main() -> Result<()> {
         if tick_count % 4 == 0 {
             let all_tokens: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
             if !all_tokens.is_empty() {
-                match fetch_books_batch(&http, &cfg.feed.clob_rest, &all_tokens, &limiter, &book_log).await {
+                match fetch_books_batch(&http, &cfg.feed.clob_rest, &all_tokens, &limiter, &book_log, &feed_params).await {
                     Ok(books) => {
                         for (tid, entry) in books {
                             book_state.insert(tid, entry);
@@ -404,11 +445,16 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            // Get CL price
-            let cl = match cl_prices.get(&meta.asset) {
-                Some(v) => v.1,
+            // Get CL price + check staleness
+            let (cl, cl_ts) = match cl_prices.get(&meta.asset) {
+                Some(v) => (v.1, v.0),
                 None    => continue,
             };
+            let cl_age = now - cl_ts;
+            if cl_age > cl_stale_secs {
+                debug!("[STALE_CL] {} cl_age={:.1}s > {:.0}s", slug, cl_age, cl_stale_secs);
+                continue;
+            }
 
             // Record open price at window start (first CL price we see)
             if meta.open_price <= 0.0 {
@@ -419,14 +465,42 @@ async fn main() -> Result<()> {
                 continue; // don't trade until open price is set
             }
 
-            // Get book prices for YES and NO tokens
-            let (book_yes, bid_yes) = match book_state.get(&meta.token_yes) {
-                Some(b) => (b.best_ask, b.best_bid),
+            // Get book prices for YES and NO tokens + check staleness
+            let yes_book_entry = match book_state.get(&meta.token_yes) {
+                Some(b) => b.clone(),
                 None    => continue,
             };
-            let (book_no, bid_no) = match book_state.get(&meta.token_no) {
-                Some(b) => (b.best_ask, b.best_bid),
+            let no_book_entry = match book_state.get(&meta.token_no) {
+                Some(b) => b.clone(),
                 None    => continue,
+            };
+
+            let yes_book_age = now - yes_book_entry.ts;
+            let no_book_age  = now - no_book_entry.ts;
+
+            if yes_book_age > book_stale_secs {
+                debug!("[STALE_BOOK] {} YES book_age={:.1}s > {:.0}s", slug, yes_book_age, book_stale_secs);
+                continue;
+            }
+            if no_book_age > book_stale_secs {
+                debug!("[STALE_BOOK] {} NO book_age={:.1}s > {:.0}s", slug, no_book_age, book_stale_secs);
+                continue;
+            }
+
+            // Build BookSnap structs
+            let yes_snap = BookSnap {
+                best_ask:  yes_book_entry.best_ask,
+                best_bid:  yes_book_entry.best_bid,
+                ask_depth: yes_book_entry.ask_depth,
+                bid_depth: yes_book_entry.bid_depth,
+                book_age:  yes_book_age,
+            };
+            let no_snap = BookSnap {
+                best_ask:  no_book_entry.best_ask,
+                best_bid:  no_book_entry.best_bid,
+                ask_depth: no_book_entry.ask_depth,
+                bid_depth: no_book_entry.bid_depth,
+                book_age:  no_book_age,
             };
 
             // Estimate sigma from CL price history
@@ -442,7 +516,7 @@ async fn main() -> Result<()> {
             let sig = match compute(
                 slug, &meta.asset, meta.tf,
                 meta.open_price, cl, sigma, secs_left,
-                book_yes, book_no, bid_yes, bid_no, now,
+                &yes_snap, &no_snap, cl_age, now,
             ) {
                 Some(s) => s,
                 None    => continue,
@@ -470,6 +544,13 @@ async fn main() -> Result<()> {
                     edge_no: sig.edge_no,
                     best_side: sig.best_side.map(|s| s.to_string()).unwrap_or_default(),
                     best_edge: sig.best_edge,
+                    spread_yes: sig.spread_yes,
+                    spread_no: sig.spread_no,
+                    depth_ask_yes: sig.depth_ask_yes,
+                    depth_ask_no: sig.depth_ask_no,
+                    book_age_yes: sig.book_age_yes,
+                    book_age_no: sig.book_age_no,
+                    cl_age: sig.cl_age,
                 };
                 if let Ok(line) = serde_json::to_string(&tick_entry) {
                     let mut f = tick_log_file.lock().await;
@@ -479,8 +560,8 @@ async fn main() -> Result<()> {
 
             if sig.best_edge > 0.05 {
                 debug!(
-                    "[SCAN] {} cl={:.2} fair_y={:.3} bk_y={:.3} bk_n={:.3} dev={:+.3} secs={:.0}",
-                    slug, cl, sig.fair_yes, book_yes, book_no, sig.best_edge, secs_left
+                    "[SCAN] {} cl={:.2} fair_y={:.3} bk_y={:.3} bk_n={:.3} edge={:+.3} secs={:.0} cl_age={:.1}s",
+                    slug, cl, sig.fair_yes, sig.book_yes, sig.book_no, sig.best_edge, secs_left, cl_age
                 );
             }
 
@@ -505,9 +586,26 @@ async fn main() -> Result<()> {
             for runner in &runners {
                 runner.print_stats();
             }
-            info!("open_markets={} settled={} book_entries={}",
-                markets.len(), settled.len(), book_state.len()
+            info!("open_markets={} settled={} book_entries={} cl_msgs={} book_msgs={}",
+                markets.len(), settled.len(), book_state.len(),
+                feed_health.cl_msg_count.load(Ordering::Relaxed),
+                feed_health.book_msg_count.load(Ordering::Relaxed),
             );
         }
     }
+
+    // ── Graceful shutdown ─────────────────────────────────────────────────────
+
+    info!("Flushing runner logs...");
+    for runner in &runners {
+        runner.flush().await;
+    }
+
+    info!("Final stats:");
+    for runner in &runners {
+        runner.print_stats();
+    }
+
+    info!("CL Oracle Scanner v2.0.0 shutdown complete");
+    Ok(())
 }
