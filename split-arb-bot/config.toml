@@ -31,10 +31,12 @@ gamma_pages = 4
 # Only consider markets with this much fillable depth on EACH side ($)
 min_depth_usd = 20.0
 # Slug/question keyword filter — only track markets matching ANY of these (case-insensitive)
-# Empty list = track all markets. Focus on crypto time-window markets for best arb frequency.
+# Empty list = track all markets. Focus on crypto markets for best arb frequency.
 slug_keywords = ["btc", "bitcoin", "eth", "ethereum", "sol", "solana", "crypto", "xrp", "doge", "bnb", "ada", "avax", "matic", "link"]
 # Time-window keywords — market must also match one of these duration patterns
-time_keywords = ["5-minute", "5 minute", "15-minute", "15 minute", "60-minute", "60 minute", "1-hour", "1 hour", "5min", "15min", "60min", "1hr"]
+# Polymarket uses formats like "above $85,000 at 5:00 PM", "price of BTC", etc.
+# Empty list = no time filter (just use slug_keywords). Set to [] if slugs alone are enough.
+time_keywords = []
 
 [arb]
 # Paper bankroll ($)
