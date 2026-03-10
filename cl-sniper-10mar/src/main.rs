@@ -458,6 +458,8 @@ struct PT {
     sl_px: f64,
     end_ts: i64,
     tid: String,
+    tid_up: String,
+    tid_dn: String,
     slug: String,
     entry_fee: f64,
 }
@@ -555,6 +557,8 @@ impl Sniper {
         for tr in &self.trackers {
             if let Some(pt) = &tr.active {
                 tids.push(pt.tid.clone());
+                tids.push(pt.tid_up.clone());
+                tids.push(pt.tid_dn.clone());
             }
         }
         tids.sort();
@@ -615,9 +619,9 @@ impl Sniper {
                         .or_else(|| s.cl_latest(pt.asset))
                         .unwrap_or(0.0);
 
-                    // CLOB cross-check
-                    let bk_up = self.bk.get(&Self::tid_for(&wins, &pt.slug, true));
-                    let bk_dn = self.bk.get(&Self::tid_for(&wins, &pt.slug, false));
+                    // CLOB cross-check (uses stored token IDs, not expired wins)
+                    let bk_up = self.bk.get(&pt.tid_up);
+                    let bk_dn = self.bk.get(&pt.tid_dn);
 
                     let cl_dir = if cl_open > 0.0 && cl_close > 0.0 {
                         Some(if cl_close >= cl_open { "UP" } else { "DOWN" })
@@ -724,6 +728,7 @@ impl Sniper {
                     tr.active = Some(PT {
                         dir: dir.to_string(), asset: w.asset, px: fp, shares,
                         sl_px, end_ts: w.end_ts, tid: tid.to_string(),
+                        tid_up: w.tid_up.clone(), tid_dn: w.tid_dn.clone(),
                         slug: w.slug.clone(), entry_fee,
                     });
                     tr.done.insert(w.slug.clone());
@@ -811,8 +816,9 @@ impl Sniper {
                     info!("═══════════════════════════════════════════════════════");
                     info!("  [{}] ▶ SIGNAL: BUY {} {} {}m @{:.3} ({:.0}s left)",
                         tr.cfg.id, dir, w.asset.to_uppercase(), w.wmin, fp, left);
+                    let actual_cont = tr.delta_ticks.get(&w.slug).copied().unwrap_or(0);
                     info!("  δ={:+.4}% thr={:.4}% cont={}/{} book={:.3}",
-                        delta, threshold, tr.cfg.continuity, tr.cfg.continuity, bk.ba);
+                        delta, threshold, actual_cont, tr.cfg.continuity, bk.ba);
                     info!("  CL={:.2} open={:.2} BN={:.2} 1hRange={:.2}%",
                         cl_now, cl_open, bn_now, hr);
                     info!("  maker={:.3} taker={:.3} fee=${:.4} SL≤{:.3}",
@@ -822,6 +828,7 @@ impl Sniper {
                     tr.active = Some(PT {
                         dir: dir.to_string(), asset: w.asset, px: fp, shares,
                         sl_px, end_ts: w.end_ts, tid: tid.to_string(),
+                        tid_up: w.tid_up.clone(), tid_dn: w.tid_dn.clone(),
                         slug: w.slug.clone(), entry_fee,
                     });
                     tr.done.insert(w.slug.clone());
@@ -843,12 +850,6 @@ impl Sniper {
             tr.delta_ticks.retain(|k, _| slug_ts(k) > cut);
             tr.maker_ticks.retain(|k, _| slug_ts(k) > cut);
         }
-    }
-
-    fn tid_for(wins: &[Win], slug: &str, up: bool) -> String {
-        wins.iter().find(|w| w.slug == slug)
-            .map(|w| if up { w.tid_up.clone() } else { w.tid_dn.clone() })
-            .unwrap_or_default()
     }
 
     fn status(&self) -> String {
