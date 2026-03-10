@@ -496,6 +496,10 @@ class PolyClient:
         self._last_call = 0.0
         self._session: Optional[aiohttp.ClientSession] = None
 
+        # Market filters (from [scan] section)
+        self.slug_keywords = [k.lower() for k in cfg["scan"].get("slug_keywords", [])]
+        self.time_keywords = [k.lower() for k in cfg["scan"].get("time_keywords", [])]
+
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
@@ -570,6 +574,15 @@ class PolyClient:
 
                 if not cond_id or not tokens[0] or not tokens[1]:
                     continue
+
+                # -- Filter by slug/question keywords --
+                match_text = f"{slug} {question}".lower()
+                if self.slug_keywords:
+                    if not any(kw in match_text for kw in self.slug_keywords):
+                        continue
+                if self.time_keywords:
+                    if not any(kw in match_text for kw in self.time_keywords):
+                        continue
 
                 o_lower = [o.lower() for o in outcomes]
                 if "yes" in o_lower:
