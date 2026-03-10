@@ -21,8 +21,8 @@ book_batch_size = 100
 interval_ms = 500
 # REST discovery interval — find new markets (seconds)
 # Markets don't appear/disappear fast, so 60s is fine
-# Crypto windows rotate every 5min, so discover frequently
-discovery_interval_secs = 30
+# Crypto windows rotate every 5min — discover every 15s to catch new opens fast
+discovery_interval_secs = 15
 # Max markets to track simultaneously
 max_markets = 200
 # Gamma API: how many events per page
@@ -31,12 +31,9 @@ gamma_page_size = 50
 gamma_pages = 10
 # Only consider markets with this much fillable depth on EACH side ($)
 min_depth_usd = 20.0
-# Slug/question keyword filter — only track markets matching ANY of these (case-insensitive)
-# Empty list = track all markets. Focus on crypto markets for best arb frequency.
-slug_keywords = ["btc", "bitcoin", "eth", "ethereum", "sol", "solana", "crypto", "xrp", "doge", "bnb", "ada", "avax", "matic", "link"]
-# Time-window keywords — market must also match one of these duration patterns
-# Polymarket uses formats like "above $85,000 at 5:00 PM", "price of BTC", etc.
-# Empty list = no time filter (just use slug_keywords). Set to [] if slugs alone are enough.
+# Slug/question keyword filter — used by general discovery fallback only
+# Crypto window discovery always uses ["btc", "eth", "sol", "xrp"]
+slug_keywords = ["btc", "eth", "sol", "xrp"]
 time_keywords = []
 
 [arb]
