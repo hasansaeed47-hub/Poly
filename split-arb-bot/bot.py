@@ -610,6 +610,102 @@ class PolyClient:
 
         return markets
 
+    async def discover_crypto_windows(self) -> list[Market]:
+        """
+        Discover active crypto Up/Down time-window markets.
+        Mirrors Hydra's approach: construct slugs like {asset}-updown-{window}m-{timestamp}
+        and query Gamma /markets?slug=... for each.
+        """
+        session = await self._get_session()
+        now = int(time.time())
+        assets = self.slug_keywords if self.slug_keywords else ["btc", "eth", "sol", "xrp"]
+        windows = [5, 15, 60]  # minutes
+
+        markets = []
+        for asset in assets:
+            for wm in windows:
+                iv = wm * 60  # interval in seconds
+                s0 = (now // iv) * iv  # current window start
+                # Check current and next window
+                for st in [s0, s0 + iv]:
+                    et = st + iv
+                    if et < now:
+                        continue  # already expired
+
+                    slug = f"{asset}-updown-{wm}m-{st}"
+                    await self._throttle()
+
+                    try:
+                        async with session.get(
+                            f"{self.gamma_api}/markets",
+                            params={"slug": slug},
+                        ) as resp:
+                            if resp.status != 200:
+                                continue
+                            data = await resp.json()
+                    except Exception:
+                        continue
+
+                    # Response can be a list or single object
+                    if isinstance(data, list):
+                        if not data:
+                            continue
+                        m = data[0]
+                    elif isinstance(data, dict):
+                        m = data
+                    else:
+                        continue
+
+                    tokens = m.get("clobTokenIds", "")
+                    if isinstance(tokens, str):
+                        try:
+                            tokens = json.loads(tokens)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+                    if not isinstance(tokens, list) or len(tokens) < 2:
+                        continue
+
+                    outcomes = m.get("outcomes", "")
+                    if isinstance(outcomes, str):
+                        try:
+                            outcomes = json.loads(outcomes)
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+
+                    if not isinstance(outcomes, list) or len(outcomes) != 2:
+                        continue
+
+                    cond_id = m.get("conditionId", "")
+                    question = m.get("question", "")
+                    if not cond_id or not tokens[0] or not tokens[1]:
+                        continue
+
+                    # Map Up/Down outcomes to yes/no (Up=yes, Down=no)
+                    o_lower = [o.lower() for o in outcomes]
+                    if "up" in o_lower:
+                        yes_idx = o_lower.index("up")
+                        no_idx = 1 - yes_idx
+                    elif "yes" in o_lower:
+                        yes_idx = o_lower.index("yes")
+                        no_idx = 1 - yes_idx
+                    elif "down" in o_lower:
+                        no_idx = o_lower.index("down")
+                        yes_idx = 1 - no_idx
+                    else:
+                        yes_idx, no_idx = 0, 1
+
+                    logging.info("WINDOW: %s | %s", slug, question[:60])
+                    markets.append(Market(
+                        condition_id=cond_id,
+                        question=question[:120],
+                        slug=slug,
+                        token_yes=tokens[yes_idx],
+                        token_no=tokens[no_idx],
+                    ))
+
+        return markets
+
     async def fetch_books(self, token_ids: list[str]) -> dict[str, dict]:
         """Fetch order books for a batch of token IDs (REST fallback)."""
         if not token_ids:
@@ -814,6 +910,27 @@ class PaperEngine:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _slug_end_ts(slug: str) -> int:
+    """Extract end timestamp from slug like 'btc-updown-5m-1741651200'."""
+    parts = slug.rsplit("-", 1)
+    if len(parts) < 2:
+        return 0
+    try:
+        start_ts = int(parts[1])
+    except ValueError:
+        return 0
+    # Parse window minutes from slug: ...-updown-{N}m-{ts}
+    mid = slug.replace(parts[1], "").rstrip("-")
+    for seg in mid.split("-"):
+        if seg.endswith("m") and seg[:-1].isdigit():
+            return start_ts + int(seg[:-1]) * 60
+    return start_ts + 300  # default 5m
+
+
+# ---------------------------------------------------------------------------
 # Main loop — 500ms scan tick with WebSocket book feed
 # ---------------------------------------------------------------------------
 
@@ -841,20 +958,28 @@ async def run(cfg: dict):
     logging.info("CLOB WS: %s", clob_ws_url)
     logging.info("=" * 60)
 
-    # -- Phase 1: Initial discovery via REST -----------------------------------
-    logging.info("Initial market discovery...")
-    for page in range(gamma_pages):
-        batch = await client.discover_markets(
-            limit=gamma_page_size,
-            offset=page * gamma_page_size,
-        )
-        for m in batch:
-            if m.condition_id not in tracked and len(tracked) < max_markets:
-                tracked[m.condition_id] = m
-        if len(batch) < gamma_page_size:
-            break
+    # -- Phase 1: Initial discovery — crypto Up/Down windows -------------------
+    logging.info("Discovering crypto time-window markets...")
+    crypto_batch = await client.discover_crypto_windows()
+    for m in crypto_batch:
+        if m.condition_id not in tracked and len(tracked) < max_markets:
+            tracked[m.condition_id] = m
 
-    logging.info("Discovered %d markets", len(tracked))
+    logging.info("Discovered %d crypto window markets", len(tracked))
+
+    if not tracked:
+        logging.warning("No crypto windows found — falling back to general discovery")
+        for page in range(gamma_pages):
+            batch = await client.discover_markets(
+                limit=gamma_page_size,
+                offset=page * gamma_page_size,
+            )
+            for m in batch:
+                if m.condition_id not in tracked and len(tracked) < max_markets:
+                    tracked[m.condition_id] = m
+            if len(batch) < gamma_page_size:
+                break
+        logging.info("Fallback discovered %d markets", len(tracked))
 
     if not tracked:
         logging.error("No markets found, exiting")
@@ -907,23 +1032,26 @@ async def run(cfg: dict):
             loop_start = time.time()
             scan_count += 1
 
-            # -- Periodic REST discovery (every discovery_interval secs) --------
+            # -- Periodic discovery (every discovery_interval secs) --------
+            # Also prune expired windows (end_ts passed)
             if time.time() - last_discovery >= discovery_interval:
                 last_discovery = time.time()
+
+                # Prune expired windows
+                now_ts = int(time.time())
+                expired = [cid for cid, m in tracked.items()
+                           if "-updown-" in m.slug and _slug_end_ts(m.slug) < now_ts]
+                for cid in expired:
+                    del tracked[cid]
+                if expired:
+                    logging.info("Pruned %d expired windows", len(expired))
+
                 new_tokens = []
-                for page in range(gamma_pages):
-                    batch = await client.discover_markets(
-                        limit=gamma_page_size,
-                        offset=page * gamma_page_size,
-                    )
-                    added = 0
-                    for m in batch:
-                        if m.condition_id not in tracked and len(tracked) < max_markets:
-                            tracked[m.condition_id] = m
-                            new_tokens.extend([m.token_yes, m.token_no])
-                            added += 1
-                    if len(batch) < gamma_page_size:
-                        break
+                crypto_batch = await client.discover_crypto_windows()
+                for m in crypto_batch:
+                    if m.condition_id not in tracked and len(tracked) < max_markets:
+                        tracked[m.condition_id] = m
+                        new_tokens.extend([m.token_yes, m.token_no])
 
                 if new_tokens:
                     logging.info("Discovery: +%d new markets (%d total)", len(new_tokens) // 2, len(tracked))
