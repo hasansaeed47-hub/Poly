@@ -610,7 +610,7 @@ class PolyClient:
 
         return markets
 
-    async def discover_crypto_windows(self) -> list[Market]:
+    async def discover_crypto_windows(self, quiet: bool = False) -> list[Market]:
         """
         Discover active crypto Up/Down time-window markets.
         Fires all slug lookups concurrently — ~1 request round-trip instead of 84 sequential.
@@ -701,7 +701,8 @@ class PolyClient:
             else:
                 yes_idx, no_idx = 0, 1
 
-            logging.info("WINDOW: %s | %s", slug, question[:60])
+            if not quiet:
+                logging.info("WINDOW: %s | %s", slug, question[:60])
             markets.append(Market(
                 condition_id=cond_id,
                 question=question[:120],
@@ -1053,11 +1054,12 @@ async def run(cfg: dict):
                     logging.info("Pruned %d expired windows", len(expired))
 
                 new_tokens = []
-                crypto_batch = await client.discover_crypto_windows()
+                crypto_batch = await client.discover_crypto_windows(quiet=True)
                 for m in crypto_batch:
                     if m.condition_id not in tracked and len(tracked) < max_markets:
                         tracked[m.condition_id] = m
                         new_tokens.extend([m.token_yes, m.token_no])
+                        logging.info("NEW window: %s", m.slug)
 
                 if new_tokens:
                     logging.info("Discovery: +%d new markets (%d total)", len(new_tokens) // 2, len(tracked))
