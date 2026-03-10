@@ -126,8 +126,32 @@ struct GammaEvent {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct GammaMarket {
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     clob_token_ids: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     outcomes:       Option<Vec<String>>,
+}
+
+/// Gamma API returns these as JSON-stringified arrays like "[\"Up\", \"Down\"]"
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where D: serde::Deserializer<'de>
+{
+    use serde::de::Error;
+    let v: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match v {
+        None => Ok(None),
+        Some(serde_json::Value::Array(arr)) => {
+            let strs = arr.into_iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            Ok(Some(strs))
+        }
+        Some(serde_json::Value::String(s)) => {
+            let parsed: Vec<String> = serde_json::from_str(&s).map_err(D::Error::custom)?;
+            Ok(Some(parsed))
+        }
+        Some(other) => Err(D::Error::custom(format!("expected string or array, got {:?}", other))),
+    }
 }
 
 // ── CLOB REST book response ───────────────────────────────────────────────────
@@ -219,11 +243,11 @@ pub async fn fetch_market_meta(
     let event: GammaEvent = serde_json::from_str(&body)
         .with_context(|| format!("gamma API JSON parse failed for {}, body: {}", slug, &body[..body.len().min(300)]))?;
 
-    // Find the market with YES/NO outcomes
+    // Find the market with Up/Down outcomes
     let market = event.markets.iter().find(|m| {
         m.outcomes
             .as_ref()
-            .map(|o| o.iter().any(|x| x.eq_ignore_ascii_case("yes")))
+            .map(|o| o.iter().any(|x| x.eq_ignore_ascii_case("up")))
             .unwrap_or(false)
     });
 
@@ -239,14 +263,15 @@ pub async fn fetch_market_meta(
         return Ok(None);
     }
 
+    // "Up" = YES side, "Down" = NO side
     let yes_idx = outcomes
         .iter()
-        .position(|o| o.eq_ignore_ascii_case("yes"))
-        .ok_or_else(|| anyhow!("no YES outcome"))?;
+        .position(|o| o.eq_ignore_ascii_case("up"))
+        .ok_or_else(|| anyhow!("no Up outcome"))?;
     let no_idx = outcomes
         .iter()
-        .position(|o| o.eq_ignore_ascii_case("no"))
-        .ok_or_else(|| anyhow!("no NO outcome"))?;
+        .position(|o| o.eq_ignore_ascii_case("down"))
+        .ok_or_else(|| anyhow!("no Down outcome"))?;
 
     let token_yes = tokens[yes_idx].clone();
     let token_no  = tokens[no_idx].clone();
