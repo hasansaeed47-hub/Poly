@@ -980,6 +980,19 @@ async def run(cfg: dict):
                     engine.bankroll,
                 )
 
+                # -- Top 5 closest markets to arb threshold -------------------------
+                sums = []
+                for m in tracked.values():
+                    yb = m.yes_bids.best
+                    nb = m.no_bids.best
+                    if yb > 0 and nb > 0:
+                        sums.append((yb + nb, yb, nb, m.slug[:40]))
+                sums.sort(key=lambda x: -x[0])
+                top5 = sums[:5]
+                if top5:
+                    parts = [f"{s[3]}={s[0]:.4f}(Y{s[1]:.3f}+N{s[2]:.3f})" for s in top5]
+                    logging.info("  TOP5 sums: %s", " | ".join(parts))
+
             # -- Wait for next 500ms tick --------------------------------------
             elapsed = time.time() - loop_start
             sleep_time = max(0, scan_tick - elapsed)
