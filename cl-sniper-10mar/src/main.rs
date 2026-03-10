@@ -53,6 +53,9 @@ const MAKER_CHASE_TICKS: u32 = 4;
 // Regime threshold
 const REGIME_THRESH: f64 = 0.3;
 
+// Minimum CL delta (%) per asset — skip trades where move is too small for oracle to resolve
+const MIN_DELTA: &[(&str, f64)] = &[("btc", 0.015), ("eth", 0.020), ("sol", 0.030), ("xrp", 0.050)];
+
 const RTDS_WS: &str = "wss://ws-live-data.polymarket.com";
 const BN_WS: &str = "wss://stream.binance.com:9443/ws";
 const GAMMA: &str = "https://gamma-api.polymarket.com";
@@ -60,6 +63,10 @@ const CLOB: &str = "https://clob.polymarket.com";
 
 fn stdev(a: &str) -> f64 {
     STDEV.iter().find(|(k, _)| *k == a).map(|(_, v)| *v).unwrap_or(STDEV_BASE)
+}
+
+fn min_delta(a: &str) -> f64 {
+    MIN_DELTA.iter().find(|(k, _)| *k == a).map(|(_, v)| *v).unwrap_or(0.020)
 }
 
 fn pm_fee(px: f64) -> f64 {
@@ -696,6 +703,14 @@ impl Sniper {
                     // ── Engine E: late scalper ────────────────────────────
                     if left > E_ENTRY_START || left < E_TAKER_DEADLINE { continue; }
 
+                    // Min delta filter for Engine E too
+                    if let (Some(&co), Some(&cn)) = (self.cl_opens.get(&w.slug), s.cl.get(w.asset)) {
+                        if co > 0.0 && cn > 0.0 {
+                            let d = ((cn - co) / co * 100.0).abs();
+                            if d < min_delta(w.asset) { continue; }
+                        }
+                    }
+
                     let tid_up = &w.tid_up;
                     let tid_dn = &w.tid_dn;
                     let bk_up = self.bk.get(tid_up);
@@ -760,7 +775,8 @@ impl Sniper {
                     let cl_open = match self.cl_opens.get(&w.slug) { Some(&p) if p > 0.0 => p, _ => continue };
                     let cl_now = match s.cl.get(w.asset) { Some(&p) if p > 0.0 => p, _ => continue };
                     let delta = (cl_now - cl_open) / cl_open * 100.0;
-                    if delta.abs() < 0.001 { continue; }
+                    // Min delta filter: skip tiny moves where CL oracle noise dominates
+                    if delta.abs() < min_delta(w.asset) { continue; }
 
                     let dir = if delta > 0.0 { "UP" } else { "DOWN" };
                     let sc = stdev(w.asset) / STDEV_BASE;
