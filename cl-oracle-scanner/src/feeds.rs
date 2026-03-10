@@ -185,18 +185,7 @@ where
 }
 
 // -- CLOB REST book response --------------------------------------------------
-
-#[derive(Deserialize, Debug)]
-struct ClobBook {
-    asks: Vec<ClobLevel>,
-    bids: Vec<ClobLevel>,
-}
-
-#[derive(Deserialize, Debug)]
-struct ClobLevel {
-    price: String,
-    size:  String,
-}
+// (batch POST /books returns Vec<Value> with asset_id, bids, asks — parsed inline)
 
 // -- Rate limiter -------------------------------------------------------------
 
@@ -245,11 +234,13 @@ pub async fn fetch_market_meta(
 ) -> Result<Option<MarketMeta>> {
     limiter.wait().await;
 
-    let url = format!("{}/events/slug/{}", gamma_api, slug);
-    debug!("GET {}", url);
+    // Use /markets?slug=X endpoint (matches Hydra + cl_ab_test)
+    let url = format!("{}/markets", gamma_api);
+    debug!("GET {}?slug={}", url, slug);
 
     let resp = client
         .get(&url)
+        .query(&[("slug", slug)])
         .timeout(Duration::from_secs(5))
         .send()
         .await
@@ -261,25 +252,24 @@ pub async fn fetch_market_meta(
 
     let text = resp.text().await.context("gamma API read body failed")?;
 
-    let event: GammaEvent = match serde_json::from_str(&text) {
-        Ok(e) => e,
-        Err(e) => {
-            // Try parsing as array — some endpoints return [event] instead of event
-            if let Ok(mut arr) = serde_json::from_str::<Vec<GammaEvent>>(&text) {
-                if let Some(ev) = arr.pop() {
-                    ev
-                } else {
-                    return Ok(None);
-                }
+    // /markets returns an array of market objects directly (not wrapped in event)
+    let markets: Vec<GammaMarket> = match serde_json::from_str(&text) {
+        Ok(m) => m,
+        Err(_) => {
+            // Fallback: try parsing as GammaEvent (wrapped format)
+            if let Ok(event) = serde_json::from_str::<GammaEvent>(&text) {
+                event.markets
+            } else if let Ok(mut arr) = serde_json::from_str::<Vec<GammaEvent>>(&text) {
+                arr.pop().map(|e| e.markets).unwrap_or_default()
             } else {
-                warn!("gamma parse error: {}  body[..200]: {}", e, &text[..text.len().min(200)]);
-                return Err(anyhow::anyhow!("gamma API JSON parse failed: {}", e));
+                warn!("gamma parse error for slug {}: body[..200]: {}", slug, &text[..text.len().min(200)]);
+                return Ok(None);
             }
         }
     };
 
     // Find market with Up/Down or Yes/No outcomes
-    let market = event.markets.iter().find(|m| {
+    let market = markets.iter().find(|m| {
         m.outcomes
             .as_ref()
             .map(|o| o.iter().any(|x| {
@@ -339,78 +329,95 @@ pub async fn fetch_market_meta(
 // -- Batch book fetcher -------------------------------------------------------
 
 /// Fetch order books via REST.
-/// Uses GET /book?token_id=X for each token individually.
+/// Uses POST /books with batch body (matches Hydra implementation).
 pub async fn fetch_books_batch(
     client:   &Client,
     clob_rest: &str,
     token_ids: &[String],
-    limiter:   &RateLimiter,
+    _limiter:  &RateLimiter,
 ) -> Result<HashMap<String, BookEntry>> {
     if token_ids.is_empty() {
         return Ok(HashMap::new());
     }
 
+    let body: Vec<serde_json::Value> = token_ids.iter()
+        .map(|t| serde_json::json!({"token_id": t}))
+        .collect();
+
+    let url = format!("{}/books", clob_rest);
+
+    let resp = match client
+        .post(&url)
+        .json(&body)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("CLOB books batch request failed: {}", e);
+            return Ok(HashMap::new());
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        warn!("CLOB books batch returned {}: {}", status, &body[..body.len().min(200)]);
+        return Ok(HashMap::new());
+    }
+
+    let items: Vec<serde_json::Value> = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("CLOB books batch parse failed: {}", e);
+            return Ok(HashMap::new());
+        }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+
     let mut result = HashMap::new();
 
-    for tid in token_ids {
-        limiter.wait().await;
-
-        let url = format!("{}/book?token_id={}", clob_rest, tid);
-
-        let resp = match client
-            .get(&url)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                warn!("CLOB book request failed for {}: {}", &tid[..8.min(tid.len())], e);
-                continue;
-            }
+    for item in &items {
+        let tid = match item.get("asset_id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => continue,
         };
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            warn!("CLOB book returned {} for {}: {}", status, &tid[..8.min(tid.len())], &body[..body.len().min(200)]);
-            continue;
+        let mut asks: Vec<(f64, f64)> = Vec::new();
+        let mut bids: Vec<(f64, f64)> = Vec::new();
+
+        if let Some(ask_arr) = item.get("asks").and_then(|a| a.as_array()) {
+            for a in ask_arr {
+                if let (Some(p), Some(s)) = (
+                    a.get("price").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()),
+                    a.get("size").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()),
+                ) {
+                    asks.push((p, s));
+                }
+            }
         }
 
-        let book: ClobBook = match resp.json().await {
-            Ok(b) => b,
-            Err(e) => {
-                warn!("CLOB book parse failed for {}: {}", &tid[..8.min(tid.len())], e);
-                continue;
+        if let Some(bid_arr) = item.get("bids").and_then(|b| b.as_array()) {
+            for b in bid_arr {
+                if let (Some(p), Some(s)) = (
+                    b.get("price").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()),
+                    b.get("size").and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()),
+                ) {
+                    bids.push((p, s));
+                }
             }
-        };
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-
-        let asks: Vec<(f64, f64)> = book.asks.iter()
-            .filter_map(|l| {
-                let p = l.price.parse::<f64>().ok()?;
-                let s = l.size.parse::<f64>().ok()?;
-                Some((p, s))
-            })
-            .collect();
-
-        let bids: Vec<(f64, f64)> = book.bids.iter()
-            .filter_map(|l| {
-                let p = l.price.parse::<f64>().ok()?;
-                let s = l.size.parse::<f64>().ok()?;
-                Some((p, s))
-            })
-            .collect();
+        }
 
         let mut entry = BookEntry::new();
         entry.set_snapshot(asks, bids, now);
 
         if entry.best_ask > 0.0 {
-            result.insert(tid.clone(), entry);
+            result.insert(tid, entry);
         }
     }
 
