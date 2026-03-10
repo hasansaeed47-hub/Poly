@@ -613,96 +613,102 @@ class PolyClient:
     async def discover_crypto_windows(self) -> list[Market]:
         """
         Discover active crypto Up/Down time-window markets.
-        Mirrors Hydra's approach: construct slugs like {asset}-updown-{window}m-{timestamp}
-        and query Gamma /markets?slug=... for each.
+        Fires all slug lookups concurrently — ~1 request round-trip instead of 84 sequential.
+        Only queries assets that actually have updown markets on Polymarket.
         """
         session = await self._get_session()
         now = int(time.time())
-        assets = self.slug_keywords if self.slug_keywords else ["btc", "eth", "sol", "xrp"]
+        # Only these assets have updown markets on Polymarket
+        assets = ["btc", "eth", "sol", "xrp"]
         windows = [5, 15, 60]  # minutes
 
-        markets = []
+        # Build all slugs to query
+        slugs = []
         for asset in assets:
             for wm in windows:
-                iv = wm * 60  # interval in seconds
-                s0 = (now // iv) * iv  # current window start
-                # Check current and next window
+                iv = wm * 60
+                s0 = (now // iv) * iv
                 for st in [s0, s0 + iv]:
-                    et = st + iv
-                    if et < now:
-                        continue  # already expired
-
-                    slug = f"{asset}-updown-{wm}m-{st}"
-                    await self._throttle()
-
-                    try:
-                        async with session.get(
-                            f"{self.gamma_api}/markets",
-                            params={"slug": slug},
-                        ) as resp:
-                            if resp.status != 200:
-                                continue
-                            data = await resp.json()
-                    except Exception:
+                    if st + iv < now:
                         continue
+                    slugs.append(f"{asset}-updown-{wm}m-{st}")
 
-                    # Response can be a list or single object
-                    if isinstance(data, list):
-                        if not data:
-                            continue
-                        m = data[0]
-                    elif isinstance(data, dict):
-                        m = data
-                    else:
-                        continue
+        # Fire all requests concurrently
+        async def _fetch_slug(slug: str):
+            try:
+                async with session.get(
+                    f"{self.gamma_api}/markets",
+                    params={"slug": slug},
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    return (slug, await resp.json())
+            except Exception:
+                return None
 
-                    tokens = m.get("clobTokenIds", "")
-                    if isinstance(tokens, str):
-                        try:
-                            tokens = json.loads(tokens)
-                        except (json.JSONDecodeError, TypeError):
-                            continue
+        results = await asyncio.gather(*[_fetch_slug(s) for s in slugs])
 
-                    if not isinstance(tokens, list) or len(tokens) < 2:
-                        continue
+        markets = []
+        for result in results:
+            if result is None:
+                continue
+            slug, data = result
 
-                    outcomes = m.get("outcomes", "")
-                    if isinstance(outcomes, str):
-                        try:
-                            outcomes = json.loads(outcomes)
-                        except (json.JSONDecodeError, TypeError):
-                            continue
+            if isinstance(data, list):
+                if not data:
+                    continue
+                m = data[0]
+            elif isinstance(data, dict):
+                m = data
+            else:
+                continue
 
-                    if not isinstance(outcomes, list) or len(outcomes) != 2:
-                        continue
+            tokens = m.get("clobTokenIds", "")
+            if isinstance(tokens, str):
+                try:
+                    tokens = json.loads(tokens)
+                except (json.JSONDecodeError, TypeError):
+                    continue
 
-                    cond_id = m.get("conditionId", "")
-                    question = m.get("question", "")
-                    if not cond_id or not tokens[0] or not tokens[1]:
-                        continue
+            if not isinstance(tokens, list) or len(tokens) < 2:
+                continue
 
-                    # Map Up/Down outcomes to yes/no (Up=yes, Down=no)
-                    o_lower = [o.lower() for o in outcomes]
-                    if "up" in o_lower:
-                        yes_idx = o_lower.index("up")
-                        no_idx = 1 - yes_idx
-                    elif "yes" in o_lower:
-                        yes_idx = o_lower.index("yes")
-                        no_idx = 1 - yes_idx
-                    elif "down" in o_lower:
-                        no_idx = o_lower.index("down")
-                        yes_idx = 1 - no_idx
-                    else:
-                        yes_idx, no_idx = 0, 1
+            outcomes = m.get("outcomes", "")
+            if isinstance(outcomes, str):
+                try:
+                    outcomes = json.loads(outcomes)
+                except (json.JSONDecodeError, TypeError):
+                    continue
 
-                    logging.info("WINDOW: %s | %s", slug, question[:60])
-                    markets.append(Market(
-                        condition_id=cond_id,
-                        question=question[:120],
-                        slug=slug,
-                        token_yes=tokens[yes_idx],
-                        token_no=tokens[no_idx],
-                    ))
+            if not isinstance(outcomes, list) or len(outcomes) != 2:
+                continue
+
+            cond_id = m.get("conditionId", "")
+            question = m.get("question", "")
+            if not cond_id or not tokens[0] or not tokens[1]:
+                continue
+
+            o_lower = [o.lower() for o in outcomes]
+            if "up" in o_lower:
+                yes_idx = o_lower.index("up")
+                no_idx = 1 - yes_idx
+            elif "yes" in o_lower:
+                yes_idx = o_lower.index("yes")
+                no_idx = 1 - yes_idx
+            elif "down" in o_lower:
+                no_idx = o_lower.index("down")
+                yes_idx = 1 - no_idx
+            else:
+                yes_idx, no_idx = 0, 1
+
+            logging.info("WINDOW: %s | %s", slug, question[:60])
+            markets.append(Market(
+                condition_id=cond_id,
+                question=question[:120],
+                slug=slug,
+                token_yes=tokens[yes_idx],
+                token_no=tokens[no_idx],
+            ))
 
         return markets
 
