@@ -1,7 +1,7 @@
 /// runner.rs — ConfigRunner
 ///
-/// One instance per config (5 total).
-/// Receives signals from the shared scan loop.
+/// One instance per config (10 total: 5 per timeframe).
+/// Each runner only processes signals matching its configured timeframe.
 /// Manages paper positions independently per config.
 /// Writes results to a separate JSONL log per config.
 
@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::signal::{Signal, Side};
 
@@ -21,8 +21,10 @@ use crate::signal::{Signal, Side};
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunnerConfig {
     pub name:          String,
+    pub tf:            u32,       // timeframe in minutes — only processes matching markets
     pub min_edge:      f64,
     pub max_secs_left: f64,
+    pub min_secs:      f64,       // minimum seconds remaining to consider entry
     pub stop_loss:     bool,
     pub take_profit:   bool,
 }
@@ -31,15 +33,17 @@ pub struct RunnerConfig {
 
 #[derive(Debug, Clone)]
 pub struct PaperPosition {
-    pub trade_id:      String,
-    pub slug:          String,
-    pub asset:         String,
-    pub side:          Side,
-    pub entry_price:   f64,
-    pub fair_at_entry: f64,
-    pub stake:         f64,
-    pub entry_ts:      f64,
-    pub window_end:    u64,
+    pub trade_id:        String,
+    pub slug:            String,
+    pub asset:           String,
+    pub side:            Side,
+    pub entry_price:     f64,
+    pub fair_at_entry:   f64,
+    pub edge_at_entry:   f64,
+    pub secs_left_entry: f64,
+    pub stake:           f64,
+    pub entry_ts:        f64,
+    pub window_end:      u64,
 }
 
 // -- Trade log entry ----------------------------------------------------------
@@ -123,6 +127,10 @@ impl ConfigRunner {
     }
 
     pub async fn on_signal(&mut self, sig: &Signal, window_end: u64) {
+        // Only process signals for this runner's timeframe
+        if sig.tf != self.config.tf {
+            return;
+        }
         self.check_exits(sig).await;
         self.maybe_enter(sig, window_end).await;
     }
@@ -148,8 +156,8 @@ impl ConfigRunner {
     async fn maybe_enter(&mut self, sig: &Signal, window_end: u64) {
         self.stats.signals += 1;
 
-        // Time gate
-        if sig.secs_left < 60.0 || sig.secs_left > self.config.max_secs_left {
+        // Time gate — per-config min/max window
+        if sig.secs_left < self.config.min_secs || sig.secs_left > self.config.max_secs_left {
             return;
         }
 
@@ -169,18 +177,20 @@ impl ConfigRunner {
         let trade_id = format!("{}-{}-{:.0}", sig.slug, self.config.name, now * 1000.0);
 
         let pos = PaperPosition {
-            trade_id:      trade_id.clone(),
-            slug:          sig.slug.clone(),
-            asset:         sig.asset.clone(),
+            trade_id:        trade_id.clone(),
+            slug:            sig.slug.clone(),
+            asset:           sig.asset.clone(),
             side,
-            entry_price:   sig.best_book,
-            fair_at_entry: sig.best_fair,
-            stake:         self.stake,
-            entry_ts:      now,
+            entry_price:     sig.best_book,
+            fair_at_entry:   sig.best_fair,
+            edge_at_entry:   sig.best_edge,
+            secs_left_entry: sig.secs_left,
+            stake:           self.stake,
+            entry_ts:        now,
             window_end,
         };
 
-        debug!(
+        info!(
             "[{}] ENTER {} {} @{:.3} fair={:.3} edge={:.3} secs={:.0}",
             self.config.name, sig.slug, side,
             sig.best_book, sig.best_fair, sig.best_edge, sig.secs_left
@@ -214,9 +224,11 @@ impl ConfigRunner {
                 Side::No  => sig.book_no,
             };
 
-            // Stop-loss: exit when current fair < entry price
+            // Stop-loss: exit when current fair < entry price.
+            // Disabled in the last 30% of the window — near expiry, hold to settlement.
+            let sl_cutoff = self.config.tf as f64 * 60.0 * 0.3;
             if self.config.stop_loss
-                && sig.secs_left > 90.0
+                && sig.secs_left > sl_cutoff
                 && current_fair < pos.entry_price
             {
                 let pos = self.positions.remove(&trade_id).unwrap();
@@ -291,12 +303,12 @@ impl ConfigRunner {
             trade_id:      pos.trade_id.clone(),
             slug:          pos.slug.clone(),
             asset:         pos.asset.clone(),
-            tf:            0,
+            tf:            self.config.tf,
             side:          pos.side.to_string(),
             entry_price:   pos.entry_price,
             fair_at_entry: pos.fair_at_entry,
-            edge_at_entry: pos.fair_at_entry - pos.entry_price,
-            secs_left:     0.0,
+            edge_at_entry: pos.edge_at_entry,
+            secs_left:     pos.secs_left_entry,
             stake:         pos.stake,
             exit_price,
             exit_reason:   exit_reason.to_string(),
@@ -322,8 +334,9 @@ impl ConfigRunner {
 
     pub fn print_stats(&self) {
         info!(
-            "[{}] sig={} entries={} W={} L={} WR={:.1}% net={:+.2} fee={:.2} settle={} sl={} tp={}",
+            "[{}] tf={}m sig={} entries={} W={} L={} WR={:.1}% net={:+.2} fee={:.2} settle={} sl={} tp={}",
             self.config.name,
+            self.config.tf,
             self.stats.signals,
             self.stats.entries,
             self.stats.wins,
@@ -350,11 +363,13 @@ mod tests {
     use crate::signal::{Signal, Side};
     use tempfile::tempdir;
 
-    fn make_config(name: &str, min_edge: f64, max_secs: f64, sl: bool, tp: bool) -> RunnerConfig {
+    fn make_config(name: &str, tf: u32, min_edge: f64, max_secs: f64, min_secs: f64, sl: bool, tp: bool) -> RunnerConfig {
         RunnerConfig {
             name:          name.to_string(),
+            tf,
             min_edge,
             max_secs_left: max_secs,
+            min_secs,
             stop_loss:     sl,
             take_profit:   tp,
         }
@@ -387,7 +402,7 @@ mod tests {
     async fn c1_enters_on_edge() {
         let dir = tempdir().unwrap();
         let mut runner = ConfigRunner::new(
-            make_config("C1_TEST", 0.12, 840.0, false, false),
+            make_config("C1_TEST", 5, 0.12, 840.0, 20.0, false, false),
             5.0, 0.015,
             dir.path().to_str().unwrap(),
         );
@@ -401,7 +416,7 @@ mod tests {
     async fn c2_rejects_outside_time_window() {
         let dir = tempdir().unwrap();
         let mut runner = ConfigRunner::new(
-            make_config("C2_TEST", 0.12, 180.0, false, false),
+            make_config("C2_TEST", 5, 0.12, 180.0, 20.0, false, false),
             5.0, 0.015,
             dir.path().to_str().unwrap(),
         );
@@ -414,7 +429,7 @@ mod tests {
     async fn c3_rejects_small_edge() {
         let dir = tempdir().unwrap();
         let mut runner = ConfigRunner::new(
-            make_config("C3_TEST", 0.25, 840.0, false, false),
+            make_config("C3_TEST", 5, 0.25, 840.0, 20.0, false, false),
             5.0, 0.015,
             dir.path().to_str().unwrap(),
         );
@@ -428,7 +443,7 @@ mod tests {
     async fn c4_stop_loss_exits_when_fair_below_entry() {
         let dir = tempdir().unwrap();
         let mut runner = ConfigRunner::new(
-            make_config("C4_TEST", 0.12, 840.0, true, false),
+            make_config("C4_TEST", 5, 0.12, 840.0, 20.0, true, false),
             5.0, 0.015,
             dir.path().to_str().unwrap(),
         );
@@ -445,7 +460,7 @@ mod tests {
     async fn c5_take_profit_exits_when_book_hits_fair() {
         let dir = tempdir().unwrap();
         let mut runner = ConfigRunner::new(
-            make_config("C5_TEST", 0.12, 840.0, false, true),
+            make_config("C5_TEST", 5, 0.12, 840.0, 20.0, false, true),
             5.0, 0.015,
             dir.path().to_str().unwrap(),
         );
@@ -462,7 +477,7 @@ mod tests {
     async fn settlement_closes_position() {
         let dir = tempdir().unwrap();
         let mut runner = ConfigRunner::new(
-            make_config("SETTLE_TEST", 0.12, 840.0, false, false),
+            make_config("SETTLE_TEST", 5, 0.12, 840.0, 20.0, false, false),
             5.0, 0.015,
             dir.path().to_str().unwrap(),
         );

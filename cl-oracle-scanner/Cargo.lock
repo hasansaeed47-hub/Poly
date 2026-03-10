@@ -123,28 +123,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cl_oracle_scanner"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "chrono",
- "dashmap",
- "futures-util",
- "reqwest",
- "serde",
- "serde_json",
- "statrs",
- "tempfile",
- "tokio",
- "tokio-retry",
- "tokio-tungstenite",
- "toml",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -679,6 +657,28 @@ checksum = "b49715b7073f385ba4bc528e5747d02e66cb39c6146efb66b781f131f0fb399c"
 dependencies = [
  "once_cell",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "lag_scanner"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dashmap",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "statrs",
+ "tempfile",
+ "tokio",
+ "tokio-retry",
+ "tokio-tungstenite",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
