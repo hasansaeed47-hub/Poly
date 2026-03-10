@@ -1,0 +1,15 @@
+[Unit]
+Description=CL Lag Bot A/B Test
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/polybot/cl_ab
+EnvironmentFile=/etc/polybot/env
+Environment=RUST_LOG=cl_ab_test=info
+ExecStart=/opt/polybot/cl_ab/target/release/cl_ab_test
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

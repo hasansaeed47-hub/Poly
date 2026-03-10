@@ -1,0 +1,800 @@
+import csv
+from collections import defaultdict
+
+with open('hydra_trades.csv') as f:
+    rows = list(csv.DictReader(f))
+
+# ============================================================
+# KEY FINDING: pnl column is CUMULATIVE, not per-trade
+# cum_pnl is GLOBAL across all 4 assets per run
+# True PnL = final cum_pnl - 100 (starting capital)
+# ============================================================
+
+# Build lookup maps
+entries_by_key = {}
+dumps_by_key = {}
+for r in rows:
+    key = r['run_id'] + '_' + r['slug'] + '_' + r['asset']
+    if r['event'] == 'ENTRY': entries_by_key[key] = r
+    elif r['event'] == 'DUMP': dumps_by_key[key] = r
+
+# Compute global incremental PnL per settle (across all assets per run)
+for run_id in ['R0308_200647', 'R0308_205043']:
+    run_settles = sorted(
+        [r for r in rows if r['event'] == 'SETTLE' and r['run_id'] == run_id],
+        key=lambda x: x['ts']
+    )
+    prev_cum = 100.0
+    for r in run_settles:
+        cum = float(r['cum_pnl'])
+        r['global_incr'] = cum - prev_cum
+        prev_cum = cum
+
+all_settles = [r for r in rows if r['event'] == 'SETTLE']
+
+# Polymarket 5-min crypto fee: taker_fee = p * (1-p) * 0.0314
+# Maker fee = 0%, Settlement fee = 0%, Maker rebate = 25% of taker pool
+FEE_RATE = 0.0314
+
+# Classify each trade into 3 execution paths (P4/P5/P6 dropped — reclassified by dump type)
+paths = defaultdict(lambda: {
+    'count': 0, 'gross': 0.0, 'poly_fees': 0.0,
+    'wins': 0, 'losses': 0,
+    'pnls_gross': [], 'dump_pxs': [], 'winner_pxs': [],
+    'assets': defaultdict(int), 'entry_spreads': [],
+    'runs': defaultdict(int), 'pair_costs': [],
+})
+
+for s in all_settles:
+    skey = s['run_id'] + '_' + s['slug'] + '_' + s['asset']
+    e = entries_by_key.get(skey)
+    d = dumps_by_key.get(skey)
+    if not e or not d:
+        continue
+
+    fill_up = float(e['fill_up'])
+    fill_dn = float(e['fill_dn'])
+    dump_side = d['dump_side']
+    dump_px = float(d['dump_px'])
+    settle_src = float(s['settle_src']) if s['settle_src'].strip() else 0
+    dump_fill_type = d.get('', '').strip()
+
+    # Settlement model: settle_src=0 means oracle@$1.0, >0 means CLOB sell at that price
+    winner_px = 1.0 if settle_src == 0 else settle_src
+
+    shares_up = 5.0 / fill_up
+    shares_dn = 5.0 / fill_dn
+
+    if dump_side == 'UP':
+        gross = shares_up * dump_px + shares_dn * winner_px - 10.0
+    else:
+        gross = shares_up * winner_px + shares_dn * dump_px - 10.0
+
+    # Polymarket fees (taker only)
+    entry_fee_up = shares_up * fill_up * (1 - fill_up) * FEE_RATE
+    entry_fee_dn = shares_dn * fill_dn * (1 - fill_dn) * FEE_RATE
+    if 'MAKER' in dump_fill_type:
+        dump_fee = 0
+    else:
+        if dump_side == 'UP':
+            dump_fee = shares_up * dump_px * (1 - dump_px) * FEE_RATE
+        else:
+            dump_fee = shares_dn * dump_px * (1 - dump_px) * FEE_RATE
+    poly_fee = entry_fee_up + entry_fee_dn + dump_fee
+
+    # Classify path — P4/P5/P6 dropped, all trades classified by dump fill type only
+    dump_src = d.get('dump_bid_src', '').strip()
+
+    if dump_fill_type == 'MAKER_FILL':
+        path = 'P1: MAKER_FILL'
+    elif dump_fill_type == 'TAKER_FORCE' and dump_src == 'REAL':
+        path = 'P2: TAKER_FORCE+REAL'
+    elif 'EST' in dump_fill_type or dump_src == 'EST':
+        path = 'P3: TAKER_FORCE+EST'
+    else:
+        path = 'P?: Other'
+
+    p = paths[path]
+    p['count'] += 1
+    p['gross'] += gross
+    p['poly_fees'] += poly_fee
+    p['pnls_gross'].append(gross)
+    if gross > 0:
+        p['wins'] += 1
+    else:
+        p['losses'] += 1
+    p['dump_pxs'].append(dump_px)
+    p['winner_pxs'].append(winner_px)
+    p['assets'][e['asset'].upper()] += 1
+    p['runs'][e['run_id']] += 1
+    p['entry_spreads'].append(max(float(e['up_spread']), float(e['dn_spread'])))
+    p['pair_costs'].append(fill_up + fill_dn)
+
+# ============================================================
+# SNIPER — parse sniper_trades.csv for side-by-side comparison
+# ============================================================
+with open('sniper_trades.csv') as f:
+    sniper_rows = list(csv.DictReader(f))
+
+# Filter out log lines (no valid event field)
+sniper_trades = [r for r in sniper_rows if r.get('event', '').strip() in ('WIN', 'LOSS', 'SL')]
+
+sniper = {
+    'count': 0, 'gross': 0.0, 'poly_fees': 0.0,
+    'wins': 0, 'losses': 0,
+    'pnls_gross': [], 'entry_pxs': [],
+    'assets': defaultdict(int),
+}
+
+for t in sniper_trades:
+    pnl = float(t['pnl'])
+    price = float(t['price'])
+    asset = t['asset'].strip()
+    event = t['event'].strip()
+
+    # Sniper stakes $5 single-side at entry price
+    # Fee: taker entry fee = (5/price) * price * (1-price) * FEE_RATE = 5 * (1-price) * FEE_RATE
+    entry_fee = 5.0 * (1 - price) * FEE_RATE
+    # On WIN: settles at $1 via oracle (no fee). On SL/LOSS: sells via taker
+    if event in ('SL', 'LOSS'):
+        # Recovery = stake + pnl = 5 + pnl (could be negative)
+        recovery = 5.0 + pnl
+        if recovery > 0:
+            sell_px = recovery / (5.0 / price)  # effective sell price
+            exit_fee = (5.0 / price) * sell_px * (1 - sell_px) * FEE_RATE
+        else:
+            exit_fee = 0
+    else:
+        exit_fee = 0  # WIN settles at $1 via oracle, no taker fee
+
+    poly_fee = entry_fee + exit_fee
+
+    sniper['count'] += 1
+    sniper['gross'] += pnl
+    sniper['poly_fees'] += poly_fee
+    sniper['pnls_gross'].append(pnl)
+    sniper['entry_pxs'].append(price)
+    sniper['assets'][asset] += 1
+    if pnl > 0:
+        sniper['wins'] += 1
+    else:
+        sniper['losses'] += 1
+
+# Actual PnL from cum_pnl (Hydra)
+actual_pnl = 0
+for run_id in ['R0308_200647', 'R0308_205043']:
+    rs = sorted([r for r in rows if r['event'] == 'SETTLE' and r['run_id'] == run_id],
+                key=lambda x: x['ts'])
+    actual_pnl += float(rs[-1]['cum_pnl']) - 100
+
+total_gross = sum(p['gross'] for p in paths.values())
+total_fees = sum(p['poly_fees'] for p in paths.values())
+total_trades = sum(p['count'] for p in paths.values())
+total_net = total_gross - total_fees
+
+print('=' * 120)
+print('HYDRA vs SNIPER — HEAD-TO-HEAD COMPARISON')
+print('=' * 120)
+print()
+print('Hydra: $5 UP + $5 DN = $10/trade (both sides) | Sniper: $5 single-side/trade')
+print('Period: March 8-9, 2026 | Assets: BTC, ETH, SOL, XRP | Window: 5m crypto')
+print()
+
+# ============================================================
+# UNIFIED COMPARISON TABLE
+# ============================================================
+
+def compute_stats(pnls):
+    n = len(pnls)
+    if n == 0:
+        return {}
+    pnls_s = sorted(pnls)
+    mean = sum(pnls) / n
+    var = sum((x - mean) ** 2 for x in pnls) / n
+    std = var ** 0.5
+    sharpe = mean / std if std > 0 else 0
+    return {
+        'min': pnls_s[0],
+        'p10': pnls_s[max(0, int(n * 0.1))],
+        'med': pnls_s[n // 2],
+        'p90': pnls_s[min(n - 1, int(n * 0.9))],
+        'max': pnls_s[-1],
+        'std': std,
+        'sharpe': sharpe,
+    }
+
+# Build rows for the comparison table
+table_rows = []
+hydra_paths = ['P1: MAKER_FILL', 'P2: TAKER_FORCE+REAL', 'P3: TAKER_FORCE+EST']
+
+for path_name in hydra_paths:
+    p = paths[path_name]
+    n = p['count']
+    if n == 0:
+        continue
+    stats = compute_stats(p['pnls_gross'])
+    net = p['gross'] - p['poly_fees']
+    avg_entry_px = sum(p['pair_costs']) / n / 2  # avg per-side entry price
+    table_rows.append({
+        'name': path_name,
+        'trades': n,
+        'stake': '$10',
+        'wins': p['wins'],
+        'losses': p['losses'],
+        'wr': p['wins'] / n * 100,
+        'gross': p['gross'],
+        'fees': p['poly_fees'],
+        'net': net,
+        'avg_net': net / n,
+        'avg_entry': avg_entry_px,
+        'std': stats['std'],
+        'sharpe': stats['sharpe'],
+        'min': stats['min'],
+        'max': stats['max'],
+        'assets': dict(p['assets']),
+    })
+
+# Hydra total (P1+P2+P3 only)
+hydra_total_n = sum(r['trades'] for r in table_rows)
+hydra_total_gross = sum(r['gross'] for r in table_rows)
+hydra_total_fees = sum(r['fees'] for r in table_rows)
+hydra_total_net = hydra_total_gross - hydra_total_fees
+hydra_total_w = sum(r['wins'] for r in table_rows)
+hydra_total_l = sum(r['losses'] for r in table_rows)
+all_hydra_pnls = []
+for pn in hydra_paths:
+    all_hydra_pnls.extend(paths[pn]['pnls_gross'])
+hydra_stats = compute_stats(all_hydra_pnls)
+
+table_rows.append({
+    'name': 'HYDRA TOTAL',
+    'trades': hydra_total_n,
+    'stake': '$10',
+    'wins': hydra_total_w,
+    'losses': hydra_total_l,
+    'wr': hydra_total_w / hydra_total_n * 100 if hydra_total_n else 0,
+    'gross': hydra_total_gross,
+    'fees': hydra_total_fees,
+    'net': hydra_total_net,
+    'avg_net': hydra_total_net / hydra_total_n if hydra_total_n else 0,
+    'avg_entry': 0,
+    'std': hydra_stats.get('std', 0),
+    'sharpe': hydra_stats.get('sharpe', 0),
+    'min': hydra_stats.get('min', 0),
+    'max': hydra_stats.get('max', 0),
+    'assets': {},
+})
+
+# Sniper row
+sn = sniper
+sn_n = sn['count']
+sn_stats = compute_stats(sn['pnls_gross'])
+sn_net = sn['gross'] - sn['poly_fees']
+sn_avg_entry = sum(sn['entry_pxs']) / sn_n if sn_n else 0
+
+table_rows.append({
+    'name': 'SNIPER v6',
+    'trades': sn_n,
+    'stake': '$5',
+    'wins': sn['wins'],
+    'losses': sn['losses'],
+    'wr': sn['wins'] / sn_n * 100 if sn_n else 0,
+    'gross': sn['gross'],
+    'fees': sn['poly_fees'],
+    'net': sn_net,
+    'avg_net': sn_net / sn_n if sn_n else 0,
+    'avg_entry': sn_avg_entry,
+    'std': sn_stats.get('std', 0),
+    'sharpe': sn_stats.get('sharpe', 0),
+    'min': sn_stats.get('min', 0),
+    'max': sn_stats.get('max', 0),
+    'assets': dict(sn['assets']),
+})
+
+# Print table
+hdr = '{:<24s} {:>6s} {:>5s} {:>5s} {:>5s} {:>6s} {:>9s} {:>7s} {:>9s} {:>8s} {:>6s} {:>6s} {:>7s} {:>7s}'.format(
+    'Strategy', 'Trades', 'Stake', 'W', 'L', 'WR%', 'Gross$', 'Fees$', 'Net$', 'Avg/Tr', 'StdDv', 'Shrpe', 'Min$', 'Max$')
+print(hdr)
+print('-' * len(hdr))
+
+for r in table_rows:
+    is_total = r['name'] in ('HYDRA TOTAL', 'SNIPER v6')
+    if is_total and r['name'] == 'HYDRA TOTAL':
+        print('-' * len(hdr))
+    line = '{:<24s} {:>6d} {:>5s} {:>5d} {:>5d} {:>5.1f}% {:>+9.2f} {:>7.2f} {:>+9.2f} {:>+8.4f} {:>6.3f} {:>6.2f} {:>+7.3f} {:>+7.3f}'.format(
+        r['name'], r['trades'], r['stake'], r['wins'], r['losses'], r['wr'],
+        r['gross'], r['fees'], r['net'], r['avg_net'],
+        r['std'], r['sharpe'], r['min'], r['max'])
+    print(line)
+    if r['name'] == 'HYDRA TOTAL':
+        print('-' * len(hdr))
+
+print()
+
+# ============================================================
+# NORMALIZED COMPARISON (per $1 wagered)
+# ============================================================
+print('=' * 80)
+print('NORMALIZED COMPARISON (per $1 wagered)')
+print('=' * 80)
+print()
+
+hydra_wagered = hydra_total_n * 10
+sniper_wagered = sn_n * 5
+
+print('{:<24s} {:>12s} {:>12s} {:>12s} {:>12s}'.format(
+    '', 'Wagered', 'Net PnL', 'Edge/Dollar', 'Net ROI/hr'))
+print('-' * 72)
+
+# Hydra runtime: ~12 hours across 2 runs
+# Sniper runtime: ~12 hours (20:55 to 08:30)
+hydra_hours = 12.0
+sniper_hours = 11.6  # 20:55 to 08:30
+
+print('{:<24s} {:>11s} {:>+12.2f} {:>11.2f}% {:>+11.2f}'.format(
+    'HYDRA (P1+P2+P3)',
+    '${:,}'.format(hydra_wagered),
+    hydra_total_net,
+    hydra_total_net / hydra_wagered * 100 if hydra_wagered else 0,
+    hydra_total_net / hydra_hours))
+
+print('{:<24s} {:>11s} {:>+12.2f} {:>11.2f}% {:>+11.2f}'.format(
+    'SNIPER v6',
+    '${:,}'.format(sniper_wagered),
+    sn_net,
+    sn_net / sniper_wagered * 100 if sniper_wagered else 0,
+    sn_net / sniper_hours))
+
+print()
+
+# ============================================================
+# ASSET BREAKDOWN
+# ============================================================
+print('=' * 80)
+print('ASSET BREAKDOWN')
+print('=' * 80)
+print()
+print('{:<24s}'.format('') + '  '.join('{:>6s}'.format(a) for a in ['BTC', 'ETH', 'SOL', 'XRP']))
+print('-' * 52)
+
+# Hydra asset counts
+hydra_assets = defaultdict(int)
+for pn in hydra_paths:
+    for a, c in paths[pn]['assets'].items():
+        hydra_assets[a] += c
+print('{:<24s}'.format('HYDRA (P1+P2+P3)') + '  '.join(
+    '{:>6d}'.format(hydra_assets.get(a, 0)) for a in ['BTC', 'ETH', 'SOL', 'XRP']))
+print('{:<24s}'.format('SNIPER v6') + '  '.join(
+    '{:>6d}'.format(sn['assets'].get(a, 0)) for a in ['BTC', 'ETH', 'SOL', 'XRP']))
+
+print()
+
+# ============================================================
+# PER-RUN SUMMARY (Hydra only)
+# ============================================================
+print('=' * 80)
+print('HYDRA PER-RUN SUMMARY')
+print('=' * 80)
+for run_id in ['R0308_200647', 'R0308_205043']:
+    rs = sorted([r for r in rows if r['event'] == 'SETTLE' and r['run_id'] == run_id],
+                key=lambda x: x['ts'])
+    final = float(rs[-1]['cum_pnl'])
+    trades = len(rs)
+    start_time = rs[0]['ts'][:19]
+    end_time = rs[-1]['ts'][:19]
+    print('  {}: {} trades | ${:.2f} PnL | {:.1f}% ROI | {} to {}'.format(
+        run_id, trades, final - 100, (final - 100) / 100 * 100, start_time, end_time))
+
+print()
+print('=' * 80)
+print('GRAND TOTAL')
+print('=' * 80)
+print('  Hydra actual PnL (cum_pnl): ${:.2f} | ROI: {:.1f}%'.format(
+    actual_pnl, actual_pnl / 200 * 100))
+print('  Sniper PnL (cumulative col): ${:.2f}'.format(
+    float(sniper_trades[-1]['cumulative']) if sniper_trades else 0))
+print('  Combined: ${:.2f}'.format(actual_pnl + sn_net))
+
+# ============================================================
+# DUMP PRICE RANGE ANALYSIS
+# ============================================================
+
+# Rebuild per-trade records for dump price analysis
+all_trades = []
+for s in all_settles:
+    skey = s['run_id'] + '_' + s['slug'] + '_' + s['asset']
+    e = entries_by_key.get(skey)
+    d = dumps_by_key.get(skey)
+    if not e or not d:
+        continue
+    fill_up = float(e['fill_up'])
+    fill_dn = float(e['fill_dn'])
+    dump_px = float(d['dump_px'])
+    dump_side = d['dump_side']
+    settle_src = float(s['settle_src']) if s['settle_src'].strip() else 0
+    dump_fill_type = d.get('', '').strip()
+    dump_src = d.get('dump_bid_src', '').strip()
+    winner_px = 1.0 if settle_src == 0 else settle_src
+    shares_up = 5.0 / fill_up
+    shares_dn = 5.0 / fill_dn
+    if dump_side == 'UP':
+        gross = shares_up * dump_px + shares_dn * winner_px - 10.0
+    else:
+        gross = shares_up * winner_px + shares_dn * dump_px - 10.0
+    entry_fee_up = shares_up * fill_up * (1 - fill_up) * FEE_RATE
+    entry_fee_dn = shares_dn * fill_dn * (1 - fill_dn) * FEE_RATE
+    if 'MAKER' in dump_fill_type:
+        dump_fee = 0
+    else:
+        if dump_side == 'UP':
+            dump_fee = shares_up * dump_px * (1 - dump_px) * FEE_RATE
+        else:
+            dump_fee = shares_dn * dump_px * (1 - dump_px) * FEE_RATE
+    poly_fee = entry_fee_up + entry_fee_dn + dump_fee
+
+    if dump_fill_type == 'MAKER_FILL':
+        path = 'P1'
+    elif dump_fill_type == 'TAKER_FORCE' and dump_src == 'REAL':
+        path = 'P2'
+    elif 'EST' in dump_fill_type or dump_src == 'EST':
+        path = 'P3'
+    else:
+        path = 'P?'
+    all_trades.append({
+        'path': path, 'gross': gross, 'fee': poly_fee, 'net': gross - poly_fee,
+        'dump_px': dump_px, 'winner_px': winner_px, 'asset': e['asset'].upper(),
+    })
+
+print()
+print('=' * 120)
+print('DUMP PRICE DISTRIBUTION BY PATH')
+print('=' * 120)
+
+buckets = [(0, 0.02), (0.02, 0.05), (0.05, 0.10), (0.10, 0.20), (0.20, 0.30), (0.30, 0.50), (0.50, 1.0)]
+
+for p_name in ['P1', 'P2', 'P3']:
+    pt = [t for t in all_trades if t['path'] == p_name]
+    print()
+    print('  {} ({} trades)'.format(p_name, len(pt)))
+    print('  {:<16s} {:>6s} {:>5s} {:>6s} {:>8s} {:>10s} {:>8s} {:>10s}'.format(
+        'Dump Px Range', 'Count', '  %', 'WR%', 'AvgNet', 'TotalNet', 'AvgDump', 'AvgWinner'))
+    print('  ' + '-' * 75)
+    for lo, hi in buckets:
+        bt = [t for t in pt if lo <= t['dump_px'] < hi]
+        if not bt:
+            continue
+        n = len(bt)
+        wins = sum(1 for t in bt if t['gross'] > 0)
+        total_net = sum(t['net'] for t in bt)
+        avg_net = total_net / n
+        avg_dp = sum(t['dump_px'] for t in bt) / n
+        avg_wp = sum(t['winner_px'] for t in bt) / n
+        print('  [{:.2f}, {:.2f})     {:>6d} {:>5.1f} {:>5.1f}% {:>+8.4f} {:>+10.2f} {:>8.4f} {:>10.4f}'.format(
+            lo, hi, n, n / len(pt) * 100, wins / n * 100, avg_net, total_net, avg_dp, avg_wp))
+
+# ============================================================
+# GRID SEARCH: min dump_px threshold per path
+# ============================================================
+print()
+print('=' * 120)
+print('GRID SEARCH: MINIMUM DUMP PRICE FILTER (skip trade if dump_px < threshold)')
+print('=' * 120)
+
+thresholds = [0.00, 0.01, 0.02, 0.03, 0.05, 0.08, 0.10, 0.15, 0.20, 0.25, 0.30]
+
+for p_name in ['P1', 'P2', 'P3']:
+    pt = [t for t in all_trades if t['path'] == p_name]
+    print()
+    print('  {}'.format(p_name))
+    print('  {:>6s} {:>7s} {:>6s} {:>6s} {:>10s} {:>8s} {:>7s}'.format(
+        'MinDP', 'Trades', 'Kept%', 'WR%', 'NetPnL', 'Avg/Tr', 'Sharpe'))
+    print('  ' + '-' * 56)
+    for thr in thresholds:
+        bt = [t for t in pt if t['dump_px'] >= thr]
+        if not bt:
+            continue
+        n = len(bt)
+        wins = sum(1 for t in bt if t['gross'] > 0)
+        nets = [t['net'] for t in bt]
+        total = sum(nets)
+        avg = total / n
+        var = sum((x - avg) ** 2 for x in nets) / n
+        std = var ** 0.5
+        sharpe = avg / std if std > 0 else 0
+        print('  {:>6.2f} {:>7d} {:>5.1f}% {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f}'.format(
+            thr, n, n / len(pt) * 100, wins / n * 100, total, avg, sharpe))
+
+# ============================================================
+# COMBINED OPTIMIZATION: Best (P1_min, P2_min, P3_min) thresholds
+# ============================================================
+print()
+print('=' * 120)
+print('COMBINED OPTIMIZATION: Best (P1_min, P2_min, P3_min) dump price thresholds')
+print('=' * 120)
+
+# Precompute filtered results for each path x threshold
+cache = {}
+for p_name in ['P1', 'P2', 'P3']:
+    pt = [t for t in all_trades if t['path'] == p_name]
+    for thr in thresholds:
+        bt = [t for t in pt if t['dump_px'] >= thr]
+        n = len(bt)
+        if n == 0:
+            cache[(p_name, thr)] = (0, 0, 0, 0, 0, [])
+            continue
+        wins = sum(1 for t in bt if t['gross'] > 0)
+        nets = [t['net'] for t in bt]
+        total = sum(nets)
+        mean = total / n
+        var = sum((x - mean) ** 2 for x in nets) / n
+        std = var ** 0.5
+        cache[(p_name, thr)] = (n, wins, total, mean, std, nets)
+
+results = []
+for t1 in thresholds:
+    for t2 in thresholds:
+        for t3 in thresholds:
+            n1, w1, net1, _, _, nets1 = cache[('P1', t1)]
+            n2, w2, net2, _, _, nets2 = cache[('P2', t2)]
+            n3, w3, net3, _, _, nets3 = cache[('P3', t3)]
+            total_n = n1 + n2 + n3
+            if total_n < 100:
+                continue
+            total_net = net1 + net2 + net3
+            total_w = w1 + w2 + w3
+            all_nets = nets1 + nets2 + nets3
+            m = sum(all_nets) / len(all_nets)
+            v = sum((x - m) ** 2 for x in all_nets) / len(all_nets)
+            combined_sharpe = m / (v ** 0.5) if v > 0 else 0
+            results.append((t1, t2, t3, total_n, total_w, total_net,
+                            total_net / total_n, combined_sharpe))
+
+fmt_hdr = '  {:>5s} {:>5s} {:>5s} {:>7s} {:>6s} {:>10s} {:>8s} {:>7s}'.format(
+    'P1min', 'P2min', 'P3min', 'Trades', 'WR%', 'NetPnL', 'Avg/Tr', 'Sharpe')
+
+results.sort(key=lambda x: x[5], reverse=True)
+print()
+print('  TOP 10 BY NET PNL:')
+print(fmt_hdr)
+print('  ' + '-' * 60)
+for r in results[:10]:
+    t1, t2, t3, n, w, net, avg, sh = r
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>7d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f}'.format(
+        t1, t2, t3, n, w / n * 100, net, avg, sh))
+
+results.sort(key=lambda x: x[7], reverse=True)
+print()
+print('  TOP 10 BY SHARPE:')
+print(fmt_hdr)
+print('  ' + '-' * 60)
+for r in results[:10]:
+    t1, t2, t3, n, w, net, avg, sh = r
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>7d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f}'.format(
+        t1, t2, t3, n, w / n * 100, net, avg, sh))
+
+net_cutoff = sorted(results, key=lambda x: x[5], reverse=True)[max(1, len(results) // 20)][5]
+balanced = [r for r in results if r[5] >= net_cutoff]
+balanced.sort(key=lambda x: x[7], reverse=True)
+print()
+print('  BEST BALANCED (top 5% net, then best Sharpe):')
+print(fmt_hdr)
+print('  ' + '-' * 60)
+for r in balanced[:5]:
+    t1, t2, t3, n, w, net, avg, sh = r
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>7d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f}'.format(
+        t1, t2, t3, n, w / n * 100, net, avg, sh))
+
+# ============================================================
+# SCENARIO COMPARISON
+# ============================================================
+print()
+print('=' * 120)
+print('SCENARIO COMPARISON: DUMP PRICE FILTERS')
+print('=' * 120)
+
+scenarios = [
+    ('ALL (no filter)', lambda t: True),
+    ('Drop P2 entirely', lambda t: t['path'] != 'P2'),
+    ('P2 >= 0.05 only', lambda t: t['path'] != 'P2' or t['dump_px'] >= 0.05),
+    ('P2 >= 0.10 only', lambda t: t['path'] != 'P2' or t['dump_px'] >= 0.10),
+    ('P2 >= 0.20 only', lambda t: t['path'] != 'P2' or t['dump_px'] >= 0.20),
+    ('BEST: P1>=0, P2>=0.08, P3>=0', lambda t: (
+        (t['path'] == 'P1') or
+        (t['path'] == 'P2' and t['dump_px'] >= 0.08) or
+        (t['path'] == 'P3') or
+        (t['path'] == 'P?'))),
+]
+
+print('  {:<30s} {:>6s} {:>6s} {:>10s} {:>8s} {:>7s} {:>10s}'.format(
+    'Scenario', 'Trades', 'WR%', 'NetPnL', 'Avg/Tr', 'Sharpe', 'vs Base'))
+print('  ' + '-' * 83)
+base_net = None
+for name, filt in scenarios:
+    bt = [t for t in all_trades if filt(t)]
+    n = len(bt)
+    wins = sum(1 for t in bt if t['gross'] > 0)
+    nets = [t['net'] for t in bt]
+    total = sum(nets)
+    avg = total / n
+    var = sum((x - avg) ** 2 for x in nets) / n
+    std = var ** 0.5
+    sharpe = avg / std if std > 0 else 0
+    if base_net is None:
+        base_net = total
+    delta = total - base_net
+    print('  {:<30s} {:>6d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f} {:>+10.2f}'.format(
+        name, n, wins / n * 100, total, avg, sharpe, delta))
+
+# ============================================================
+# SNIPER DEEP DIVE
+# ============================================================
+print()
+print('=' * 120)
+print('SNIPER v6 — ENTRY PRICE & ASSET ANALYSIS')
+print('=' * 120)
+
+sniper_detail = []
+for t in sniper_trades:
+    pnl = float(t['pnl'])
+    price = float(t['price'])
+    asset = t['asset'].strip()
+    sniper_detail.append({'pnl': pnl, 'price': price, 'asset': asset})
+
+print()
+print('  --- ENTRY PRICE DISTRIBUTION ---')
+sn_buckets = [(0.85, 0.88), (0.88, 0.91), (0.91, 0.94), (0.94, 0.97), (0.97, 1.00)]
+print('  {:<14s} {:>6s} {:>5s} {:>6s} {:>10s} {:>8s} {:>7s}'.format(
+    'Price Range', 'Count', '  %', 'WR%', 'TotalPnL', 'AvgPnL', 'AvgPx'))
+print('  ' + '-' * 62)
+for lo, hi in sn_buckets:
+    bt = [t for t in sniper_detail if lo <= t['price'] < hi]
+    if not bt:
+        continue
+    n = len(bt)
+    wins = sum(1 for t in bt if t['pnl'] > 0)
+    total = sum(t['pnl'] for t in bt)
+    avg_px = sum(t['price'] for t in bt) / n
+    print('  [{:.2f}, {:.2f})   {:>6d} {:>5.1f} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.3f}'.format(
+        lo, hi, n, n / len(sniper_detail) * 100, wins / n * 100, total, total / n, avg_px))
+
+print()
+print('  --- BY ASSET ---')
+print('  {:<6s} {:>6s} {:>6s} {:>10s} {:>8s} {:>7s}'.format(
+    'Asset', 'Count', 'WR%', 'TotalPnL', 'AvgPnL', 'AvgPx'))
+print('  ' + '-' * 50)
+for asset in ['BTC', 'ETH', 'SOL', 'XRP']:
+    bt = [t for t in sniper_detail if t['asset'] == asset]
+    if not bt:
+        continue
+    n = len(bt)
+    wins = sum(1 for t in bt if t['pnl'] > 0)
+    total = sum(t['pnl'] for t in bt)
+    avg_px = sum(t['price'] for t in bt) / n
+    print('  {:<6s} {:>6d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.3f}'.format(
+        asset, n, wins / n * 100, total, total / n, avg_px))
+
+print()
+print('  --- LOSS/SL DETAIL ---')
+for t in sniper_detail:
+    if t['pnl'] <= 0:
+        print('    {} px={:.3f} pnl={:+.2f}'.format(t['asset'], t['price'], t['pnl']))
+
+# Sniper entry price grid search
+print()
+print('  --- SNIPER ENTRY PRICE FILTER (min/max) ---')
+sn_min_prices = [0.85, 0.88, 0.90, 0.93, 0.94, 0.95]
+sn_max_prices = [0.93, 0.95, 0.96, 0.97, 0.98]
+print('  {:>5s} {:>5s} {:>7s} {:>6s} {:>10s} {:>8s} {:>7s}'.format(
+    'MinPx', 'MaxPx', 'Trades', 'WR%', 'TotalPnL', 'AvgPnL', 'Sharpe'))
+print('  ' + '-' * 56)
+for minp in sn_min_prices:
+    for maxp in sn_max_prices:
+        if minp >= maxp:
+            continue
+        bt = [t for t in sniper_detail if minp <= t['price'] <= maxp]
+        if len(bt) < 5:
+            continue
+        n = len(bt)
+        wins = sum(1 for t in bt if t['pnl'] > 0)
+        pnls = [t['pnl'] for t in bt]
+        total = sum(pnls)
+        avg = total / n
+        var = sum((x - avg) ** 2 for x in pnls) / n
+        std = var ** 0.5
+        sharpe = avg / std if std > 0 else 0
+        print('  {:>5.2f} {:>5.2f} {:>7d} {:>5.1f}% {:>+10.2f} {:>+8.4f} {:>7.2f}'.format(
+            minp, maxp, n, wins / n * 100, total, avg, sharpe))
+
+# ============================================================
+# BEST MIX: HYDRA + SNIPER COMBINED
+# ============================================================
+print()
+print('=' * 120)
+print('BEST MIX: HYDRA + SNIPER COMBINED OPTIMIZATION')
+print('=' * 120)
+print()
+print('  Grid: P2_min_dump x Sniper_min_px x Sniper_max_px x Sniper_stake_mult')
+print('  Hydra P1/P3 unfiltered | Hydra stake=$10 fixed')
+
+h_thresholds = [0.00, 0.05, 0.08, 0.10, 0.15, 0.20]
+s_min_pxs = [0.85, 0.88, 0.90, 0.93, 0.94, 0.95]
+s_max_pxs = [0.93, 0.95, 0.96, 0.97, 0.98]
+s_mults = [1, 2, 3, 5]
+
+# Precompute
+h_cache2 = {}
+for p in ['P1', 'P2', 'P3']:
+    pt = [t for t in all_trades if t['path'] == p]
+    for thr in h_thresholds:
+        h_cache2[(p, thr)] = [t['net'] for t in pt if t['dump_px'] >= thr]
+
+s_cache2 = {}
+for smin in s_min_pxs:
+    for smax in s_max_pxs:
+        if smin >= smax:
+            continue
+        s_cache2[(smin, smax)] = [t['pnl'] for t in sniper_detail if smin <= t['price'] <= smax]
+
+mix_results = []
+for p2_thr in h_thresholds:
+    h_nets = h_cache2[('P1', 0.00)] + h_cache2[('P2', p2_thr)] + h_cache2[('P3', 0.00)]
+    h_n = len(h_nets)
+    h_total = sum(h_nets)
+    h_wager = h_n * 10
+
+    for smin in s_min_pxs:
+        for smax in s_max_pxs:
+            if smin >= smax:
+                continue
+            s_nets = s_cache2.get((smin, smax), [])
+            if not s_nets:
+                continue
+
+            for mult in s_mults:
+                s_scaled = [p * mult for p in s_nets]
+                s_n = len(s_scaled)
+                s_total = sum(s_scaled)
+                s_wager = s_n * 5 * mult
+
+                combined_net = h_total + s_total
+                combined_wager = h_wager + s_wager
+                edge = combined_net / combined_wager * 100 if combined_wager else 0
+
+                normalized = [x / 10 for x in h_nets] + [x / (5 * mult) for x in s_scaled]
+                m = sum(normalized) / len(normalized)
+                v = sum((x - m) ** 2 for x in normalized) / len(normalized)
+                sharpe = m / (v ** 0.5) if v > 0 else 0
+
+                mix_results.append((p2_thr, smin, smax, mult, h_n, s_n,
+                                    h_total, s_total, combined_net, edge, sharpe,
+                                    combined_net / 12.0))
+
+mix_hdr = '  {:>5s} {:>5s} {:>5s} {:>3s} {:>5s} {:>5s} {:>8s} {:>8s} {:>9s} {:>6s} {:>6s} {:>6s}'.format(
+    'P2min', 'S_mn', 'S_mx', 'S_x', 'H_tr', 'S_tr', 'H_net', 'S_net', 'Total', 'Edge%', 'Shrpe', '$/hr')
+
+mix_results.sort(key=lambda x: x[8], reverse=True)
+print()
+print('  TOP 10 BY TOTAL NET PNL:')
+print(mix_hdr)
+print('  ' + '-' * 80)
+for r in mix_results[:10]:
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>2d}x {:>5d} {:>5d} {:>+8.2f} {:>+8.2f} {:>+9.2f} {:>5.2f}% {:>6.2f} {:>+6.1f}'.format(*r))
+
+mix_results.sort(key=lambda x: x[10], reverse=True)
+print()
+print('  TOP 10 BY SHARPE:')
+print(mix_hdr)
+print('  ' + '-' * 80)
+for r in mix_results[:10]:
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>2d}x {:>5d} {:>5d} {:>+8.2f} {:>+8.2f} {:>+9.2f} {:>5.2f}% {:>6.2f} {:>+6.1f}'.format(*r))
+
+net_sorted = sorted(mix_results, key=lambda x: x[8], reverse=True)
+net_cut = net_sorted[max(1, len(net_sorted) // 10)][8]
+balanced = [r for r in mix_results if r[8] >= net_cut]
+balanced.sort(key=lambda x: x[10], reverse=True)
+print()
+print('  BEST BALANCED (top 10% net, best Sharpe):')
+print(mix_hdr)
+print('  ' + '-' * 80)
+for r in balanced[:10]:
+    print('  {:>5.2f} {:>5.2f} {:>5.2f} {:>2d}x {:>5d} {:>5d} {:>+8.2f} {:>+8.2f} {:>+9.2f} {:>5.2f}% {:>6.2f} {:>+6.1f}'.format(*r))
