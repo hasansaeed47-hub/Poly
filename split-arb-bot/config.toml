@@ -27,7 +27,7 @@ max_markets = 200
 # Gamma API: how many events per page
 gamma_page_size = 50
 # Gamma API: how many pages to fetch on discovery
-gamma_pages = 4
+gamma_pages = 10
 # Only consider markets with this much fillable depth on EACH side ($)
 min_depth_usd = 20.0
 # Slug/question keyword filter — only track markets matching ANY of these (case-insensitive)
@@ -65,4 +65,4 @@ trade_log = "logs/trades.jsonl"
 # JSONL scan log (all opportunities seen)
 scan_log = "logs/scans.jsonl"
 # Console log level: DEBUG, INFO, WARN, ERROR
-level = "INFO"
+level = "DEBUG"
