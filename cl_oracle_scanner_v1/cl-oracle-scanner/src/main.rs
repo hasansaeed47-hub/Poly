@@ -143,7 +143,7 @@ fn now_unix() -> u64 {
 async fn main() -> Result<()> {
     // Logging
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("cl_scanner=info".parse()?))
+        .with_env_filter(EnvFilter::from_default_env().add_directive("cl_oracle_scanner=info".parse()?))
         .with_target(false)
         .init();
 

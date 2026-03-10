@@ -414,16 +414,20 @@ async fn connect_cl_feed(
     request.headers_mut().insert("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".parse().unwrap());
     let (mut ws, _) = connect_async(request).await.context("CL WS connect failed")?;
 
-    for asset in assets {
-        let symbol = format!("{}usd", asset.to_uppercase());
-        let sub = serde_json::json!({
-            "type": "subscribe",
-            "channel": "crypto_prices_chainlink",
-            "symbol": symbol
-        });
-        ws.send(Message::Text(sub.to_string())).await?;
-        debug!("[CL] Subscribed to {}", symbol);
-    }
+    // Build Chainlink symbol filters: "eth/usd" format
+    let filters: Vec<String> = assets.iter()
+        .map(|a| format!("{}/usd", a.to_lowercase()))
+        .collect();
+    let sub = serde_json::json!({
+        "action": "subscribe",
+        "subscriptions": [{
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+            "filters": filters.join(",")
+        }]
+    });
+    ws.send(Message::Text(sub.to_string())).await?;
+    debug!("[CL] Subscribed to {:?}", filters);
 
     info!("[CL] Feed connected, {} assets", assets.len());
 
@@ -462,22 +466,29 @@ async fn process_cl_message(
     params:        &FeedParams,
     health:        &Arc<FeedHealth>,
 ) {
-    let channel = v.get("channel").and_then(|c| c.as_str()).unwrap_or("");
-    if channel != "crypto_prices_chainlink" {
+    // RTDS format: {"topic":"crypto_prices_chainlink","type":"update","payload":{"symbol":"eth/usd","timestamp":...,"value":1234.56}}
+    let topic = v.get("topic").and_then(|c| c.as_str()).unwrap_or("");
+    if topic != "crypto_prices_chainlink" {
         return;
     }
 
-    let symbol = match v.get("symbol").and_then(|s| s.as_str()) {
+    let payload = match v.get("payload") {
+        Some(p) => p,
+        None => return,
+    };
+
+    // symbol is "eth/usd" → extract "eth"
+    let symbol = match payload.get("symbol").and_then(|s| s.as_str()) {
         Some(s) => s.to_lowercase(),
         None    => return,
     };
+    let asset = symbol.split('/').next().unwrap_or("").to_string();
+    if asset.is_empty() {
+        return;
+    }
 
-    // "btcusd" → "btc"
-    let asset = symbol.trim_end_matches("usd").to_string();
-
-    let price_str = v.get("price").and_then(|p| p.as_str()).unwrap_or("0");
-    let price: f64 = match price_str.parse() {
-        Ok(p) if p > 0.0 => p,
+    let price: f64 = match payload.get("value").and_then(|p| p.as_f64()) {
+        Some(p) if p > 0.0 => p,
         _ => return,
     };
 
