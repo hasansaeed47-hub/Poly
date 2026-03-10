@@ -325,10 +325,19 @@ impl Scan {
                     } else {
                         serde_json::from_value(or.clone()).unwrap_or_default()
                     };
-                    let (tu, td) = if outs.len() >= 2 && outs[0] == "Down" {
-                        (tids[1].clone(), tids[0].clone())
+                    let (tu, td) = if outs.len() >= 2 {
+                        let o0 = outs[0].to_lowercase();
+                        if o0 == "down" {
+                            (tids[1].clone(), tids[0].clone())
+                        } else if o0 == "up" {
+                            (tids[0].clone(), tids[1].clone())
+                        } else {
+                            // Unknown outcome labels — skip
+                            warn!("[SCAN] Unknown outcomes {:?} for {}", outs, slug);
+                            continue;
+                        }
                     } else {
-                        (tids[0].clone(), tids[1].clone())
+                        continue;
                     };
                     ws.push(Win { slug, asset: a, wmin: wm, tid_up: tu, tid_dn: td, start_ts: st, end_ts: et });
                 }
@@ -615,8 +624,8 @@ impl Sniper {
                     continue;
                 }
 
-                // Settlement: end_ts + 3s
-                if now >= pt.end_ts + 3 {
+                // Settlement: end_ts + 8s (give PM time to settle books)
+                if now >= pt.end_ts + 8 {
                     let cl_open = self.cl_opens.get(&pt.slug).copied().unwrap_or(0.0);
                     // No cl_latest fallback — only use snap at end_ts (±3s)
                     let cl_close = s.cl_at(pt.asset, pt.end_ts).unwrap_or(0.0);
