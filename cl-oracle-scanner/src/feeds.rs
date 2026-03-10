@@ -446,37 +446,32 @@ async fn connect_cl_feed(
     let url = Url::parse(live_ws).context("invalid live WS URL")?;
     let (mut ws, _) = connect_async(url).await.context("CL WS connect failed")?;
 
-    // RTDS subscription format per Polymarket docs:
-    //   filters: "" for all symbols, or JSON string like '{"symbol":"btc/usd"}'
-    //   type: "*" for all message types, or "update" for price updates only
-    // Subscribe once per asset with proper JSON filter format.
-    let subs: Vec<serde_json::Value> = assets.iter().map(|a| {
-        let symbol = format!("{}/usd", a.to_lowercase());
-        let filter_json = serde_json::json!({"symbol": symbol}).to_string();
-        serde_json::json!({
-            "topic": "crypto_prices_chainlink",
-            "type": "*",
-            "filters": filter_json
-        })
-    }).collect();
+    // RTDS subscription: single subscription with empty filter = ALL symbols.
+    // Per-symbol filters don't work reliably on the RTDS API.
+    // We filter by asset in process_cl_message() instead.
     let sub = serde_json::json!({
         "action": "subscribe",
-        "subscriptions": subs
+        "subscriptions": [{
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+            "filters": ""
+        }]
     });
     ws.send(Message::Text(sub.to_string())).await?;
     debug!("[CL] Subscribe msg: {}", serde_json::to_string(&sub).unwrap_or_default());
 
-    info!("[CL] Feed connected, {} assets", assets.len());
+    info!("[CL] Feed connected, watching {} assets: {:?}", assets.len(), assets);
 
-    // Polymarket RTDS requires text "ping" every 5s to keep connection alive.
-    // Use select! to interleave keepalive pings with message processing.
+    // Polymarket RTDS keepalive: send {"action":"ping"} every 5s.
     let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
         tokio::select! {
             _ = ping_interval.tick() => {
-                ws.send(Message::Text("ping".to_string())).await?;
+                ws.send(Message::Text(
+                    serde_json::json!({"action":"ping"}).to_string()
+                )).await?;
             }
             msg = ws.next() => {
                 match msg {
