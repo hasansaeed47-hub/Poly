@@ -27,6 +27,7 @@ const CLOB_WS: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const GAMMA: &str = "https://gamma-api.polymarket.com";
 
 fn fee(px: f64) -> f64 { px * (1.0 - px) * 0.0625 }
+fn bk_get(bk: &HashMap<String, Bk>, tid: &str) -> Bk { bk.get(tid).cloned().unwrap_or_default() }
 
 // ── Shared state ────────────────────────────────────────────────────────────
 
@@ -98,7 +99,7 @@ async fn book_feed(bs: BS) {
 }
 
 async fn book_ws(bs: &BS) -> Result<()> {
-    let (mut ws, _) = connect_async(CLOB_WS).await.context("BOOK-WS")?;
+    let (ws, _) = connect_async(CLOB_WS).await.context("BOOK-WS")?;
     info!("[BOOK-WS] Connected");
 
     // Ping task
@@ -333,12 +334,11 @@ impl Hydra {
           }}
         }
 
-        // Evaluate all strategies (book data from WS is already current)
-        let bk = self.bs.read().await;
+        // Snapshot book state, then evaluate strategies
+        let bk = { let b = self.bs.read().await; b.books.clone() };
         self.eval_s3a(&wins, &bk);
         self.eval_s3(&wins, &bk);
         self.eval_s4(&wins, &bk);
-        drop(bk);
 
         self.manage().await;
 
@@ -350,13 +350,13 @@ impl Hydra {
         for st in self.s.values_mut() { st.done.retain(|k| k.rsplit('-').next().and_then(|s|s.parse::<i64>().ok()).map(|t|t>c).unwrap_or(false)); }
     }
 
-    fn eval_s3a(&mut self, wins: &[Win], bk: &BookState) {
+    fn eval_s3a(&mut self, wins: &[Win], bk: &HashMap<String, Bk>) {
         for w in wins {
             if w.wmin!=5 { continue; }
             let left = w.left(); if left>57||left<44 { continue; }
             let st = self.s.get_mut("S3a").expect("s");
             if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_2 { continue; }
-            let bu = bk.get(&w.tid_up); let bd = bk.get(&w.tid_down);
+            let bu = bk_get(bk, &w.tid_up); let bd = bk_get(bk, &w.tid_down);
             if !bu.ha||!bd.ha { continue; }
             if bu.ba+bd.ba >= 0.98 { continue; }
             let sh = (STAKE_1/bu.ba).min(STAKE_1/bd.ba);
@@ -371,11 +371,11 @@ impl Hydra {
         }
     }
 
-    fn eval_s3(&mut self, wins: &[Win], bk: &BookState) {
+    fn eval_s3(&mut self, wins: &[Win], bk: &HashMap<String, Bk>) {
         for w in wins {
             if w.wmin!=5 { continue; }
             let left = w.left(); if left>290||left<60 { continue; }
-            let bu = bk.get(&w.tid_up); let bd = bk.get(&w.tid_down);
+            let bu = bk_get(bk, &w.tid_up); let bd = bk_get(bk, &w.tid_down);
             if !bu.ha||!bd.ha { continue; }
             if bu.ba<0.47||bu.ba>0.53||bd.ba<0.47||bd.ba>0.53 { continue; }
             for id in ["S3b","S3C","S3D","S3E"] {
@@ -395,7 +395,7 @@ impl Hydra {
         }
     }
 
-    fn eval_s4(&mut self, wins: &[Win], bk: &BookState) {
+    fn eval_s4(&mut self, wins: &[Win], bk: &HashMap<String, Bk>) {
         let mut rng = rand::thread_rng();
         for w in wins {
             if w.wmin!=15 { continue; }
@@ -410,7 +410,7 @@ impl Hydra {
             }
             let dir = if u>=2 {"UP"} else if d>=2 {"DOWN"} else { continue };
             let tid = if dir=="UP" {&w.tid_up} else {&w.tid_down};
-            let b = bk.get(tid);
+            let b = bk_get(bk, tid);
             if !b.ha||b.ba<MIN_ENTRY||b.ba>MAX_ENTRY { continue; }
             let mk = ((b.ba-0.01)*100.0).round()/100.0;
             let fp = if rng.gen::<f64>()<FILL_PROB { mk } else { b.ba+SLIP };
