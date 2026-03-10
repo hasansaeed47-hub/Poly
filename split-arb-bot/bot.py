@@ -40,11 +40,6 @@ def load_config(path: str = "config.toml") -> dict:
 # ---------------------------------------------------------------------------
 
 @dataclass
-class BookLevel:
-    price: float
-    size: float
-
-@dataclass
 class BookSide:
     """One side of an order book — list of (price, size) levels."""
     levels: list[tuple[float, float]] = field(default_factory=list)
@@ -103,7 +98,6 @@ class Market:
     yes_asks: BookSide = field(default_factory=BookSide)
     no_asks: BookSide = field(default_factory=BookSide)
     last_update: float = 0.0
-    ws_subscribed: bool = False
 
 
 @dataclass
@@ -228,7 +222,7 @@ class BookFeed:
         logging.info("[BOOK-WS] Connecting to %s", self.ws_url)
         self._ws = await self._session.ws_connect(
             self.ws_url,
-            timeout=aiohttp.ClientWSMsgType(10),
+            timeout=10.0,
             heartbeat=30,
         )
         self._connected = True
@@ -333,6 +327,9 @@ class BookFeed:
 
         if event_type == "best_bid_ask":
             # Fast top-of-book update (custom_feature_enabled)
+            # IMPORTANT: Only update the best price at level[0], do NOT inject
+            # fake sizes — that corrupts fillable_at() depth calculations.
+            # Full book depth is maintained by "book" + "price_change" events.
             asset_id = v.get("asset_id", "")
             if not asset_id or asset_id not in self._token_to_market:
                 return
@@ -345,22 +342,16 @@ class BookFeed:
             if not m:
                 return
 
-            # For best_bid_ask we just update the top-of-book for quick scanning
-            # The full book state is maintained via book + price_change events
             if side == "yes":
-                if best_bid > 0:
-                    if not m.yes_bids.levels or abs(m.yes_bids.levels[0][0] - best_bid) > 1e-10:
-                        m.yes_bids.apply_delta(best_bid, 999.0, is_bids=True)
-                if best_ask > 0:
-                    if not m.yes_asks.levels or abs(m.yes_asks.levels[0][0] - best_ask) > 1e-10:
-                        m.yes_asks.apply_delta(best_ask, 999.0, is_bids=False)
+                if best_bid and best_bid > 0:
+                    self._update_top_of_book(m.yes_bids, best_bid, is_bids=True)
+                if best_ask and best_ask > 0:
+                    self._update_top_of_book(m.yes_asks, best_ask, is_bids=False)
             else:
-                if best_bid > 0:
-                    if not m.no_bids.levels or abs(m.no_bids.levels[0][0] - best_bid) > 1e-10:
-                        m.no_bids.apply_delta(best_bid, 999.0, is_bids=True)
-                if best_ask > 0:
-                    if not m.no_asks.levels or abs(m.no_asks.levels[0][0] - best_ask) > 1e-10:
-                        m.no_asks.apply_delta(best_ask, 999.0, is_bids=False)
+                if best_bid and best_bid > 0:
+                    self._update_top_of_book(m.no_bids, best_bid, is_bids=True)
+                if best_ask and best_ask > 0:
+                    self._update_top_of_book(m.no_asks, best_ask, is_bids=False)
 
             m.last_update = now
             self._update_count += 1
@@ -407,6 +398,31 @@ class BookFeed:
             if changes and isinstance(changes, list) and asset_id and asset_id in self._token_to_market:
                 for change in changes:
                     self._apply_change(asset_id, change, now)
+
+    @staticmethod
+    def _update_top_of_book(book_side: BookSide, new_best: float, is_bids: bool):
+        """Update only the best price without injecting fake depth.
+
+        If the book already has levels, update the price at level[0] while
+        preserving its real size. If the book is empty (no snapshot yet),
+        insert a minimal placeholder — the next 'book' or 'price_change'
+        event will replace it with real depth.
+        """
+        if book_side.levels:
+            old_best = book_side.levels[0][0]
+            if abs(old_best - new_best) > 1e-10:
+                # Price changed — update level[0] price, keep its real size
+                old_size = book_side.levels[0][1]
+                book_side.levels[0] = (new_best, old_size)
+                # Re-sort in case the new best crossed other levels
+                if is_bids:
+                    book_side.levels.sort(key=lambda x: -x[0])
+                else:
+                    book_side.levels.sort(key=lambda x: x[0])
+        else:
+            # No book yet — insert placeholder with small size so .best works
+            # but fillable_at() won't think there's real depth
+            book_side.levels = [(new_best, 0.01)]
 
     def _apply_change(self, asset_id: str, change: dict, now: float):
         """Apply a single price_change entry to book state."""
@@ -691,7 +707,7 @@ class PaperEngine:
             return True
         return False
 
-    async def evaluate(self, market: Market) -> Optional[PaperTrade]:
+    def evaluate(self, market: Market) -> Optional[PaperTrade]:
         """Check a market for split-sell arb. Returns trade if profitable."""
         yes_bid = market.yes_bids.best
         no_bid = market.no_bids.best
@@ -740,11 +756,13 @@ class PaperEngine:
 
         return trade
 
-    async def execute(self, market: Market, trade: PaperTrade):
-        """Simulate execution: split + sell both sides via relayer."""
-        # Simulate relayer delay
-        await asyncio.sleep(self.exec_delay)
-
+    def execute(self, market: Market, trade: PaperTrade):
+        """
+        Record a paper trade immediately. The exec_delay is modeled as a
+        cooldown on the market (already handled by cooldown_secs) rather
+        than blocking the scan loop — blocking would miss arb opportunities
+        on other markets during the 2s relayer wait.
+        """
         trade.market = market.slug
         trade.question = market.question
 
@@ -932,10 +950,10 @@ async def run(cfg: dict):
                 if engine.on_cooldown(m.condition_id):
                     continue
 
-                trade = await engine.evaluate(m)
+                trade = engine.evaluate(m)
                 if trade is not None:
                     opportunities += 1
-                    await engine.execute(m, trade)
+                    engine.execute(m, trade)
 
             # -- Status line (every 20 scans = ~10s) ----------------------------
             if scan_count % 20 == 0:
