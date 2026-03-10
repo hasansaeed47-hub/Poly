@@ -314,20 +314,18 @@ pub async fn fetch_books_batch(
     let mut result = HashMap::new();
 
     for chunk in token_ids.chunks(params.book_batch_size) {
-        let mut url = Url::parse(&format!("{}/books", clob_rest))
-            .context("invalid CLOB REST URL")?;
+        let url = format!("{}/books", clob_rest);
 
-        {
-            let mut pairs = url.query_pairs_mut();
-            for tid in chunk {
-                pairs.append_pair("token_id", tid);
-            }
-        }
+        // POST with JSON array of {token_id: "..."} objects
+        let body: Vec<serde_json::Value> = chunk.iter()
+            .map(|tid| serde_json::json!({"token_id": tid}))
+            .collect();
 
         debug!("Batch book fetch: {} tokens", chunk.len());
 
         let resp = client
-            .get(url.as_str())
+            .post(&url)
+            .json(&body)
             .timeout(Duration::from_secs(5))
             .send()
             .await
