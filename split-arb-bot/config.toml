@@ -11,6 +11,9 @@ clob_ws = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 gamma_api = "https://gamma-api.polymarket.com"
 # Throttle between REST calls (ms) — only affects discovery, not scan tick
 throttle_ms = 400
+# Book fetch batch size — how many token IDs per /books POST
+# Polymarket CLOB handles up to ~100 per request; bigger batches = fewer throttled calls
+book_batch_size = 100
 
 [scan]
 # Arb scan tick interval (milliseconds) — how fast we check all books

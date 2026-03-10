@@ -807,7 +807,7 @@ async def run(cfg: dict):
     gamma_page_size = cfg["scan"]["gamma_page_size"]
     gamma_pages = cfg["scan"]["gamma_pages"]
     discovery_interval = cfg["scan"]["discovery_interval_secs"]
-    book_batch_size = 20
+    book_batch_size = cfg["api"].get("book_batch_size", 100)
 
     clob_ws_url = cfg["api"]["clob_ws"]
 
