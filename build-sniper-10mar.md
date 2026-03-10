@@ -15,7 +15,9 @@
 | Stop Losses | 2 |
 | Win Rate | ~96.3% |
 | Cumulative P&L | +$21.44 |
-| Entry prices | 0.85 – 0.985 |
+| Entry prices (9 Mar) | 0.85 – 0.985 |
+| Entry range (10 Mar A-D) | **0.88 – 0.98** (raised from 0.85) |
+| Entry range (10 Mar E) | 0.95 – 0.975 (unchanged) |
 | SL example | BTC enter 0.85, bid dropped to 0.33 → SL at 0.425, loss -$3.09 |
 | SL example | ETH enter 0.92, bid dropped to 0.27 → SL at 0.460, loss -$3.56 |
 
@@ -42,7 +44,7 @@ fee(price) = price × (1 - price) × 0.0625
 
 | Entry Price | Fee per share | Fee % | Engines |
 |-------------|---------------|-------|---------|
-| 0.85 | $0.0080 | 0.80% | A-D low end |
+| 0.88 | $0.0066 | 0.66% | A-D low end |
 | 0.90 | $0.0056 | 0.56% | A-D typical |
 | 0.95 | $0.0030 | 0.30% | A-D/E high end |
 | 0.975 | $0.0015 | 0.15% | E max entry |
@@ -81,7 +83,9 @@ TAKER_DEADLINE = 44 seconds left  (taker fallback cutoff / latest entry)
 
 **Why 57s to 44s:** By this point CL has been updating for 4+ minutes. If CL has moved enough to push book price to 0.85+, the move is real and confirmed. The 13-second entry window is tight enough that mean reversion hasn't started.
 
-**Book price range:** Entry only if `0.85 ≤ best_ask ≤ 0.98`. Below 0.85: not enough conviction. Above 0.98: not enough edge to cover fees + SL risk.
+**Book price range (A-D):** Entry only if `0.88 ≤ best_ask ≤ 0.98`. Raised from 0.85 — the two SL events on 9th March both entered at 0.85. Raising the floor to 0.88 requires higher market conviction before entry, filtering out the weakest signals that produced the worst losses.
+
+**Book price range (E):** `0.95 ≤ best_ask ≤ 0.975`. Unchanged.
 
 ---
 
@@ -155,6 +159,7 @@ Phase 1: MAKER (ticks 1-4, up to 2.0 seconds)
 Phase 2: TAKER FALLBACK (at secs_left ≤ 45 OR after 4+ ticks unfilled)
   fill_price = best_ask + 0.005 (SLIP)
   If fill_price > 0.98 (MAX_ENTRY) → abort, no entry
+  If fill_price < 0.88 (MIN_ENTRY, A-D) or < 0.95 (E) → abort
 
 Phase 3: ENTRY
   shares = $5.00 / fill_price
@@ -258,23 +263,24 @@ Every 500ms tick while position is open:
 | **ENTRY** | | | | | |
 | Entry Window | **57s – 44s left** | **57s – 44s left** | **57s – 44s left** | **57s – 44s left** | **≤ 25s left** |
 | Entry Window Width | 13 seconds | 13 seconds | 13 seconds | 13 seconds | 25 seconds |
-| Min Book Price | 0.85 | 0.85 | 0.85 | 0.85 | 0.95 |
+| Min Book Price | **0.88** | **0.88** | **0.88** | **0.88** | 0.95 |
 | Max Book Price | 0.98 | 0.98 | 0.98 | 0.98 | 0.975 |
 | Order Method | Maker 2s → taker | Maker 2s → taker | Maker 2s → taker | Maker 2s → taker | Maker 2s → taker |
 | Maker Price | ask - 0.01 | ask - 0.01 | ask - 0.01 | ask - 0.01 | ask - 0.01 (chase to 0.975) |
 | Taker Slippage | +0.005 | +0.005 | +0.005 | +0.005 | +0.005 |
-| Typical Entry Fee (taker) | 0.3 – 0.8% | 0.3 – 0.8% | 0.3 – 0.8% | 0.3 – 0.8% | 0.15 – 0.30% |
+| Typical Entry Fee (taker) | 0.3 – 0.66% | 0.3 – 0.66% | 0.3 – 0.66% | 0.3 – 0.66% | 0.15 – 0.30% |
 | | | | | | |
 | **EXIT** | | | | | |
 | Stop Loss | Bid ≤ 50% entry | Bid ≤ 50% entry | Bid ≤ 50% entry | Bid ≤ 50% entry | Bid ≤ 50% entry |
 | SL Example | Enter 0.90 → SL bid ≤ 0.45 | Same | Same | Same | Enter 0.96 → SL bid ≤ 0.48 |
+| SL Max Loss | ~$2.85 (at 0.88 entry) | Same | Same | Same | ~$2.58 (at 0.96 entry) |
 | Take Profit | No — hold to settle | No — hold to settle | No — hold to settle | No — hold to settle | No — hold to settle |
 | Settlement | end_ts + 3s, binary | end_ts + 3s, binary | end_ts + 3s, binary | end_ts + 3s, binary | end_ts + 3s, binary |
 | Max Hold Time | ~57 seconds | ~57 seconds | ~57 seconds | ~57 seconds | ~25 seconds |
 | Window Skip Post-SL | Yes | Yes | Yes | Yes | Yes |
 | | | | | | |
 | **RISK** | | | | | |
-| Max loss (SL fires) | ~$3.10 (depends on bid at SL) | ~$3.10 | ~$3.10 | ~$3.10 | ~$2.58 |
+| Max loss (SL fires) | ~$2.85 (at 0.88 floor) | ~$2.85 | ~$2.85 | ~$2.85 | ~$2.58 |
 | Max loss (settle at 0) | -$5.00 | -$5.00 | -$5.00 | -$5.00 | -$5.00 |
 | Stdev scaling | Yes | Yes | Yes | Yes | No |
 | BS Model | **No** | **No** | **No** | **No** | **No** |
@@ -332,7 +338,7 @@ When secs_left ≤ 25 (any window, 5m or 15m):
 | # | Weakness | Severity | Detail |
 |---|----------|----------|--------|
 | 1 | **Delta 0.04% is 3.75x lower than D1's 0.15%** | **High** | D1 at 0.15% produced 96% WR. Dropping to 0.04% captures much weaker signals. On BTC (stdev=0.167), 0.04% = $27 move on $67k BTC. That's noise-level. Continuity helps, but 4 ticks of 0.04% noise is still noise |
-| 2 | **50% SL is wide but fires too late** | **Medium** | 9th March SL data: BTC entered 0.85, bid hit 0.33 (61% drop, far below 50% trigger). ETH entered 0.92, bid hit 0.27 (71% drop). The book gaps through the SL level — by the time REST refreshes, bid is already far below trigger. SL limits damage but doesn't prevent most of it |
+| 2 | **50% SL is wide but fires too late** | **Medium** | 9th March SL data: BTC entered 0.85, bid hit 0.33 (61% drop). ETH entered 0.92, bid hit 0.27 (71% drop). Book gaps through SL level. **Raising MIN_ENTRY to 0.88 eliminates the BTC 0.85 entry that triggered the worst SL.** ETH at 0.92 would still occur. SL at 50% of 0.88 = 0.44 — marginally tighter than 0.425 |
 | 3 | **REST-only book (no WS) means 400ms blind spots** | **Medium** | 9th March used REST polling, not WS. Between polls, book can move. SL checks only happen on poll refresh. For Engine E at 0.95+, a 400ms gap is significant — book can crash to 0.50 between polls |
 | 4 | **Engine A/C continuity=4 eats 2s of a 13s window** | **Medium** | 4s total (2s cont + 2s maker) of a 13s window = 31% of the entry time consumed by confirmation. If the edge is real but brief, A/C miss it while B/D catch it |
 | 5 | **Engine E has no delta filter at all** | **Medium** | Only checks book price ≥ 0.95. A thin 0.95 ask with CL barely above open is far riskier than 0.95 with CL 0.5% above open. No CL validation on E |
@@ -353,8 +359,8 @@ When secs_left ≤ 25 (any window, 5m or 15m):
 | 6 | **9th March win rate may not replicate** | 96% WR over 109 trades in ~12 hours during a specific BTC volatility regime. Different regime (chop, extreme vol, CL feed delays) could produce very different results. 109 trades is a small sample for 96% confidence |
 | 7 | **No handling for book with no bids** | If CLOB returns empty bids, `bk.hb = false`, SL check skips (`if bk.hb && bk.bb <= sl_px`). Position held to settlement even if book has collapsed. May be correct (hold to settle) or may be a $5 loss that could have been $2.50 |
 | 8 | **XRP added but not in 10 March Engine E** | 9th March had XRP. Engine E checks both 5m and 15m but doesn't specify XRP inclusion. If XRP is included, its 0.440 stdev means the 0.04% base delta scales to 0.106% — actually reasonable. But XRP books are thinner |
-| 9 | **Maker at ask-0.01 may self-cross** | If ask is 0.86, maker at 0.85 is below the ask. Fine. But if ask is 0.85 (MIN_ENTRY), maker at 0.84 is below MIN_ENTRY. The code handles this (`if mk >= bk.ba → fill at mk`) but it means maker price can be outside the intended book range |
-| 10 | **D1 used delta 0.15 and still had 1 loss + 2 SLs in 109 trades** | Even with the higher threshold, 3/109 = 2.8% adverse rate. At delta 0.04, the adverse rate will likely be higher. If it doubles to 6%, and SL losses average -$3.30, that's meaningful P&L drag |
+| 9 | **Maker at ask-0.01 may be below MIN_ENTRY** | If ask is 0.88 (new MIN_ENTRY), maker at 0.87 is below the range. The code handles this (`if mk >= bk.ba → fill at mk`) but maker fill at 0.87 would be below 0.88 floor. Should clamp maker price to `max(ask-0.01, MIN_ENTRY)` |
+| 10 | **D1 used delta 0.15 and still had 1 loss + 2 SLs in 109 trades** | Even with the higher threshold, 3/109 = 2.8% adverse rate. At delta 0.04, the adverse rate will likely be higher. **Raising MIN_ENTRY to 0.88 helps** — both SL entries were at 0.85 (BTC) and 0.92 (ETH). The 0.85 entry would now be filtered. But the 0.92 entry still occurs |
 
 ---
 
@@ -363,7 +369,8 @@ When secs_left ≤ 25 (any window, 5m or 15m):
 | Scenario | A (5m, δ=0.04, cont=4) | B (5m D1, δ=0.15) | C (15m, δ=0.04, cont=4) | D (15m D1, δ=0.15) | E (≤25s, ≥0.95) |
 |----------|---|---|---|---|---|
 | **BTC trends 0.2%, book at 0.93** | ✅ Enters after 2s confirm + 2s maker. Delta 0.2% >> 0.04% threshold | ✅ Enters after 2s maker. Delta 0.2% > 0.15% | ✅ Same as A but 15m window | ✅ Same as B | ❌ Book < 0.95, skips |
-| **BTC trends 0.08%, book at 0.88** | ✅ Enters — 0.08% > 0.04% | ❌ Skips — 0.08% < 0.15% | ✅ Enters | ❌ Skips | ❌ Book < 0.95 |
+| **BTC trends 0.08%, book at 0.88** | ✅ Enters — 0.08% > 0.04%, book 0.88 = MIN_ENTRY | ❌ Skips — 0.08% < 0.15% | ✅ Enters | ❌ Skips | ❌ Book < 0.95 |
+| **BTC trends 0.05%, book at 0.86** | ❌ Skips — book 0.86 < 0.88 MIN_ENTRY | ❌ Skips | ❌ Skips — book below range | ❌ Skips | ❌ Book < 0.95 |
 | **BTC barely moves 0.03%** | ❌ Skips — 0.03% < 0.04% | ❌ Skips | ❌ Skips | ❌ Skips | ❌ |
 | **BTC trends but BN reverses** | ❌ BN contra blocks | ❌ BN contra blocks | ❌ Blocked | ❌ Blocked | ✅ No BN filter on E |
 | **CL fading (reverting last 10s)** | ❌ CL fade blocks | ❌ CL fade blocks | ❌ Blocked | ❌ Blocked | ✅ No CL fade on E |
@@ -383,7 +390,7 @@ When secs_left ≤ 25 (any window, 5m or 15m):
 stake             = 5.0
 max_drawdown      = 50.0
 sl_share_pct      = 0.50
-min_entry         = 0.85
+min_entry         = 0.88      # raised from 0.85 — 9Mar SLs both entered at 0.85
 max_entry         = 0.98
 entry_start       = 57        # seconds left — earliest entry
 taker_deadline    = 44        # seconds left — taker fallback
@@ -454,3 +461,4 @@ taker_deadline  = 3           # need at least 3s
 *5 Engines | $5 Stake | $50 Max DD | 50% Bid SL | Maker 2s → Taker*
 *Based on cl-sniper-9mar v8.0.0 (96% WR, +$21.44 / 109 trades)*
 *Entry: last 57-44s of window | Delta: raw CL % change, stdev-scaled | No BS model*
+*A-D book range: 0.88-0.98 (raised from 0.85) | E book range: 0.95-0.975*
