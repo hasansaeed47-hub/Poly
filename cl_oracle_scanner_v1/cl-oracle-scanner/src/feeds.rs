@@ -22,7 +22,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{connect_async, tungstenite::{Message, client::IntoClientRequest}};
 use tracing::{debug, error, info, trace, warn};
 use url::Url;
 
@@ -409,8 +409,10 @@ async fn connect_cl_feed(
     params:        &FeedParams,
     health:        &Arc<FeedHealth>,
 ) -> Result<()> {
-    let url = Url::parse(live_ws).context("invalid live WS URL")?;
-    let (mut ws, _) = connect_async(url).await.context("CL WS connect failed")?;
+    let mut request = live_ws.into_client_request().context("invalid live WS URL")?;
+    request.headers_mut().insert("Origin", "https://polymarket.com".parse().unwrap());
+    request.headers_mut().insert("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".parse().unwrap());
+    let (mut ws, _) = connect_async(request).await.context("CL WS connect failed")?;
 
     for asset in assets {
         let symbol = format!("{}usd", asset.to_uppercase());
@@ -549,8 +551,10 @@ async fn connect_book_feed(
     book_log:   &LogWriter,
     health:     &Arc<FeedHealth>,
 ) -> Result<()> {
-    let url = Url::parse(clob_ws).context("invalid CLOB WS URL")?;
-    let (ws, _) = connect_async(url).await.context("CLOB WS connect failed")?;
+    let mut request = clob_ws.into_client_request().context("invalid CLOB WS URL")?;
+    request.headers_mut().insert("Origin", "https://polymarket.com".parse().unwrap());
+    request.headers_mut().insert("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".parse().unwrap());
+    let (ws, _) = connect_async(request).await.context("CLOB WS connect failed")?;
     let (mut ws_tx, mut ws_rx) = ws.split();
 
     // Subscribe all known token IDs
