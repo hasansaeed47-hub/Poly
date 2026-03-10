@@ -579,6 +579,11 @@ class PolyClient:
                 match_text = f"{slug} {question}".lower()
                 if self.slug_keywords:
                     if not any(kw in match_text for kw in self.slug_keywords):
+                        if not hasattr(self, '_logged_skips'):
+                            self._logged_skips = 0
+                        if self._logged_skips < 20:
+                            logging.debug("SKIP (no crypto kw): %s | %s", slug[:50], question[:60])
+                            self._logged_skips += 1
                         continue
                 if self.time_keywords:
                     if not any(kw in match_text for kw in self.time_keywords):
@@ -594,6 +599,7 @@ class PolyClient:
                 else:
                     yes_idx, no_idx = 0, 1
 
+                logging.info("MATCH: %s | %s", slug[:50], question[:60])
                 markets.append(Market(
                     condition_id=cond_id,
                     question=question[:120],
