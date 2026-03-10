@@ -457,6 +457,120 @@ taker_deadline  = 3           # need at least 3s
 
 ---
 
+## Code Audit — 9th March vs 10th March Paper
+
+**Verified correct (code matches paper intent):**
+
+| Logic | Code Location | Status |
+|-------|---------------|--------|
+| Delta formula `(cl_now-cl_open)/cl_open*100` | main.rs:410 | ✅ |
+| Stdev scaling `delta * (stdev/STDEV_BASE)` | main.rs:414-415 | ✅ |
+| Continuity state machine (counter per slug, hard reset) | main.rs:418-428 | ✅ |
+| BN contra (15s, ±0.02%) | main.rs:431-435 | ✅ |
+| CL fade (10s, ±0.03%) | main.rs:438-442 | ✅ |
+| Regime (1h range < 0.3%) | main.rs:445-448 | ✅ |
+| Entry window 57-44s left | main.rs:405 | ✅ |
+| Maker at ask-0.01 | main.rs:456 | ✅ |
+| Taker fallback at ≤45s left | main.rs:458 | ✅ |
+| SL at bid ≤ 50% entry | main.rs:346 | ✅ |
+| Settlement end_ts+3, CL vs CLOB cross-check | main.rs:356-378 | ✅ |
+| Tick order: settle → entry → cleanup | main.rs:310-489 | ✅ |
+| CL open capture (first tick in window) | main.rs:323-332 | ✅ |
+| Cleanup (1h retention on done/delta_ticks/cl_opens) | main.rs:482-488 | ✅ |
+
+**Discrepancies (code does NOT match 10 March paper):**
+
+| # | Item | 9 Mar Code | 10 Mar Paper | Fix Required |
+|---|------|------------|-------------|-------------|
+| 1 | **MIN_ENTRY** | 0.85 | **0.88** | Change constant |
+| 2 | **MAX_DD** | $35 (unused) | **$50 (enforced)** | Add kill switch to tick loop |
+| 3 | **MAX_DD enforcement** | **Not implemented** | Hard kill | **BLOCKER — must build** |
+| 4 | **Engine count** | 10 (A/A1/B/B1/C/C1/D/D1/E/E1) | **5 (A/B/C/D/E)** | Rewrite engine configs |
+| 5 | **Engine A delta** | 0.10 | **0.04** | Change |
+| 6 | **Engine A continuity** | 0 | **4** | Change |
+| 7 | **Engine B delta** | 0.10 | **0.15** (D1 clone) | Change |
+| 8 | **Engine B continuity** | 3 | **0** | Change |
+| 9 | **Engine C delta** | 0.03 | **0.04** | Change |
+| 10 | **Engine C continuity** | 3 | **4** | Change |
+| 11 | **Engine E** | Standard engine, delta=0.05, 57-44s | **Late scalper, ≤25s, book ≥0.95** | Rewrite |
+| 12 | **Window skip post-SL** | Not implemented | Required | Add `done.insert` on SL |
+| 13 | **Maker chase timer** | fill sim (elapsed > 2 ticks) | **2.0s fixed timer** | Align |
+
+---
+
+## Live Readiness — What's Required
+
+### Execution Mode: Polymarket UI (Manual + Signal Overlay)
+
+For live via the Poly UI (not programmatic API), the scanner runs as a **signal generator** that tells the operator what to do. The operator executes manually on the Polymarket web interface.
+
+**What the Rust code must do (signal mode):**
+1. Run all feeds (CL, BN, CLOB REST) — already works
+2. Detect entry signals per engine logic — needs 10Mar config updates
+3. **Output clear actionable signals to terminal:**
+   ```
+   [A] BUY UP BTC 5m @0.91 (δ=0.08% cont=4/4) — MAKER 0.90, TAKER 0.915
+   [E] BUY DOWN ETH 15m @0.96 (book=0.96, 22s left) — MAKER 0.95, TAKER 0.965
+   [SL] EXIT BTC 5m UP — bid 0.44 ≤ 0.455 (50% of 0.91) — SELL NOW
+   [DD] KILL SWITCH — cumulative -$50.12 — CLOSE ALL, STOP TRADING
+   ```
+4. Track paper positions alongside (P&L logging)
+5. Enforce kill switch (halt signals at -$50)
+
+**What the operator does on Poly UI:**
+1. See signal → navigate to the market on polymarket.com
+2. Place limit order (maker) at the signaled price
+3. If unfilled after ~2s, buy at market (taker)
+4. Monitor for SL signals → sell at market if SL fires
+5. Hold to settlement otherwise
+
+### Code Changes Required (Rust)
+
+**Must have for live signal mode:**
+
+| # | Change | Effort | File |
+|---|--------|--------|------|
+| 1 | Rewrite `all_engines()` → 5 engines per 10Mar spec | Small | main.rs:237-263 |
+| 2 | Change `MIN_ENTRY` from 0.85 to 0.88 | Trivial | main.rs:26 |
+| 3 | Add `MAX_DD` enforcement in tick loop | Small | main.rs (after line 480) |
+| 4 | Build Engine E special logic (≤25s, book ≥0.95, no delta) | Medium | main.rs (new branch in entry eval) |
+| 5 | Add window skip on SL (`tr.done.insert(slug)` on SL exit) | Trivial | main.rs:351 |
+| 6 | Change `MAX_DD` from 35 to 50 | Trivial | main.rs:33 |
+| 7 | Add `maker_chase_secs = 2.0` timer logic (replace elapsed>2 heuristic) | Small | main.rs:459-463 |
+| 8 | Clear signal output format (actionable terminal output) | Small | main.rs (info! calls) |
+| 9 | Per-engine MIN_ENTRY (0.88 for A-D, 0.95 for E) | Small | main.rs:453 |
+
+**Not needed for UI execution (would need for API execution):**
+
+| # | Item | Why Not Needed |
+|---|------|---------------|
+| 1 | CLOB API auth + EIP-712 signing | Operator places orders via UI |
+| 2 | Order management state machine | Operator manages orders manually |
+| 3 | Nonce tracking | No programmatic orders |
+| 4 | Fill confirmation | Operator confirms visually |
+| 5 | Wallet/key management | Operator's browser wallet |
+
+### If Going Fully Programmatic (API Execution)
+
+This is a much larger scope. Would additionally need:
+
+| # | Component | Effort | Detail |
+|---|-----------|--------|--------|
+| 1 | **Polymarket CLOB API client** | Large | REST endpoints for order placement, cancellation, positions. Auth via API key + EIP-712 signature |
+| 2 | **Order signing (EIP-712)** | Medium | Polymarket uses typed structured data signing. Needs ethers-rs or similar Ethereum signing library |
+| 3 | **Order state machine** | Medium | Track: pending → placed → partial_fill → filled / cancelled. Handle each state transition |
+| 4 | **Position tracking** | Small | Verify fills via API, reconcile with paper tracker |
+| 5 | **Maker order management** | Medium | Place → monitor → cancel → re-place at new price → taker fallback. Per-engine state |
+| 6 | **Rate limiting** | Small | Polymarket API rate limits (TBD — check docs) |
+| 7 | **Error recovery** | Medium | Network failures, rejected orders, partial fills, stale nonces |
+| 8 | **Wallet funding** | Ops | USDC on Polygon, approved for Polymarket CTF exchange |
+| 9 | **Kill switch with force-close** | Medium | Cancel all open orders + market-sell all positions when DD hits |
+| 10 | **Dry-run mode** | Small | Execute full pipeline except final order submission |
+
+**Recommended path:** Start with UI execution (signal mode). Validate 10Mar strategy live. Then build API execution once the strategy proves profitable.
+
+---
+
 *Build Sniper — 10 March 2026*
 *5 Engines | $5 Stake | $50 Max DD | 50% Bid SL | Maker 2s → Taker*
 *Based on cl-sniper-9mar v8.0.0 (96% WR, +$21.44 / 109 trades)*
