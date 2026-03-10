@@ -120,6 +120,7 @@ class PaperTrade:
     gross: float          # yes_proceeds + no_proceeds
     net: float            # gross - stake
     profit: float         # net - fees
+    entry_num: int = 0    # which entry this is on this market (1st, 2nd, etc.)
 
 # ---------------------------------------------------------------------------
 # Fee model — Polymarket's actual fee curve
@@ -657,6 +658,11 @@ class PaperEngine:
         self.cooldown_secs = cfg["arb"].get("cooldown_secs", 5.0)
         self._last_trade_ts: dict[str, float] = {}  # condition_id → last trade time
 
+        # Multi-entry tracking per market
+        self._market_entries: dict[str, int] = defaultdict(int)    # condition_id → entry count
+        self._market_profit: dict[str, float] = defaultdict(float) # condition_id → cumulative profit
+        self.max_entries_per_market = cfg["arb"].get("max_entries_per_market", 10)  # safety cap
+
         # Log files
         trade_path = Path(cfg["logging"]["trade_log"])
         scan_path = Path(cfg["logging"]["scan_log"])
@@ -679,7 +685,11 @@ class PaperEngine:
 
     def on_cooldown(self, condition_id: str) -> bool:
         last = self._last_trade_ts.get(condition_id, 0)
-        return (time.time() - last) < self.cooldown_secs
+        if (time.time() - last) < self.cooldown_secs:
+            return True
+        if self._market_entries[condition_id] >= self.max_entries_per_market:
+            return True
+        return False
 
     async def evaluate(self, market: Market) -> Optional[PaperTrade]:
         """Check a market for split-sell arb. Returns trade if profitable."""
@@ -738,25 +748,30 @@ class PaperEngine:
         trade.market = market.slug
         trade.question = market.question
 
+        # Track multi-entry
+        self._market_entries[market.condition_id] += 1
+        trade.entry_num = self._market_entries[market.condition_id]
+
         self.bankroll += trade.profit
         self.total_trades += 1
         self.total_profit += trade.profit
         self.total_volume += trade.stake
+        self._market_profit[market.condition_id] += trade.profit
         self._last_trade_ts[market.condition_id] = time.time()
 
         self._log_trade(trade)
 
         logging.info(
-            "TRADE #%d | %s | stake=$%.2f | YES@%.3f NO@%.3f | "
-            "gross=$%.4f fees=$%.4f profit=$%.4f | bankroll=$%.2f",
+            "TRADE #%d | %s | entry=%d | stake=$%.2f | YES@%.3f NO@%.3f | "
+            "profit=$%.4f (mkt_total=$%.4f) | bankroll=$%.2f",
             self.total_trades,
             market.slug[:50],
+            trade.entry_num,
             trade.stake,
             trade.yes_sell_price,
             trade.no_sell_price,
-            trade.gross,
-            trade.yes_fee + trade.no_fee,
             trade.profit,
+            self._market_profit[market.condition_id],
             self.bankroll,
         )
 
@@ -927,16 +942,22 @@ async def run(cfg: dict):
                 elapsed_session = time.time() - engine.session_start
                 hours = elapsed_session / 3600
                 daily_rate = (engine.total_profit / hours * 24) if hours > 0.01 else 0
+                # Multi-entry stats
+                multi_markets = sum(1 for v in engine._market_entries.values() if v >= 2)
+                max_entries = max(engine._market_entries.values()) if engine._market_entries else 0
+                avg_entries = (sum(engine._market_entries.values()) / len(engine._market_entries)) if engine._market_entries else 0
                 logging.info(
-                    "Scan #%d | %d mkts | ws_updates=%d | "
-                    "trades=%d profit=$%.4f vol=$%.2f | "
-                    "daily_rate=$%.2f | bankroll=$%.2f",
+                    "Scan #%d | %d mkts | ws=%d | "
+                    "trades=%d (multi=%d, max=%d, avg=%.1f/mkt) | "
+                    "profit=$%.4f daily=$%.2f | bankroll=$%.2f",
                     scan_count,
                     len(tracked),
                     book_feed._update_count,
                     engine.total_trades,
+                    multi_markets,
+                    max_entries,
+                    avg_entries,
                     engine.total_profit,
-                    engine.total_volume,
                     daily_rate,
                     engine.bankroll,
                 )
@@ -977,6 +998,17 @@ async def run(cfg: dict):
     logging.info("Final bankroll:  $%.2f", engine.bankroll)
     if engine.total_trades > 0:
         logging.info("Avg profit/trade: $%.4f", engine.total_profit / engine.total_trades)
+
+    # Multi-entry breakdown
+    if engine._market_entries:
+        multi = {k: v for k, v in engine._market_entries.items() if v >= 2}
+        logging.info("--- Multi-entry markets: %d / %d traded ---", len(multi), len(engine._market_entries))
+        # Top 5 most-arbed markets
+        top = sorted(engine._market_entries.items(), key=lambda x: -x[1])[:5]
+        for cid, count in top:
+            profit = engine._market_profit.get(cid, 0)
+            slug = tracked.get(cid, Market("", "", "", "", "")).slug or cid[:20]
+            logging.info("  %s: %d entries, profit=$%.4f", slug[:50], count, profit)
     logging.info("=" * 60)
 
 
