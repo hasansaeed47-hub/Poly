@@ -3,7 +3,8 @@
 
 [feed]
 # Assets to scan
-assets = ["btc", "eth", "sol", "xrp"]
+# Only assets with Chainlink feeds on Polymarket RTDS
+assets = ["btc", "eth", "sol"]
 
 # Window timeframes in minutes
 timeframes = [5, 15]
