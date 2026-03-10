@@ -106,9 +106,10 @@ impl State {
 
     fn cl_at(&self, a: &str, t: i64) -> Option<f64> {
         let s = self.snap.get(a)?;
-        if let Some(&p) = s.get(&t) { return Some(p); }
-        if let Some(&p) = s.get(&(t + 1)) { return Some(p); }
-        if let Some(&p) = s.get(&(t - 1)) { return Some(p); }
+        // Search ±3s to account for irregular CL oracle update intervals
+        for off in [0i64, 1, -1, 2, -2, 3, -3] {
+            if let Some(&p) = s.get(&(t + off)) { return Some(p); }
+        }
         None
     }
 
@@ -565,17 +566,19 @@ impl Sniper {
         tids.dedup();
         if !tids.is_empty() { self.bk.refresh(&tids).await; }
 
-        // Record CL open prices
+        // Record CL open prices — use snap at start_ts, not live price
         {
             let s = self.st.read().await;
             for w in &wins {
                 if self.cl_opens.contains_key(&w.slug) { continue; }
                 let now = Utc::now().timestamp();
                 if now >= w.start_ts && now <= w.end_ts {
-                    if let Some(&px) = s.cl.get(w.asset) {
-                        if px > 0.0 {
-                            self.cl_opens.insert(w.slug.clone(), px);
-                        }
+                    // Prefer the exact CL snapshot at window start_ts
+                    let px = s.cl_at(w.asset, w.start_ts)
+                        .or_else(|| s.cl.get(w.asset).copied())
+                        .unwrap_or(0.0);
+                    if px > 0.0 {
+                        self.cl_opens.insert(w.slug.clone(), px);
                     }
                 }
             }
@@ -615,9 +618,8 @@ impl Sniper {
                 // Settlement: end_ts + 3s
                 if now >= pt.end_ts + 3 {
                     let cl_open = self.cl_opens.get(&pt.slug).copied().unwrap_or(0.0);
-                    let cl_close = s.cl_at(pt.asset, pt.end_ts)
-                        .or_else(|| s.cl_latest(pt.asset))
-                        .unwrap_or(0.0);
+                    // No cl_latest fallback — only use snap at end_ts (±3s)
+                    let cl_close = s.cl_at(pt.asset, pt.end_ts).unwrap_or(0.0);
 
                     // CLOB cross-check (uses stored token IDs, not expired wins)
                     let bk_up = self.bk.get(&pt.tid_up);
@@ -631,13 +633,20 @@ impl Sniper {
                         else if bk_dn.hb && bk_dn.bb > 0.80 { Some("DOWN") }
                         else { None };
 
+                    // Debug: log CL open/close so mismatches can be diagnosed
+                    info!("[{}] SETTLE {} cl_open={:.2} cl_close={:.2} cl={:?} clob={:?} up_bb={:.3} dn_bb={:.3}",
+                        tr.cfg.id, pt.slug, cl_open, cl_close,
+                        cl_dir, clob_dir, bk_up.bb, bk_dn.bb);
+
                     if let (Some(cd), Some(cb)) = (cl_dir, clob_dir) {
                         if cd != cb {
-                            warn!("[{}] CL/CLOB disagree: CL={} CLOB={} {}", tr.cfg.id, cd, cb, pt.slug);
+                            warn!("[{}] CL/CLOB disagree: CL={} CLOB={} {} — using CLOB (ground truth)",
+                                tr.cfg.id, cd, cb, pt.slug);
                         }
                     }
 
-                    let actual = cl_dir.or(clob_dir);
+                    // CLOB post-settlement bids are ground truth; CL is fallback
+                    let actual = clob_dir.or(cl_dir);
 
                     if let Some(actual) = actual {
                         let won = actual == pt.dir;
