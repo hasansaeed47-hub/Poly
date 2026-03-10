@@ -1,0 +1,45 @@
+# Split-Sell Arbitrage Paper Trading Bot
+# Scans Polymarket binary markets for YES + NO > $1.00 opportunities
+
+[api]
+# Polymarket CLOB REST
+clob_rest = "https://clob.polymarket.com"
+# Gamma API (market discovery)
+gamma_api = "https://gamma-api.polymarket.com"
+# Throttle between REST calls (ms)
+throttle_ms = 400
+
+[scan]
+# How often to scan all tracked markets (seconds)
+interval_secs = 5
+# Max markets to track simultaneously
+max_markets = 200
+# Gamma API: how many events per page
+gamma_page_size = 50
+# Gamma API: how many pages to fetch on discovery
+gamma_pages = 4
+# Only consider markets with this much fillable depth on EACH side ($)
+min_depth_usd = 20.0
+
+[arb]
+# Paper bankroll ($)
+bankroll = 500.0
+# Max stake per arb ($) — amount of USDC to split
+max_stake = 25.0
+# Min profit after fees to trigger entry (cents)
+min_profit_cents = 1.5
+# Taker fee rate (Polymarket max — 1.56% at 50c, 0% at 0c/100c)
+# We model the real fee curve, this is the max cap
+max_taker_fee_rate = 0.02
+# Simulated fill slippage (bps off best bid)
+slippage_bps = 10
+# Simulated execution delay (seconds) — relayer confirmation
+exec_delay_secs = 2.0
+
+[logging]
+# JSONL trade log
+trade_log = "logs/trades.jsonl"
+# JSONL scan log (all opportunities seen)
+scan_log = "logs/scans.jsonl"
+# Console log level: DEBUG, INFO, WARN, ERROR
+level = "INFO"
