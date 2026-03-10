@@ -1,4 +1,4 @@
-# CL Scanner — external config
+# Lag Scanner — external config
 # All thresholds here, nothing hardcoded in binary
 
 [feed]
@@ -29,15 +29,26 @@ rest_throttle_ms = 500
 # Book warmup: wait this many seconds after WS connect before trading
 book_warmup_secs = 5
 
+# Max seconds after window_start to still capture open_price reliably
+max_open_delay = 5.0
+
 [scan]
 # Scan tick interval in milliseconds
 tick_ms = 500
 
-# Sigma estimation: rolling window in seconds
-sigma_window_secs = 300
+# --- Per-timeframe scan parameters ---
 
-# Minimum seconds left in window to consider entry
-min_secs = 60
+[scan_5m]
+# Sigma estimation: rolling window in seconds (3 minutes for 5m windows)
+sigma_window_secs = 180
+# Seconds after window_end before settling (wait for CL oracle confirmation)
+settle_delay_secs = 10
+
+[scan_15m]
+# Sigma estimation: rolling window in seconds (10 minutes for 15m windows)
+sigma_window_secs = 600
+# Seconds after window_end before settling
+settle_delay_secs = 15
 
 [paper]
 # Stake per trade in USD (paper only)
@@ -46,46 +57,114 @@ stake = 5.0
 # Taker fee rate (Polymarket curve approximation)
 taker_fee_rate = 0.015
 
-# Maker fee rate
+# Maker fee rate (unused — scanner is always taker)
 maker_fee_rate = 0.0
 
-[configs]
-# Config 1 — Base
+# ==============================================================================
+# CONFIGS — 5 strategies per timeframe, each independently paper-traded
+#
+# Each config specifies:
+#   name          — unique identifier (appears in logs)
+#   tf            — timeframe in minutes (5 or 15) — ONLY processes matching markets
+#   min_edge      — minimum fee-adjusted edge to enter (fair - book×(1+fee))
+#   max_secs_left — max seconds remaining in window to consider entry
+#   min_secs      — min seconds remaining (skip near-expiry noise)
+#   stop_loss     — exit if current fair drops below entry price
+#   take_profit   — exit if book reprices to fair_at_entry
+# ==============================================================================
+
+# --- 5-Minute Configs ---
+# 5m windows: faster decay, tighter edges, allow entries closer to expiry
+
 [configs.c1]
-name           = "BASE"
-min_edge       = 0.12
-max_secs_left  = 840
+name           = "5M_BASE"
+tf             = 5
+min_edge       = 0.08
+max_secs_left  = 270
+min_secs       = 20
 stop_loss      = false
 take_profit    = false
 
-# Config 2 — Base + Time Filter (last 3 minutes only)
 [configs.c2]
-name           = "TIME_FILTER"
-min_edge       = 0.12
-max_secs_left  = 180
+name           = "5M_LATE"
+tf             = 5
+min_edge       = 0.08
+max_secs_left  = 90
+min_secs       = 15
 stop_loss      = false
 take_profit    = false
 
-# Config 3 — Base + Edge Filter (large gaps only)
 [configs.c3]
-name           = "EDGE_FILTER"
-min_edge       = 0.25
-max_secs_left  = 840
+name           = "5M_EDGE"
+tf             = 5
+min_edge       = 0.20
+max_secs_left  = 270
+min_secs       = 20
 stop_loss      = false
 take_profit    = false
 
-# Config 4 — Base + Stop Loss (exit when fair < entry_price)
 [configs.c4]
-name           = "STOP_LOSS"
-min_edge       = 0.12
-max_secs_left  = 840
+name           = "5M_SL"
+tf             = 5
+min_edge       = 0.08
+max_secs_left  = 270
+min_secs       = 20
 stop_loss      = true
 take_profit    = false
 
-# Config 5 — CL Target Exit (exit when book >= fair_at_entry)
 [configs.c5]
-name           = "CL_TARGET"
+name           = "5M_TP"
+tf             = 5
+min_edge       = 0.08
+max_secs_left  = 270
+min_secs       = 20
+stop_loss      = false
+take_profit    = true
+
+# --- 15-Minute Configs ---
+# 15m windows: more time for mean reversion, need larger edges
+
+[configs.c6]
+name           = "15M_BASE"
+tf             = 15
 min_edge       = 0.12
 max_secs_left  = 840
+min_secs       = 60
+stop_loss      = false
+take_profit    = false
+
+[configs.c7]
+name           = "15M_LATE"
+tf             = 15
+min_edge       = 0.12
+max_secs_left  = 300
+min_secs       = 45
+stop_loss      = false
+take_profit    = false
+
+[configs.c8]
+name           = "15M_EDGE"
+tf             = 15
+min_edge       = 0.25
+max_secs_left  = 840
+min_secs       = 60
+stop_loss      = false
+take_profit    = false
+
+[configs.c9]
+name           = "15M_SL"
+tf             = 15
+min_edge       = 0.12
+max_secs_left  = 840
+min_secs       = 60
+stop_loss      = true
+take_profit    = false
+
+[configs.c10]
+name           = "15M_TP"
+tf             = 15
+min_edge       = 0.12
+max_secs_left  = 840
+min_secs       = 60
 stop_loss      = false
 take_profit    = true
