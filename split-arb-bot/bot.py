@@ -8,8 +8,9 @@ Strategy: When YES_bid + NO_bid > $1.00 (after fees), simulate:
   3. Sell X NO tokens at NO_bid
   4. Profit = sell_proceeds - split_cost - fees
 
-This is paper trading only — no wallet, no signing, no real orders.
-All execution is simulated with realistic timing, slippage, and fees.
+WebSocket-driven: Real-time book updates via CLOB WS + 500ms arb scan tick.
+REST discovery only for finding new markets (~60s interval).
+Paper trading only — no wallet, no signing, no real orders.
 """
 
 import asyncio
@@ -18,6 +19,7 @@ import logging
 import os
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
@@ -36,6 +38,11 @@ def load_config(path: str = "config.toml") -> dict:
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
+
+@dataclass
+class BookLevel:
+    price: float
+    size: float
 
 @dataclass
 class BookSide:
@@ -63,6 +70,25 @@ class BookSide:
         avg = total_cost / total_qty if total_qty > 0 else 0.0
         return avg, total_qty
 
+    def apply_snapshot(self, levels: list[tuple[float, float]], is_bids: bool):
+        """Replace entire side from a full snapshot."""
+        self.levels = [(p, s) for p, s in levels if s > 0]
+        if is_bids:
+            self.levels.sort(key=lambda x: -x[0])  # highest first
+        else:
+            self.levels.sort(key=lambda x: x[0])    # lowest first
+
+    def apply_delta(self, price: float, size: float, is_bids: bool):
+        """Apply a single level delta: size=0 removes, size>0 upserts."""
+        # Remove existing level at this price
+        self.levels = [(p, s) for p, s in self.levels if abs(p - price) > 1e-10]
+        if size > 0:
+            self.levels.append((price, size))
+            if is_bids:
+                self.levels.sort(key=lambda x: -x[0])
+            else:
+                self.levels.sort(key=lambda x: x[0])
+
 
 @dataclass
 class Market:
@@ -77,6 +103,7 @@ class Market:
     yes_asks: BookSide = field(default_factory=BookSide)
     no_asks: BookSide = field(default_factory=BookSide)
     last_update: float = 0.0
+    ws_subscribed: bool = False
 
 
 @dataclass
@@ -102,12 +129,7 @@ def taker_fee(price: float, max_rate: float) -> float:
     """
     Polymarket fee: rate * price * (1 - price)
     Peaks at 50c (max_rate * 0.25), zero at 0c and 100c.
-    The rate is ~6.25% to produce ~1.56% effective fee at 50c.
-    We use max_rate as the cap on the effective fee.
     """
-    # Effective fee = price * q * (1-q) where q is the price
-    # But Polymarket docs say: fee = price * fee_rate, capped.
-    # Simpler realistic model: fee% = min(max_rate, 2 * max_rate * min(price, 1-price))
     effective_rate = min(max_rate, 2 * max_rate * min(price, 1 - price))
     return price * effective_rate
 
@@ -119,33 +141,23 @@ def compute_arb(
     max_fee_rate: float,
     slippage_bps: int,
 ) -> Optional[PaperTrade]:
-    """
-    Check if a split-sell arb is profitable.
-
-    Split $stake USDC → stake YES + stake NO tokens.
-    Sell YES at yes_bid (minus slippage), sell NO at no_bid (minus slippage).
-    Pay taker fees on each sell.
-    """
+    """Check if a split-sell arb is profitable."""
     if yes_bid <= 0 or no_bid <= 0:
         return None
 
-    # Apply slippage
     slip = slippage_bps / 10000
     yes_fill = yes_bid * (1 - slip)
     no_fill = no_bid * (1 - slip)
 
-    # Proceeds from selling
     yes_proceeds = stake * yes_fill
     no_proceeds = stake * no_fill
     gross = yes_proceeds + no_proceeds
 
-    # Fees on each leg
     yes_fee = stake * taker_fee(yes_fill, max_fee_rate)
     no_fee = stake * taker_fee(no_fill, max_fee_rate)
     total_fees = yes_fee + no_fee
 
-    # P&L
-    net = gross - stake  # before fees
+    net = gross - stake
     profit = net - total_fees
 
     if profit <= 0:
@@ -153,7 +165,7 @@ def compute_arb(
 
     return PaperTrade(
         ts=time.time(),
-        market="",      # filled by caller
+        market="",
         question="",
         stake=stake,
         yes_sell_price=yes_fill,
@@ -166,11 +178,299 @@ def compute_arb(
     )
 
 # ---------------------------------------------------------------------------
-# API client
+# WebSocket book feed — real-time order book updates
+# ---------------------------------------------------------------------------
+
+class BookFeed:
+    """
+    WebSocket connection to Polymarket CLOB for real-time book updates.
+    Mirrors the Rust feeds.rs implementation:
+      - Subscribes via market channel with custom_feature_enabled
+      - Handles best_bid_ask, book (snapshot), and price_change (delta) events
+      - Maintains full order book state per token with proper delta application
+      - Automatic reconnection with backoff
+    """
+
+    def __init__(self, ws_url: str, markets: dict[str, "Market"]):
+        self.ws_url = ws_url
+        self.markets = markets  # condition_id → Market (shared ref)
+        self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._token_to_market: dict[str, tuple[str, str]] = {}  # token → (cond_id, "yes"/"no")
+        self._subscribed_tokens: set[str] = set()
+        self._msg_count = 0
+        self._connected = False
+        self._update_count = 0  # total book updates received
+
+    def _rebuild_token_map(self):
+        """Rebuild token→market mapping from current markets dict."""
+        self._token_to_market.clear()
+        for cid, m in self.markets.items():
+            self._token_to_market[m.token_yes] = (cid, "yes")
+            self._token_to_market[m.token_no] = (cid, "no")
+
+    async def run(self):
+        """Main loop: connect, subscribe, process messages. Auto-reconnects."""
+        while True:
+            try:
+                await self._connect_and_run()
+            except Exception as e:
+                logging.error("[BOOK-WS] Error: %s, reconnecting in 5s", e)
+            self._connected = False
+            await asyncio.sleep(5)
+
+    async def _connect_and_run(self):
+        """Single connection lifecycle."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+
+        logging.info("[BOOK-WS] Connecting to %s", self.ws_url)
+        self._ws = await self._session.ws_connect(
+            self.ws_url,
+            timeout=aiohttp.ClientWSMsgType(10),
+            heartbeat=30,
+        )
+        self._connected = True
+        self._msg_count = 0
+        logging.info("[BOOK-WS] Connected")
+
+        # Subscribe to all known tokens
+        await self._subscribe_all()
+
+        # Ping every 10s (Polymarket CLOB WS keepalive)
+        ping_task = asyncio.create_task(self._ping_loop())
+
+        try:
+            async for msg in self._ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    text = msg.data
+                    if text in ("pong", "PONG"):
+                        continue
+                    self._msg_count += 1
+                    if self._msg_count <= 3:
+                        logging.debug("[BOOK-WS] msg #%d: %s", self._msg_count, text[:500])
+
+                    # CLOB WS may send JSON arrays
+                    if text.startswith("["):
+                        try:
+                            for v in json.loads(text):
+                                self._process_message(v)
+                        except json.JSONDecodeError:
+                            pass
+                    else:
+                        try:
+                            self._process_message(json.loads(text))
+                        except json.JSONDecodeError:
+                            pass
+
+                elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    logging.warning("[BOOK-WS] Connection closed/error")
+                    break
+        finally:
+            ping_task.cancel()
+            try:
+                await ping_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _ping_loop(self):
+        """Send ping every 10s to keep connection alive."""
+        while True:
+            await asyncio.sleep(10)
+            if self._ws and not self._ws.closed:
+                try:
+                    await self._ws.send_str("ping")
+                except Exception:
+                    break
+
+    async def _subscribe_all(self):
+        """Subscribe to all token IDs from tracked markets."""
+        self._rebuild_token_map()
+        all_tokens = list(self._token_to_market.keys())
+        if not all_tokens:
+            return
+
+        # Polymarket limits ~500 per subscription
+        for i in range(0, len(all_tokens), 500):
+            batch = all_tokens[i:i+500]
+            sub = {
+                "type": "market",
+                "assets_ids": batch,
+                "custom_feature_enabled": True,
+            }
+            if self._ws and not self._ws.closed:
+                await self._ws.send_json(sub)
+                logging.info("[BOOK-WS] Subscribed to %d tokens (batch %d)", len(batch), i // 500 + 1)
+
+        self._subscribed_tokens = set(all_tokens)
+
+    async def subscribe_new_tokens(self, new_tokens: list[str]):
+        """Subscribe to newly discovered tokens without reconnecting."""
+        if not new_tokens or not self._ws or self._ws.closed:
+            return
+        self._rebuild_token_map()
+        unsub = [t for t in new_tokens if t not in self._subscribed_tokens]
+        if not unsub:
+            return
+
+        for i in range(0, len(unsub), 500):
+            batch = unsub[i:i+500]
+            sub = {
+                "type": "market",
+                "assets_ids": batch,
+                "custom_feature_enabled": True,
+            }
+            await self._ws.send_json(sub)
+            logging.info("[BOOK-WS] Subscribed to %d new tokens", len(batch))
+
+        self._subscribed_tokens.update(unsub)
+
+    def _process_message(self, v: dict):
+        """Process a single WS message — mirrors Rust process_book_message."""
+        event_type = v.get("event_type", "")
+        now = time.time()
+
+        if event_type == "best_bid_ask":
+            # Fast top-of-book update (custom_feature_enabled)
+            asset_id = v.get("asset_id", "")
+            if not asset_id or asset_id not in self._token_to_market:
+                return
+
+            best_bid = self._parse_float(v.get("best_bid"))
+            best_ask = self._parse_float(v.get("best_ask"))
+
+            cid, side = self._token_to_market[asset_id]
+            m = self.markets.get(cid)
+            if not m:
+                return
+
+            # For best_bid_ask we just update the top-of-book for quick scanning
+            # The full book state is maintained via book + price_change events
+            if side == "yes":
+                if best_bid > 0:
+                    if not m.yes_bids.levels or abs(m.yes_bids.levels[0][0] - best_bid) > 1e-10:
+                        m.yes_bids.apply_delta(best_bid, 999.0, is_bids=True)
+                if best_ask > 0:
+                    if not m.yes_asks.levels or abs(m.yes_asks.levels[0][0] - best_ask) > 1e-10:
+                        m.yes_asks.apply_delta(best_ask, 999.0, is_bids=False)
+            else:
+                if best_bid > 0:
+                    if not m.no_bids.levels or abs(m.no_bids.levels[0][0] - best_bid) > 1e-10:
+                        m.no_bids.apply_delta(best_bid, 999.0, is_bids=True)
+                if best_ask > 0:
+                    if not m.no_asks.levels or abs(m.no_asks.levels[0][0] - best_ask) > 1e-10:
+                        m.no_asks.apply_delta(best_ask, 999.0, is_bids=False)
+
+            m.last_update = now
+            self._update_count += 1
+
+        elif event_type == "book":
+            # Full snapshot
+            asset_id = v.get("asset_id", "")
+            if not asset_id or asset_id not in self._token_to_market:
+                return
+
+            cid, side = self._token_to_market[asset_id]
+            m = self.markets.get(cid)
+            if not m:
+                return
+
+            asks = self._parse_levels(v.get("asks"))
+            bids = self._parse_levels(v.get("bids"))
+
+            if side == "yes":
+                m.yes_bids.apply_snapshot(bids, is_bids=True)
+                m.yes_asks.apply_snapshot(asks, is_bids=False)
+            else:
+                m.no_bids.apply_snapshot(bids, is_bids=True)
+                m.no_asks.apply_snapshot(asks, is_bids=False)
+
+            m.last_update = now
+            self._update_count += 1
+
+        elif event_type == "price_change":
+            # Delta updates — handle both new and old Polymarket formats
+
+            # New format: price_changes array with per-entry asset_id
+            price_changes = v.get("price_changes")
+            if price_changes and isinstance(price_changes, list):
+                for change in price_changes:
+                    asset_id = change.get("asset_id", "")
+                    if asset_id and asset_id in self._token_to_market:
+                        self._apply_change(asset_id, change, now)
+                return
+
+            # Old format: changes array with message-level asset_id
+            changes = v.get("changes")
+            asset_id = v.get("asset_id", "")
+            if changes and isinstance(changes, list) and asset_id and asset_id in self._token_to_market:
+                for change in changes:
+                    self._apply_change(asset_id, change, now)
+
+    def _apply_change(self, asset_id: str, change: dict, now: float):
+        """Apply a single price_change entry to book state."""
+        price = self._parse_float(change.get("price"))
+        size = self._parse_float(change.get("size"))
+        side = change.get("side", "")
+
+        if price is None or size is None:
+            return
+
+        is_ask = side.upper() in ("SELL", "ASK")
+        cid, token_side = self._token_to_market[asset_id]
+        m = self.markets.get(cid)
+        if not m:
+            return
+
+        if token_side == "yes":
+            if is_ask:
+                m.yes_asks.apply_delta(price, size, is_bids=False)
+            else:
+                m.yes_bids.apply_delta(price, size, is_bids=True)
+        else:
+            if is_ask:
+                m.no_asks.apply_delta(price, size, is_bids=False)
+            else:
+                m.no_bids.apply_delta(price, size, is_bids=True)
+
+        m.last_update = now
+        self._update_count += 1
+
+    @staticmethod
+    def _parse_float(val) -> Optional[float]:
+        if val is None:
+            return None
+        if isinstance(val, (int, float)):
+            return float(val)
+        if isinstance(val, str):
+            try:
+                return float(val)
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _parse_levels(val) -> list[tuple[float, float]]:
+        if not val or not isinstance(val, list):
+            return []
+        levels = []
+        for l in val:
+            try:
+                p = float(l.get("price", 0)) if isinstance(l.get("price"), (int, float)) else float(l.get("price", "0"))
+                s = float(l.get("size", 0)) if isinstance(l.get("size"), (int, float)) else float(l.get("size", "0"))
+                if p > 0 and s > 0:
+                    levels.append((p, s))
+            except (ValueError, TypeError, AttributeError):
+                continue
+        return levels
+
+
+# ---------------------------------------------------------------------------
+# API client (REST — discovery only)
 # ---------------------------------------------------------------------------
 
 class PolyClient:
-    """Thin async wrapper around Gamma + CLOB REST APIs."""
+    """REST client for market discovery via Gamma API + initial book snapshots."""
 
     def __init__(self, cfg: dict):
         self.gamma_api = cfg["api"]["gamma_api"]
@@ -196,8 +496,6 @@ class PolyClient:
     async def close(self):
         if self._session and not self._session.closed:
             await self._session.close()
-
-    # -- Gamma: discover binary markets ----------------------------------------
 
     async def discover_markets(self, limit: int = 50, offset: int = 0) -> list[Market]:
         """Fetch active binary markets from Gamma API."""
@@ -229,7 +527,6 @@ class PolyClient:
         for event in events:
             event_markets = event.get("markets", [])
             for m in event_markets:
-                # Only binary (2-outcome) markets
                 outcomes = m.get("outcomes", "")
                 if isinstance(outcomes, str):
                     try:
@@ -257,7 +554,6 @@ class PolyClient:
                 if not cond_id or not tokens[0] or not tokens[1]:
                     continue
 
-                # Map outcomes to YES/NO token positions
                 o_lower = [o.lower() for o in outcomes]
                 if "yes" in o_lower:
                     yes_idx = o_lower.index("yes")
@@ -266,7 +562,6 @@ class PolyClient:
                     yes_idx = o_lower.index("up")
                     no_idx = 1 - yes_idx
                 else:
-                    # Default: first = YES, second = NO
                     yes_idx, no_idx = 0, 1
 
                 markets.append(Market(
@@ -279,17 +574,14 @@ class PolyClient:
 
         return markets
 
-    # -- CLOB: fetch order books -----------------------------------------------
-
     async def fetch_books(self, token_ids: list[str]) -> dict[str, dict]:
-        """Fetch order books for a batch of token IDs. Returns {token_id: {bids, asks}}."""
+        """Fetch order books for a batch of token IDs (REST fallback)."""
         if not token_ids:
             return {}
 
         await self._throttle()
         session = await self._get_session()
 
-        # CLOB /books accepts POST with array of {token_id: ...}
         body = [{"token_id": tid} for tid in token_ids]
 
         try:
@@ -322,7 +614,7 @@ class PolyClient:
                         bids.append((p, s))
                 except (ValueError, TypeError):
                     continue
-            bids.sort(key=lambda x: -x[0])  # highest first
+            bids.sort(key=lambda x: -x[0])
 
             asks = []
             for level in item.get("asks", []):
@@ -333,7 +625,7 @@ class PolyClient:
                         asks.append((p, s))
                 except (ValueError, TypeError):
                     continue
-            asks.sort(key=lambda x: x[0])  # lowest first
+            asks.sort(key=lambda x: x[0])
 
             result[tid] = {"bids": bids, "asks": asks}
 
@@ -359,6 +651,11 @@ class PaperEngine:
         self.total_trades = 0
         self.total_profit = 0.0
         self.total_volume = 0.0
+        self.session_start = time.time()
+
+        # Cooldown: don't re-arb the same market within N seconds
+        self.cooldown_secs = cfg["arb"].get("cooldown_secs", 5.0)
+        self._last_trade_ts: dict[str, float] = {}  # condition_id → last trade time
 
         # Log files
         trade_path = Path(cfg["logging"]["trade_log"])
@@ -380,6 +677,10 @@ class PaperEngine:
         self._trade_log.write(json.dumps(asdict(trade)) + "\n")
         self._trade_log.flush()
 
+    def on_cooldown(self, condition_id: str) -> bool:
+        last = self._last_trade_ts.get(condition_id, 0)
+        return (time.time() - last) < self.cooldown_secs
+
     async def evaluate(self, market: Market) -> Optional[PaperTrade]:
         """Check a market for split-sell arb. Returns trade if profitable."""
         yes_bid = market.yes_bids.best
@@ -390,7 +691,6 @@ class PaperEngine:
 
         raw_sum = yes_bid + no_bid
 
-        # Quick check: bids must sum above $1.00
         if raw_sum <= 1.0:
             return None
 
@@ -401,23 +701,20 @@ class PaperEngine:
         if yes_avg <= 0 or no_avg <= 0:
             return None
 
-        # Stake: limited by bankroll, max_stake, and available depth
         depth_limited = min(yes_qty * yes_avg, no_qty * no_avg)
         stake = min(self.max_stake, self.bankroll, depth_limited)
         if stake < 1.0:
             return None
 
-        # Compute arb using depth-weighted avg prices
         trade = compute_arb(yes_avg, no_avg, stake, self.max_fee_rate, self.slippage_bps)
 
-        # Log the scan regardless
         self._log_scan({
             "ts": time.time(),
             "slug": market.slug,
             "question": market.question,
             "yes_bid": yes_bid,
             "no_bid": no_bid,
-            "sum": raw_sum,
+            "sum": round(raw_sum, 4),
             "yes_avg": round(yes_avg, 4),
             "no_avg": round(no_avg, 4),
             "stake": round(stake, 2),
@@ -428,7 +725,6 @@ class PaperEngine:
         if trade is None:
             return None
 
-        # Must meet minimum profit threshold
         if trade.profit < self.min_profit_cents / 100:
             return None
 
@@ -442,11 +738,11 @@ class PaperEngine:
         trade.market = market.slug
         trade.question = market.question
 
-        # Update bankroll
         self.bankroll += trade.profit
         self.total_trades += 1
         self.total_profit += trade.profit
         self.total_volume += trade.stake
+        self._last_trade_ts[market.condition_id] = time.time()
 
         self._log_trade(trade)
 
@@ -466,141 +762,221 @@ class PaperEngine:
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Main loop — 500ms scan tick with WebSocket book feed
 # ---------------------------------------------------------------------------
 
 async def run(cfg: dict):
     client = PolyClient(cfg)
     engine = PaperEngine(cfg)
 
-    scan_interval = cfg["scan"]["interval_secs"]
+    scan_interval_ms = cfg["scan"]["interval_ms"]  # 500ms scan tick
     max_markets = cfg["scan"]["max_markets"]
     gamma_page_size = cfg["scan"]["gamma_page_size"]
     gamma_pages = cfg["scan"]["gamma_pages"]
-    book_batch_size = 20  # CLOB limit per request
+    discovery_interval = cfg["scan"]["discovery_interval_secs"]
+    book_batch_size = 20
+
+    clob_ws_url = cfg["api"]["clob_ws"]
 
     tracked: dict[str, Market] = {}  # condition_id → Market
-    discovery_counter = 0
 
     logging.info("=" * 60)
-    logging.info("Split-Sell Arb Bot — Paper Trading")
+    logging.info("Split-Sell Arb Bot — WebSocket + 500ms Scan")
     logging.info("Bankroll: $%.2f | Max stake: $%.2f", engine.bankroll, engine.max_stake)
     logging.info("Min profit: %.1f¢ | Slippage: %d bps", engine.min_profit_cents, engine.slippage_bps)
     logging.info("Min depth: $%.0f | Exec delay: %.1fs", engine.min_depth, engine.exec_delay)
+    logging.info("Scan tick: %dms | Discovery: %ds", scan_interval_ms, discovery_interval)
+    logging.info("CLOB WS: %s", clob_ws_url)
     logging.info("=" * 60)
+
+    # -- Phase 1: Initial discovery via REST -----------------------------------
+    logging.info("Initial market discovery...")
+    for page in range(gamma_pages):
+        batch = await client.discover_markets(
+            limit=gamma_page_size,
+            offset=page * gamma_page_size,
+        )
+        for m in batch:
+            if m.condition_id not in tracked and len(tracked) < max_markets:
+                tracked[m.condition_id] = m
+        if len(batch) < gamma_page_size:
+            break
+
+    logging.info("Discovered %d markets", len(tracked))
+
+    if not tracked:
+        logging.error("No markets found, exiting")
+        await client.close()
+        return
+
+    # -- Phase 2: Fetch initial book snapshots via REST ------------------------
+    logging.info("Fetching initial book snapshots...")
+    all_tokens = []
+    token_to_market: dict[str, tuple[str, str]] = {}
+
+    for cid, m in tracked.items():
+        all_tokens.append(m.token_yes)
+        all_tokens.append(m.token_no)
+        token_to_market[m.token_yes] = (cid, "yes")
+        token_to_market[m.token_no] = (cid, "no")
+
+    for i in range(0, len(all_tokens), book_batch_size):
+        batch = all_tokens[i:i + book_batch_size]
+        books = await client.fetch_books(batch)
+        now = time.time()
+        for tid, book in books.items():
+            if tid not in token_to_market:
+                continue
+            cid, side = token_to_market[tid]
+            m = tracked.get(cid)
+            if m is None:
+                continue
+            if side == "yes":
+                m.yes_bids = BookSide(levels=book["bids"])
+                m.yes_asks = BookSide(levels=book["asks"])
+            else:
+                m.no_bids = BookSide(levels=book["bids"])
+                m.no_asks = BookSide(levels=book["asks"])
+            m.last_update = now
+
+    logging.info("Initial snapshots loaded for %d tokens", len(all_tokens))
+
+    # -- Phase 3: Start WebSocket book feed ------------------------------------
+    book_feed = BookFeed(clob_ws_url, tracked)
+    ws_task = asyncio.create_task(book_feed.run())
+
+    # -- Phase 4: 500ms scan loop + periodic REST discovery --------------------
+    last_discovery = time.time()
+    scan_count = 0
+    scan_tick = scan_interval_ms / 1000.0  # 0.5s
 
     try:
         while True:
             loop_start = time.time()
+            scan_count += 1
 
-            # -- Discovery: refresh market list every 12 cycles (~1 min) -------
-            if discovery_counter % 12 == 0:
-                logging.info("Discovering markets...")
-                new_markets = []
+            # -- Periodic REST discovery (every discovery_interval secs) --------
+            if time.time() - last_discovery >= discovery_interval:
+                last_discovery = time.time()
+                new_tokens = []
                 for page in range(gamma_pages):
                     batch = await client.discover_markets(
                         limit=gamma_page_size,
                         offset=page * gamma_page_size,
                     )
-                    new_markets.extend(batch)
+                    added = 0
+                    for m in batch:
+                        if m.condition_id not in tracked and len(tracked) < max_markets:
+                            tracked[m.condition_id] = m
+                            new_tokens.extend([m.token_yes, m.token_no])
+                            added += 1
                     if len(batch) < gamma_page_size:
                         break
 
-                added = 0
-                for m in new_markets:
-                    if m.condition_id not in tracked and len(tracked) < max_markets:
-                        tracked[m.condition_id] = m
-                        added += 1
+                if new_tokens:
+                    logging.info("Discovery: +%d new markets (%d total)", len(new_tokens) // 2, len(tracked))
+                    # Fetch initial snapshots for new markets
+                    for i in range(0, len(new_tokens), book_batch_size):
+                        tbatch = new_tokens[i:i + book_batch_size]
+                        books = await client.fetch_books(tbatch)
+                        now = time.time()
+                        for tid, book in books.items():
+                            cid_side = token_to_market.get(tid)
+                            if not cid_side:
+                                # Build mapping for new tokens
+                                for cid, m in tracked.items():
+                                    if m.token_yes == tid:
+                                        token_to_market[tid] = (cid, "yes")
+                                        cid_side = (cid, "yes")
+                                        break
+                                    elif m.token_no == tid:
+                                        token_to_market[tid] = (cid, "no")
+                                        cid_side = (cid, "no")
+                                        break
+                            if not cid_side:
+                                continue
+                            cid, side = cid_side
+                            m = tracked.get(cid)
+                            if m is None:
+                                continue
+                            if side == "yes":
+                                m.yes_bids = BookSide(levels=book["bids"])
+                                m.yes_asks = BookSide(levels=book["asks"])
+                            else:
+                                m.no_bids = BookSide(levels=book["bids"])
+                                m.no_asks = BookSide(levels=book["asks"])
+                            m.last_update = now
 
-                logging.info(
-                    "Tracking %d markets (+%d new, %d discovered)",
-                    len(tracked), added, len(new_markets),
-                )
-            discovery_counter += 1
+                    # Subscribe new tokens on WS
+                    await book_feed.subscribe_new_tokens(new_tokens)
 
-            if not tracked:
-                logging.warning("No markets tracked, waiting...")
-                await asyncio.sleep(scan_interval)
-                continue
-
-            # -- Fetch order books in batches -----------------------------------
-            all_tokens = []
-            token_to_market: dict[str, tuple[str, str]] = {}  # token → (cond_id, "yes"/"no")
-
-            for cid, m in tracked.items():
-                all_tokens.append(m.token_yes)
-                all_tokens.append(m.token_no)
-                token_to_market[m.token_yes] = (cid, "yes")
-                token_to_market[m.token_no] = (cid, "no")
-
-            # Batch fetch
-            all_books: dict[str, dict] = {}
-            for i in range(0, len(all_tokens), book_batch_size):
-                batch = all_tokens[i : i + book_batch_size]
-                books = await client.fetch_books(batch)
-                all_books.update(books)
-
-            # -- Update market book state ---------------------------------------
-            now = time.time()
-            for tid, book in all_books.items():
-                if tid not in token_to_market:
-                    continue
-                cid, side = token_to_market[tid]
-                m = tracked.get(cid)
-                if m is None:
-                    continue
-
-                if side == "yes":
-                    m.yes_bids = BookSide(levels=book["bids"])
-                    m.yes_asks = BookSide(levels=book["asks"])
-                else:
-                    m.no_bids = BookSide(levels=book["bids"])
-                    m.no_asks = BookSide(levels=book["asks"])
-                m.last_update = now
-
-            # -- Scan for arb opportunities ------------------------------------
+            # -- Scan all markets for arb opportunities -------------------------
             opportunities = 0
             for m in tracked.values():
+                # Skip if on cooldown
+                if engine.on_cooldown(m.condition_id):
+                    continue
+
                 trade = await engine.evaluate(m)
                 if trade is not None:
                     opportunities += 1
                     await engine.execute(m, trade)
 
-            # -- Status line ----------------------------------------------------
-            elapsed = time.time() - loop_start
-            logging.info(
-                "Scan %d | %d markets | %d opps | "
-                "trades=%d profit=$%.4f volume=$%.2f | %.1fs",
-                discovery_counter,
-                len(tracked),
-                opportunities,
-                engine.total_trades,
-                engine.total_profit,
-                engine.total_volume,
-                elapsed,
-            )
+            # -- Status line (every 20 scans = ~10s) ----------------------------
+            if scan_count % 20 == 0:
+                elapsed_session = time.time() - engine.session_start
+                hours = elapsed_session / 3600
+                daily_rate = (engine.total_profit / hours * 24) if hours > 0.01 else 0
+                logging.info(
+                    "Scan #%d | %d mkts | ws_updates=%d | "
+                    "trades=%d profit=$%.4f vol=$%.2f | "
+                    "daily_rate=$%.2f | bankroll=$%.2f",
+                    scan_count,
+                    len(tracked),
+                    book_feed._update_count,
+                    engine.total_trades,
+                    engine.total_profit,
+                    engine.total_volume,
+                    daily_rate,
+                    engine.bankroll,
+                )
 
-            # -- Wait for next tick --------------------------------------------
-            sleep_time = max(0, scan_interval - elapsed)
+            # -- Wait for next 500ms tick --------------------------------------
+            elapsed = time.time() - loop_start
+            sleep_time = max(0, scan_tick - elapsed)
             if sleep_time > 0:
                 await asyncio.sleep(sleep_time)
 
     except KeyboardInterrupt:
         logging.info("Shutting down...")
     finally:
+        ws_task.cancel()
+        try:
+            await ws_task
+        except asyncio.CancelledError:
+            pass
         engine.close()
         await client.close()
+        if book_feed._session and not book_feed._session.closed:
+            await book_feed._session.close()
 
     # -- Final summary ----------------------------------------------------------
+    elapsed_session = time.time() - engine.session_start
+    hours = elapsed_session / 3600
+    daily_rate = (engine.total_profit / hours * 24) if hours > 0.01 else 0
+
     logging.info("=" * 60)
     logging.info("SESSION SUMMARY")
-    logging.info("Total trades:  %d", engine.total_trades)
-    logging.info("Total volume:  $%.2f", engine.total_volume)
-    logging.info("Total profit:  $%.4f", engine.total_profit)
-    logging.info("Final bankroll: $%.2f", engine.bankroll)
+    logging.info("Runtime:         %.1f minutes", elapsed_session / 60)
+    logging.info("Total scans:     %d", scan_count)
+    logging.info("WS book updates: %d", book_feed._update_count)
+    logging.info("Total trades:    %d", engine.total_trades)
+    logging.info("Total volume:    $%.2f", engine.total_volume)
+    logging.info("Total profit:    $%.4f", engine.total_profit)
+    logging.info("Daily rate:      $%.2f/day", daily_rate)
+    logging.info("Final bankroll:  $%.2f", engine.bankroll)
     if engine.total_trades > 0:
         logging.info("Avg profit/trade: $%.4f", engine.total_profit / engine.total_trades)
-        logging.info("Win rate: 100%% (arb is structurally profitable)")
     logging.info("=" * 60)
 
 
@@ -616,7 +992,6 @@ def main():
 
     cfg = load_config(cfg_path)
 
-    # Setup logging
     log_level = getattr(logging, cfg["logging"]["level"].upper(), logging.INFO)
     logging.basicConfig(
         level=log_level,
