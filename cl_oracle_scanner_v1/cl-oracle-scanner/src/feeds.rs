@@ -205,14 +205,19 @@ pub async fn fetch_market_meta(
         .await
         .context("gamma API request failed")?;
 
-    if resp.status() == 404 {
+    let status = resp.status();
+    if status == 404 {
         return Ok(None);
     }
 
-    let event: GammaEvent = resp
-        .json()
-        .await
-        .context("gamma API JSON parse failed")?;
+    let body = resp.text().await.context("gamma API read body failed")?;
+    if !status.is_success() {
+        warn!("[DISCOVER] {} returned HTTP {} body: {}", slug, status, &body[..body.len().min(200)]);
+        return Ok(None);
+    }
+
+    let event: GammaEvent = serde_json::from_str(&body)
+        .with_context(|| format!("gamma API JSON parse failed for {}, body: {}", slug, &body[..body.len().min(300)]))?;
 
     // Find the market with YES/NO outcomes
     let market = event.markets.iter().find(|m| {
