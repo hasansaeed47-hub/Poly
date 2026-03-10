@@ -427,18 +427,31 @@ async fn connect_cl_feed(
 
     info!("[CL] Feed connected, {} assets", assets.len());
 
-    while let Some(msg) = ws.next().await {
-        let msg = msg.context("CL WS message error")?;
-        if let Message::Text(text) = msg {
-            // Log raw WS message at trace level for replay
-            trace!("[CL_RAW] {}", text);
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                process_cl_message(&v, cl_prices, price_history, cl_log, params, health).await;
+    let (mut ws_tx, mut ws_rx) = ws.split();
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            msg = ws_rx.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        trace!("[CL_RAW] {}", text);
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                            process_cl_message(&v, cl_prices, price_history, cl_log, params, health).await;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {} // expected pong response
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(anyhow!("CL WS message error: {}", e)),
+                    None => return Ok(()),
+                }
+            }
+            _ = ping_interval.tick() => {
+                ws_tx.send(Message::Ping(vec![])).await.context("CL WS ping failed")?;
             }
         }
     }
-
-    Ok(())
 }
 
 async fn process_cl_message(
@@ -557,13 +570,12 @@ async fn connect_book_feed(
     let (ws, _) = connect_async(request).await.context("CLOB WS connect failed")?;
     let (mut ws_tx, mut ws_rx) = ws.split();
 
-    // Subscribe all known token IDs
+    // Subscribe all known token IDs using correct Polymarket CLOB WS format
     let ids: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
     if !ids.is_empty() {
         let sub = serde_json::json!({
-            "auth": {},
-            "type": "subscribe",
-            "markets": ids
+            "type": "market",
+            "assets_ids": ids
         });
         ws_tx.send(Message::Text(sub.to_string())).await?;
         info!("[BOOK] Subscribed to {} token IDs", ids.len());
@@ -575,19 +587,22 @@ async fn connect_book_feed(
         .as_secs();
     book_live.store(connect_ts, Ordering::Relaxed);
 
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
+    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
             // Handle incoming WS messages
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        // Log raw WS message at trace level for replay
                         trace!("[BOOK_RAW] {}", text);
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                             process_book_message(&v, book_state, book_log, health).await;
                         }
                     }
-                    Some(Ok(_)) => {} // ping/pong/binary
+                    Some(Ok(Message::Pong(_))) => {} // expected pong response
+                    Some(Ok(_)) => {} // ping/binary
                     Some(Err(e)) => return Err(e.into()),
                     None => return Ok(()), // stream closed
                 }
@@ -597,14 +612,17 @@ async fn connect_book_feed(
                 if let Some(tokens) = new_tokens {
                     if !tokens.is_empty() {
                         let sub = serde_json::json!({
-                            "auth": {},
-                            "type": "subscribe",
-                            "markets": tokens
+                            "type": "market",
+                            "assets_ids": tokens
                         });
                         ws_tx.send(Message::Text(sub.to_string())).await?;
                         info!("[BOOK] Subscribed {} new tokens", tokens.len());
                     }
                 }
+            }
+            // Keepalive ping every 5s
+            _ = ping_interval.tick() => {
+                ws_tx.send(Message::Ping(vec![])).await.context("BOOK WS ping failed")?;
             }
         }
     }
