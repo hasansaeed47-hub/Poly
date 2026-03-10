@@ -414,20 +414,24 @@ async fn connect_cl_feed(
     request.headers_mut().insert("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36".parse().unwrap());
     let (mut ws, _) = connect_async(request).await.context("CL WS connect failed")?;
 
-    // Build Chainlink symbol filters: "eth/usd" format
-    let filters: Vec<String> = assets.iter()
-        .map(|a| format!("{}/usd", a.to_lowercase()))
-        .collect();
+    // Subscribe to each asset's Chainlink feed
+    // filters must be a JSON-stringified object, e.g. "{\"symbol\":\"eth/usd\"}"
+    let mut subscriptions = Vec::new();
+    for asset in assets {
+        let symbol = format!("{}/usd", asset.to_lowercase());
+        let filter = serde_json::json!({"symbol": symbol}).to_string();
+        subscriptions.push(serde_json::json!({
+            "topic": "crypto_prices_chainlink",
+            "type": "update",
+            "filters": filter
+        }));
+    }
     let sub = serde_json::json!({
         "action": "subscribe",
-        "subscriptions": [{
-            "topic": "crypto_prices_chainlink",
-            "type": "*",
-            "filters": filters.join(",")
-        }]
+        "subscriptions": subscriptions
     });
     ws.send(Message::Text(sub.to_string())).await?;
-    debug!("[CL] Subscribed to {:?}", filters);
+    debug!("[CL] Subscribed to {} assets", assets.len());
 
     info!("[CL] Feed connected, {} assets", assets.len());
 
@@ -445,14 +449,13 @@ async fn connect_cl_feed(
                             process_cl_message(&v, cl_prices, price_history, cl_log, params, health).await;
                         }
                     }
-                    Some(Ok(Message::Pong(_))) => {} // expected pong response
-                    Some(Ok(_)) => {}
+                    Some(Ok(_)) => {} // pong/ping/binary
                     Some(Err(e)) => return Err(anyhow!("CL WS message error: {}", e)),
                     None => return Ok(()),
                 }
             }
             _ = ping_interval.tick() => {
-                ws_tx.send(Message::Ping(vec![])).await.context("CL WS ping failed")?;
+                ws_tx.send(Message::Text("ping".to_string())).await.context("CL WS ping failed")?;
             }
         }
     }
