@@ -26,9 +26,7 @@ use url::Url;
 
 // -- Constants ----------------------------------------------------------------
 
-const BOOK_BATCH_SIZE:   usize = 20;
-const REST_THROTTLE_MS:  u64   = 500;
-const WS_RECONNECT_SECS: u64   = 5;
+const WS_RECONNECT_SECS: u64 = 5;
 
 // -- Shared state types -------------------------------------------------------
 
@@ -104,17 +102,23 @@ impl BookEntry {
     }
 }
 
-/// Market metadata fetched once at startup
+/// Market metadata — one per active window
 #[derive(Debug, Clone)]
 pub struct MarketMeta {
-    pub slug:         String,
-    pub asset:        String,
-    pub tf:           u32,
-    pub window_start: u64,
-    pub window_end:   u64,
-    pub token_yes:    String,
-    pub token_no:     String,
-    pub open_price:   f64,
+    pub slug:          String,
+    pub asset:         String,
+    pub tf:            u32,
+    pub window_start:  u64,
+    pub window_end:    u64,
+    pub token_yes:     String,
+    pub token_no:      String,
+    // Open price tracking
+    pub open_price:    f64,   // CL price at window start (0 = not yet captured)
+    pub open_cl_ts:    f64,   // CL timestamp of the open price tick
+    pub open_missed:   bool,  // true if we were too late to capture open reliably
+    // Settle price tracking
+    pub settle_price:  f64,   // CL price captured at window end (0 = not yet captured)
+    pub settle_cl_ts:  f64,   // CL timestamp of the settle price tick
 }
 
 // -- Gamma API response types -------------------------------------------------
@@ -324,7 +328,11 @@ pub async fn fetch_market_meta(
         window_end,
         token_yes,
         token_no,
-        open_price: 0.0,
+        open_price:   0.0,
+        open_cl_ts:   0.0,
+        open_missed:  false,
+        settle_price: 0.0,
+        settle_cl_ts: 0.0,
     }))
 }
 

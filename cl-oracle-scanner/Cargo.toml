@@ -1,6 +1,6 @@
 [package]
-name    = "cl_oracle_scanner"
-version = "1.0.0"
+name    = "lag_scanner"
+version = "2.0.0"
 edition = "2021"
 
 [dependencies]
