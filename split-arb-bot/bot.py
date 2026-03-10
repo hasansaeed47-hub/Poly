@@ -628,8 +628,10 @@ class PolyClient:
             for wm in windows:
                 iv = wm * 60
                 s0 = (now // iv) * iv
+                # s0 = current open window; s0+iv = next (not yet started)
+                # Include current + next so we subscribe early
                 for st in [s0, s0 + iv]:
-                    if st + iv < now:
+                    if st + iv < now:       # already ended
                         continue
                     slugs.append(f"{asset}-updown-{wm}m-{st}")
 
