@@ -1,17 +1,24 @@
 # Split-Sell Arbitrage Paper Trading Bot
-# Scans Polymarket binary markets for YES + NO > $1.00 opportunities
+# WebSocket-driven with 500ms arb scan tick
+# Targets ALL binary markets — 5m crypto windows are highest-frequency arb source
 
 [api]
-# Polymarket CLOB REST
+# Polymarket CLOB REST (discovery + initial snapshots only)
 clob_rest = "https://clob.polymarket.com"
+# Polymarket CLOB WebSocket (real-time book updates)
+clob_ws = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 # Gamma API (market discovery)
 gamma_api = "https://gamma-api.polymarket.com"
-# Throttle between REST calls (ms)
+# Throttle between REST calls (ms) — only affects discovery, not scan tick
 throttle_ms = 400
 
 [scan]
-# How often to scan all tracked markets (seconds)
-interval_secs = 5
+# Arb scan tick interval (milliseconds) — how fast we check all books
+# 500ms = 2 scans/second, continuously checking for YES+NO > $1.00
+interval_ms = 500
+# REST discovery interval — find new markets (seconds)
+# Markets don't appear/disappear fast, so 60s is fine
+discovery_interval_secs = 60
 # Max markets to track simultaneously
 max_markets = 200
 # Gamma API: how many events per page
@@ -29,12 +36,14 @@ max_stake = 25.0
 # Min profit after fees to trigger entry (cents)
 min_profit_cents = 1.5
 # Taker fee rate (Polymarket max — 1.56% at 50c, 0% at 0c/100c)
-# We model the real fee curve, this is the max cap
 max_taker_fee_rate = 0.02
 # Simulated fill slippage (bps off best bid)
 slippage_bps = 10
 # Simulated execution delay (seconds) — relayer confirmation
 exec_delay_secs = 2.0
+# Cooldown per market: don't re-arb same market within N seconds
+# Prevents hammering the same mispriced book before it corrects
+cooldown_secs = 5.0
 
 [logging]
 # JSONL trade log
