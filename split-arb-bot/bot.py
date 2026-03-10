@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import sys
 import time
 from collections import defaultdict
@@ -1031,13 +1032,23 @@ async def run(cfg: dict):
     book_feed = BookFeed(clob_ws_url, tracked)
     ws_task = asyncio.create_task(book_feed.run())
 
+    # -- Graceful shutdown on SIGTERM/SIGINT ------------------------------------
+    shutdown_event = asyncio.Event()
+
+    def _signal_handler(sig, _frame):
+        logging.info("Received %s — shutting down gracefully...", signal.Signals(sig).name)
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+
     # -- Phase 4: 500ms scan loop + periodic REST discovery --------------------
     last_discovery = time.time()
     scan_count = 0
     scan_tick = scan_interval_ms / 1000.0  # 0.5s
 
     try:
-        while True:
+        while not shutdown_event.is_set():
             loop_start = time.time()
             scan_count += 1
 
