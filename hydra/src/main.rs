@@ -1,5 +1,5 @@
-//! Hydra — 10-strategy paper tracker for Polymarket 5m/15m markets
-//! A02/A05/A10: CL favorite | S2: Contrarian | S3a-3E: Both-sides | S4: 5m→15m
+//! Hydra — 7-strategy paper tracker for Polymarket 5m/15m markets
+//! S2: Contrarian | S3a-3E: Both-sides | S4: 5m→15m
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -14,8 +14,6 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info};
 
 const ASSETS: &[&str] = &["btc", "eth", "sol", "xrp"];
-const STDEV: &[(&str, f64)] = &[("btc",0.167),("eth",0.194),("sol",0.247),("xrp",0.440)];
-const STDEV_BASE: f64 = 0.167;
 const STAKE_1: f64 = 5.0;
 const STAKE_2: f64 = 10.0;
 const START_CAP: f64 = 100.0;
@@ -29,7 +27,6 @@ const BN_WS: &str = "wss://stream.binance.com:9443/ws";
 const GAMMA: &str = "https://gamma-api.polymarket.com";
 const CLOB: &str = "https://clob.polymarket.com";
 
-fn stdev(a: &str) -> f64 { STDEV.iter().find(|(k,_)| *k==a).map(|(_,v)| *v).unwrap_or(STDEV_BASE) }
 fn fee(px: f64) -> f64 { px * (1.0 - px) * 0.0625 }
 
 type SS = Arc<RwLock<State>>;
@@ -61,14 +58,6 @@ impl State {
             if d > 0 { if let Some(&p) = s.get(&(t-d)) { return Some(p); } }
         }
         None
-    }
-    fn bn_trend(&self, a: &str, sec: u64) -> Option<f64> {
-        let h = self.bnh.get(a)?;
-        if h.len() < 2 { return None; }
-        let now = Utc::now().timestamp_millis() as f64 / 1000.0;
-        let old = h.iter().find(|(t,_)| *t >= now - sec as f64)?;
-        if old.1 <= 0.0 { return None; }
-        Some((h.back()?.1 - old.1) / old.1 * 100.0)
     }
 }
 
@@ -220,7 +209,7 @@ struct Hydra { st: SS, scan: Scan, bk: BkC, s: HashMap<&'static str, Strat>,
 impl Hydra {
     fn new(st: SS, scan: Scan, bk: BkC) -> Self {
         let mut s = HashMap::new();
-        for id in ["A02","A05","A10","A1_02","A1_05","A1_10","S2","S3a","S3b","S3C","S3D","S3E","S4"] { s.insert(id, Strat::new(id)); }
+        for id in ["S2","S3a","S3b","S3C","S3D","S3E","S4"] { s.insert(id, Strat::new(id)); }
         Hydra { st, scan, bk, s, cl_o: HashMap::new(), sub_r: HashMap::new(), start: Instant::now() }
     }
 
@@ -240,7 +229,6 @@ impl Hydra {
           }}
         }
 
-        self.eval_a(&wins).await;
         self.eval_s2(&wins).await;
         self.eval_s3a(&wins).await;
         self.eval_s3(&wins).await;
@@ -252,69 +240,6 @@ impl Hydra {
         self.cl_o.retain(|k,_| k.rsplit('-').next().and_then(|s|s.parse::<i64>().ok()).map(|t|t>c).unwrap_or(false));
         self.sub_r.retain(|k,_| k.rsplit('-').next().and_then(|s|s.parse::<i64>().ok()).map(|t|t>c).unwrap_or(false));
         for st in self.s.values_mut() { st.done.retain(|k| k.rsplit('-').next().and_then(|s|s.parse::<i64>().ok()).map(|t|t>c).unwrap_or(false)); }
-    }
-
-    async fn eval_a(&mut self, wins: &[Win]) {
-        let s = self.st.read().await;
-        let mut rng = rand::thread_rng();
-        for w in wins {
-            if w.wmin != 5 { continue; }
-            let left = w.left(); if left>57||left<44 { continue; }
-            let co = match self.cl_o.get(&w.slug) { Some(&p) if p>0.0=>p, _=>continue };
-            let cn = match s.cl.get(w.asset) { Some(&p) if p>0.0=>p, _=>continue };
-            let delta = (cn-co)/co*100.0;
-            if delta.abs()<0.001 { continue; }
-            let dir = if delta>0.0 {"UP"} else {"DOWN"};
-            let tid = if dir=="UP" {&w.tid_up} else {&w.tid_down};
-            let bk = self.bk.get(tid);
-            if !bk.ha||bk.ba<MIN_ENTRY||bk.ba>MAX_ENTRY { continue; }
-            let ad = delta.abs();
-            let sc = stdev(w.asset)/STDEV_BASE;
-
-            // BN contra (for A1 variants)
-            let bn = s.bn_trend(w.asset, 15);
-            let bn_ok = if let Some(bt) = bn {
-                !((dir=="UP" && bt < -0.02) || (dir=="DOWN" && bt > 0.02))
-            } else { true };
-
-            // A02/A05/A10: NO BN filter
-            for (id,th) in [("A02",0.02),("A05",0.05),("A10",0.10)] {
-                if ad < th*sc { continue; }
-                let st = self.s.get_mut(id).expect("s");
-                if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_1 { continue; }
-                let mk = ((bk.ba-0.01)*100.0).round()/100.0;
-                let fp = if mk>=bk.ba||rng.gen::<f64>()<FILL_PROB { mk } else if left<=45 { bk.ba+SLIP } else { continue };
-                if fp>MAX_ENTRY { continue; }
-                let sh = STAKE_1/fp;
-                st.cap -= STAKE_1;
-                st.active.insert(w.slug.clone(), PT { id, slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
-                    dir:dir.into(), px:fp, shares:sh, dir2:String::new(), px2:0.0, sh2:0.0,
-                    end_ts:w.end_ts, sl:fp*SL_PCT, dumped:false, dump_px:0.0, wsold:false, wpx:0.0,
-                    tid_up:w.tid_up.clone(), tid_dn:w.tid_down.clone() });
-                st.done.insert(w.slug.clone());
-                info!("[{}] ENTRY {} {} T-{}s @{:.3} d={:+.3}%", id, dir, w.asset.to_uppercase(), left, fp, delta);
-            }
-
-            // A1_02/A1_05/A1_10: WITH BN contra filter
-            if bn_ok {
-                for (id,th) in [("A1_02",0.02),("A1_05",0.05),("A1_10",0.10)] {
-                    if ad < th*sc { continue; }
-                    let st = self.s.get_mut(id).expect("s");
-                    if st.done.contains(&w.slug)||st.active.contains_key(&w.slug)||st.cap<STAKE_1 { continue; }
-                    let mk = ((bk.ba-0.01)*100.0).round()/100.0;
-                    let fp = if mk>=bk.ba||rng.gen::<f64>()<FILL_PROB { mk } else if left<=45 { bk.ba+SLIP } else { continue };
-                    if fp>MAX_ENTRY { continue; }
-                    let sh = STAKE_1/fp;
-                    st.cap -= STAKE_1;
-                    st.active.insert(w.slug.clone(), PT { id, slug:w.slug.clone(), asset:w.asset, wmin:w.wmin,
-                        dir:dir.into(), px:fp, shares:sh, dir2:String::new(), px2:0.0, sh2:0.0,
-                        end_ts:w.end_ts, sl:fp*SL_PCT, dumped:false, dump_px:0.0, wsold:false, wpx:0.0,
-                        tid_up:w.tid_up.clone(), tid_dn:w.tid_down.clone() });
-                    st.done.insert(w.slug.clone());
-                    info!("[{}] ENTRY {} {} T-{}s @{:.3} d={:+.3}%", id, dir, w.asset.to_uppercase(), left, fp, delta);
-                }
-            }
-        }
     }
 
     async fn eval_s2(&mut self, wins: &[Win]) {
@@ -425,7 +350,7 @@ impl Hydra {
                 let t = match st.active.get(&slug) { Some(t)=>t.clone(), None=>continue };
                 let left = t.end_ts - now;
 
-                // Single-side: A02/A05/A10, S2, S4
+                // Single-side: S2, S4
                 if t.dir2.is_empty() {
                     // SL: CL flip
                     if t.sl > 0.0 {
@@ -544,7 +469,7 @@ impl Hydra {
 
     fn status(&self) -> String {
         let mut p = Vec::new();
-        for id in ["A02","A05","A10","A1_02","A1_05","A1_10","S2","S3a","S3b","S3C","S3D","S3E","S4"] {
+        for id in ["S2","S3a","S3b","S3C","S3D","S3E","S4"] {
             if let Some(st) = self.s.get(id) {
                 if st.t()>0||!st.active.is_empty() {
                     p.push(format!("{}:{}W/{}L${:+.1}", id, st.w, st.l, st.pnl));
@@ -560,11 +485,10 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter("hydra=info").with_target(false).init();
     dotenvy::dotenv().ok();
     info!("══════════════════════════════════════════════════════════");
-    info!("  HYDRA — 13-Strategy Paper Tracker");
-    info!("  A02/A05/A10: CL δ (no BN) | A1_02/05/10: +BN contra");
+    info!("  HYDRA — 7-Strategy Paper Tracker");
     info!("  S2: Contrarian ≤$0.40 | S3a: Arb <$0.98");
-    info!("  S3b/3C: Dump T-30 | S3D: Dump@0.10 | S3E: Safe exit");
-    info!("  S4: 5m→15m 2/3 confirm");
+    info!("  S3b: Dump T-30 (delta) | S3C: Dump T-30 (fixed 0.35)");
+    info!("  S3D: Dump@0.10 | S3E: Safe exit | S4: 5m→15m 2/3");
     info!("  ${}/{} stake | ${}/strat | SL {}%", STAKE_1, STAKE_2, START_CAP, SL_PCT*100.0);
     info!("══════════════════════════════════════════════════════════");
 
