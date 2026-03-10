@@ -183,6 +183,7 @@ impl RunnerStats {
 pub struct ConfigRunner {
     pub config:    RunnerConfig,
     pub stake:     f64,
+    pub tf_filter: u32,  // only trade this timeframe (5 or 15)
     min_secs:      f64,
     positions:     HashMap<String, PaperPosition>, // trade_id → position
     stats:         RunnerStats,
@@ -190,7 +191,7 @@ pub struct ConfigRunner {
 }
 
 impl ConfigRunner {
-    pub fn new(config: RunnerConfig, stake: f64, min_secs: f64, log_dir: &str) -> Self {
+    pub fn new(config: RunnerConfig, stake: f64, tf_filter: u32, min_secs: f64, log_dir: &str) -> Self {
         let log_path = format!("{}/{}.jsonl", log_dir, config.name.to_lowercase());
         let file = OpenOptions::new()
             .create(true)
@@ -198,11 +199,12 @@ impl ConfigRunner {
             .open(&log_path)
             .unwrap_or_else(|e| panic!("Cannot open log {}: {}", log_path, e));
 
-        info!("[{}] Log: {} max_pos={} max_exp=${}", config.name, log_path, config.max_positions, config.max_exposure);
+        info!("[{}] Log: {} tf={}m max_pos={} max_exp=${}", config.name, log_path, tf_filter, config.max_positions, config.max_exposure);
 
         Self {
             config,
             stake,
+            tf_filter,
             min_secs,
             positions: HashMap::new(),
             stats: RunnerStats::default(),
@@ -243,6 +245,11 @@ impl ConfigRunner {
     // ── Private ───────────────────────────────────────────────────────────────
 
     async fn maybe_enter(&mut self, sig: &Signal, window_end: u64) {
+        // Timeframe filter — only trade matching window length
+        if sig.tf != self.tf_filter {
+            return;
+        }
+
         self.stats.signals += 1;
 
         // Time gate — use config min_secs, not hardcoded
@@ -564,6 +571,27 @@ impl ConfigRunner {
             .collect()
     }
 
+    /// Print per-window result after settlement
+    pub fn print_window_result(&self, slug: &str, winning_side: Side) {
+        // Only print if this runner's tf matches the slug's window
+        info!(
+            "[{}] {} winner={} | sig={} entries={} W={} L={} WR={:.1}% net={:+.2} fee={:.2} settle={} sl={} tp={} peak={:+.2} dd={:.2}",
+            self.config.name, slug, winning_side,
+            self.stats.signals,
+            self.stats.entries,
+            self.stats.wins,
+            self.stats.losses,
+            self.stats.wr(),
+            self.stats.net_pnl,
+            self.stats.total_fee,
+            self.stats.settlement_exits,
+            self.stats.stop_loss_exits,
+            self.stats.take_profit_exits,
+            self.stats.peak_pnl,
+            self.stats.max_drawdown,
+        );
+    }
+
     /// Flush log file (for graceful shutdown)
     pub async fn flush(&self) {
         let mut file = self.log_file.lock().await;
@@ -624,7 +652,7 @@ mod tests {
         let dir = std::env::temp_dir();
         ConfigRunner::new(
             make_config(name, min_edge, max_secs, sl, tp),
-            5.0, 60.0,
+            5.0, 5, 60.0,
             dir.to_str().unwrap(),
         )
     }
@@ -667,7 +695,7 @@ mod tests {
             max_exposure: 1000.0,
         };
         let dir = std::env::temp_dir();
-        let mut runner = ConfigRunner::new(cfg, 5.0, 60.0, dir.to_str().unwrap());
+        let mut runner = ConfigRunner::new(cfg, 5.0, 5, 60.0, dir.to_str().unwrap());
 
         let sig1 = make_signal("btc-updown-5m-test1", 0.80, 0.50, 0.49, 300.0, 1000.0);
         runner.on_signal(&sig1, 1300).await;

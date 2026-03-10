@@ -278,13 +278,26 @@ async fn main() -> Result<()> {
     // ── Build runners ─────────────────────────────────────────────────────────
 
     let min_secs = cfg.scan.min_secs;
-    let mut runners = vec![
-        ConfigRunner::new(cfg.configs.c1.clone(), cfg.paper.stake, min_secs, "logs"),
-        ConfigRunner::new(cfg.configs.c2.clone(), cfg.paper.stake, min_secs, "logs"),
-        ConfigRunner::new(cfg.configs.c3.clone(), cfg.paper.stake, min_secs, "logs"),
-        ConfigRunner::new(cfg.configs.c4.clone(), cfg.paper.stake, min_secs, "logs"),
-        ConfigRunner::new(cfg.configs.c5.clone(), cfg.paper.stake, min_secs, "logs"),
+    let stake = cfg.paper.stake;
+
+    // Create 10 runners: each config × 2 timeframes (5m and 15m)
+    let base_configs = vec![
+        cfg.configs.c1.clone(),
+        cfg.configs.c2.clone(),
+        cfg.configs.c3.clone(),
+        cfg.configs.c4.clone(),
+        cfg.configs.c5.clone(),
     ];
+    let mut runners: Vec<ConfigRunner> = Vec::new();
+    for base in &base_configs {
+        for &tf in &cfg.feed.timeframes {
+            let mut config = base.clone();
+            config.name = format!("{}_{:02}m", base.name, tf);
+            runners.push(ConfigRunner::new(config, stake, tf, min_secs, "logs"));
+        }
+    }
+    info!("Created {} runners ({} configs × {} timeframes)",
+        runners.len(), base_configs.len(), cfg.feed.timeframes.len());
 
     // ── Warmup gate ───────────────────────────────────────────────────────────
 
@@ -459,6 +472,14 @@ async fn main() -> Result<()> {
                     runner.on_settlement(slug, winning_side, now).await;
                 }
 
+                // Print per-window results for runners matching this timeframe
+                info!("── WINDOW RESULT: {} ──", slug);
+                for runner in &runners {
+                    if runner.tf_filter == meta.tf {
+                        runner.print_window_result(slug, winning_side);
+                    }
+                }
+
                 settled.insert(slug.clone(), true);
             }
         }
@@ -616,9 +637,9 @@ async fn main() -> Result<()> {
 
         // ── Periodic stats print (every 60s) ──────────────────────────────────
 
-        if now - last_stats_ts >= 60.0 {
+        if now - last_stats_ts >= 300.0 {
             last_stats_ts = now;
-            info!("──────────────────────────────────────────────────────");
+            info!("══════════════════════ CUMULATIVE STATS ══════════════════════");
             for runner in &runners {
                 runner.print_stats();
             }
