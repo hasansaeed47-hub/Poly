@@ -21,7 +21,8 @@ book_batch_size = 100
 interval_ms = 500
 # REST discovery interval — find new markets (seconds)
 # Markets don't appear/disappear fast, so 60s is fine
-discovery_interval_secs = 60
+# Crypto windows rotate every 5min, so discover frequently
+discovery_interval_secs = 30
 # Max markets to track simultaneously
 max_markets = 200
 # Gamma API: how many events per page
@@ -65,4 +66,4 @@ trade_log = "logs/trades.jsonl"
 # JSONL scan log (all opportunities seen)
 scan_log = "logs/scans.jsonl"
 # Console log level: DEBUG, INFO, WARN, ERROR
-level = "DEBUG"
+level = "INFO"
