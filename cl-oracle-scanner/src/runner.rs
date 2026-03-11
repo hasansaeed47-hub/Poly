@@ -30,7 +30,6 @@ pub struct MarketWindow<'a> {
     pub slug:       &'a str,
     pub asset:      &'a str,
     pub wmin:       u32,
-    pub start_ts:   i64,
     pub end_ts:     i64,
     pub tid_up:     &'a str,
     pub tid_dn:     &'a str,

@@ -174,7 +174,6 @@ impl BookEntry {
 /// Market metadata — one per active window
 #[derive(Debug, Clone)]
 pub struct MarketMeta {
-    pub slug:          String,
     pub asset:         String,
     pub tf:            u32,
     pub window_start:  u64,
@@ -185,9 +184,6 @@ pub struct MarketMeta {
     pub open_price:    f64,   // CL price at window start (0 = not yet captured)
     pub open_cl_ts:    f64,   // CL timestamp of the open price tick
     pub open_missed:   bool,  // true if we were too late to capture open reliably
-    // Settle price tracking
-    pub settle_price:  f64,   // CL price captured at window end (0 = not yet captured)
-    pub settle_cl_ts:  f64,   // CL timestamp of the settle price tick
 }
 
 // -- Gamma API response types -------------------------------------------------
@@ -199,6 +195,7 @@ struct GammaEvent {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct GammaMarket {
     condition_id:   Option<String>,
     #[serde(default, deserialize_with = "deserialize_string_or_vec")]
@@ -380,7 +377,6 @@ pub async fn fetch_market_meta(
     let window_end = window_start + (tf as u64 * 60);
 
     Ok(Some(MarketMeta {
-        slug: slug.to_string(),
         asset: asset.to_string(),
         tf,
         window_start,
@@ -390,8 +386,6 @@ pub async fn fetch_market_meta(
         open_price:   0.0,
         open_cl_ts:   0.0,
         open_missed:  false,
-        settle_price: 0.0,
-        settle_cl_ts: 0.0,
     }))
 }
 
