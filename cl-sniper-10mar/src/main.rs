@@ -610,8 +610,16 @@ impl Sniper {
                 let now = Utc::now().timestamp();
 
                 // SL: bid ≤ 50% of fill
+                // Skip SL in last 15s — books get thin near settlement causing false triggers
+                let secs_left = pt.end_ts - now;
+                let sl_enabled = if tr.cfg.is_late_scalper {
+                    false  // Engine E: never SL — too little time, hold to settlement
+                } else {
+                    secs_left > 15  // A-D: disable SL in last 15s
+                };
+
                 let bk = self.bk.get(&pt.tid);
-                if bk.hb && bk.bb <= pt.sl_px {
+                if sl_enabled && bk.hb && bk.bb <= pt.sl_px {
                     let recovery = pt.shares * (bk.bb - SLIP).max(0.0);
                     let exit_fee = pm_fee(bk.bb) * pt.shares;
                     let pnl = recovery - STAKE - pt.entry_fee - exit_fee;
