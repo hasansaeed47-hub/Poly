@@ -3,20 +3,22 @@
 /// Usage (from cl-oracle-scanner/):
 ///   cargo build --release --bin test_order
 ///   # Windows:
-///   set RUST_LOG=test_order=debug,lag_scanner=debug && target\release\test_order.exe
+///   set RUST_LOG=test_order=info,lag_scanner=info && target\release\test_order.exe
 ///   # Linux/Mac:
-///   RUST_LOG=test_order=debug,lag_scanner=debug ./target/release/test_order
+///   RUST_LOG=test_order=info,lag_scanner=info ./target/release/test_order
 ///
-/// Reads wallet/API creds from config.toml (or .env / env vars).
-/// Places a $0.50 BUY @ 0.50 on a known active BTC 5m market.
-/// The order is GTC so it will sit on the book — cancel manually if needed.
+/// Uses the exact same market discovery as the main scanner (build_slug +
+/// fetch_market_meta via Gamma API). Places a $0.50 GTC BUY on the first
+/// active BTC 5m market it finds.
+
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use tracing::{info, warn, error};
+use tracing::{info, error};
 use tracing_subscriber::EnvFilter;
 
-// Re-use library modules from the main crate
+use lag_scanner::feeds::{build_slug, current_window_starts, fetch_market_meta, RateLimiter};
 use lag_scanner::order::{ApiCreds, ClobClient};
 use lag_scanner::wallet::Wallet;
 
@@ -36,55 +38,19 @@ struct WalletConfig {
     neg_risk:    Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct FeedConfig {
-    clob_rest: Option<String>,
     gamma_api: Option<String>,
-}
-
-/// Fetch current active token IDs for a BTC 5m market from Gamma API
-async fn fetch_active_token(gamma_url: &str) -> Result<(String, String)> {
-    let url = format!(
-        "{}/markets?slug_contains=btc&active=true&closed=false&limit=5",
-        gamma_url.trim_end_matches('/')
-    );
-    info!("Fetching active markets from: {}", url);
-
-    let resp: serde_json::Value = reqwest::get(&url).await?.json().await?;
-    let markets = resp.as_array().ok_or_else(|| anyhow!("Gamma response is not an array"))?;
-
-    for m in markets {
-        let q = m.get("question").and_then(|v| v.as_str()).unwrap_or("");
-        // Look for a short-duration (5m/15m) BTC up/down market
-        if q.to_lowercase().contains("btc") && q.to_lowercase().contains("up") {
-            if let Some(tokens) = m.get("tokens").and_then(|v| v.as_array()) {
-                for tok in tokens {
-                    let outcome = tok.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
-                    let tid = tok.get("token_id").and_then(|v| v.as_str()).unwrap_or("");
-                    if outcome == "Yes" && !tid.is_empty() {
-                        let cid = m.get("condition_id").and_then(|v| v.as_str()).unwrap_or("?");
-                        info!("Found market: {} (condition={})", q, cid);
-                        return Ok((tid.to_string(), q.to_string()));
-                    }
-                }
-            }
-        }
-    }
-
-    Err(anyhow!("No active BTC up/down market found on Gamma"))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Init tracing
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    // Load .env
     let _ = dotenvy::dotenv();
 
-    // Load config
     let cfg_text = std::fs::read_to_string("config.toml")
         .context("Cannot read config.toml — run from cl-oracle-scanner/ directory")?;
     let cfg: MiniConfig = toml::from_str(&cfg_text)
@@ -96,7 +62,6 @@ async fn main() -> Result<()> {
     let pk = wcfg.private_key.clone()
         .or_else(|| std::env::var("PRIVATE_KEY").ok())
         .ok_or_else(|| anyhow!("No private_key in config.toml or PRIVATE_KEY env var"))?;
-
     let api_key = wcfg.api_key.clone()
         .or_else(|| std::env::var("CLOB_API_KEY").ok())
         .ok_or_else(|| anyhow!("No api_key — set in config.toml or CLOB_API_KEY env"))?;
@@ -109,11 +74,9 @@ async fn main() -> Result<()> {
 
     let neg_risk = wcfg.neg_risk.unwrap_or(false)
         || std::env::var("NEG_RISK").unwrap_or_default() == "true";
-
     let base_url = wcfg.api_url.clone()
         .or_else(|| std::env::var("CLOB_API_URL").ok())
         .unwrap_or_else(|| "https://clob.polymarket.com".into());
-
     let gamma_url = cfg.feed
         .and_then(|f| f.gamma_api)
         .unwrap_or_else(|| "https://gamma-api.polymarket.com".into());
@@ -128,35 +91,67 @@ async fn main() -> Result<()> {
         api_passphrase: passphrase,
     };
     let client = ClobClient::new(&base_url, wallet, Some(creds), neg_risk);
+    info!("CLOB: {}  neg_risk: {}", base_url, neg_risk);
 
-    info!("CLOB base URL: {}", base_url);
-    info!("neg_risk: {}", neg_risk);
+    // -- Discover market using the same logic as the main scanner ---------------
+    let http = reqwest::Client::new();
+    let limiter = RateLimiter::new(200);
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
 
-    // Find an active token to trade
-    let (token_id, question) = match fetch_active_token(&gamma_url).await {
-        Ok(v) => v,
-        Err(e) => {
-            error!("Could not find active market: {}", e);
-            error!("You can manually set TOKEN_ID env var and re-run");
-            return Err(e);
+    let assets = ["btc", "eth", "sol", "xrp"];
+    let timeframes = [5u32, 15];
+
+    let mut token_id: Option<String> = None;
+    let mut market_desc = String::new();
+
+    info!("Discovering active markets via Gamma...");
+
+    'outer: for asset in &assets {
+        for &tf in &timeframes {
+            let windows = current_window_starts(tf, now_secs);
+            for ws in &windows {
+                let slug = build_slug(asset, tf, *ws);
+                match fetch_market_meta(&http, &gamma_url, &slug, asset, tf, &limiter).await {
+                    Ok(Some(meta)) => {
+                        info!("Found: {} → token_yes={}...{}", slug,
+                            &meta.token_yes[..8], &meta.token_yes[meta.token_yes.len()-8..]);
+                        token_id = Some(meta.token_yes.clone());
+                        market_desc = slug;
+                        break 'outer;
+                    }
+                    Ok(None) => {
+                        info!("  {} — not found", slug);
+                    }
+                    Err(e) => {
+                        info!("  {} — error: {}", slug, e);
+                    }
+                }
+            }
         }
-    };
+    }
+
+    let token_id = token_id.ok_or_else(|| anyhow!(
+        "No active up/down market found. Markets may be between windows."
+    ))?;
+
+    // -- Place test order -------------------------------------------------------
+    let price = 0.50;
+    let size  = 1.0;
 
     info!("═══════════════════════════════════════════════════════");
     info!("  TEST ORDER — FORCE TRADE");
     info!("═══════════════════════════════════════════════════════");
-    info!("  Market:   {}", question);
+    info!("  Market:   {}", market_desc);
     info!("  Token:    {}...{}", &token_id[..8], &token_id[token_id.len()-8..]);
     info!("  Side:     BUY");
-    info!("  Price:    0.50");
-    info!("  Size:     1.0 shares ($0.50 USDC)");
+    info!("  Price:    {}", price);
+    info!("  Size:     {} shares (${:.2} USDC)", size, size * price);
     info!("  Type:     GTC (limit)");
     info!("  neg_risk: {}", neg_risk);
     info!("═══════════════════════════════════════════════════════");
-
-    // Place a tiny GTC limit buy: 1 share @ $0.50 = $0.50 USDC
-    let price = 0.50;
-    let size  = 1.0;
 
     match client.place_limit_order(&token_id, price, size, "BUY").await {
         Ok(resp) => {
@@ -165,7 +160,7 @@ async fn main() -> Result<()> {
         }
         Err(e) => {
             error!("Order FAILED: {:#}", e);
-            warn!("Check: wallet funded? API creds valid? neg_risk correct?");
+            error!("Check: wallet funded? API creds valid? neg_risk correct?");
             return Err(e);
         }
     }
