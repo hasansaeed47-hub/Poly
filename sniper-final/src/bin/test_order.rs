@@ -18,7 +18,7 @@ use tracing::{info, error};
 use tracing_subscriber::EnvFilter;
 
 use sniper_final::feeds::{build_slug, current_window_starts, fetch_market_meta, RateLimiter};
-use sniper_final::order::ClobClient;
+use sniper_final::order::{ClobClient, ProxyConfig};
 use sniper_final::wallet::Wallet;
 
 #[derive(Deserialize)]
@@ -65,12 +65,28 @@ async fn main() -> Result<()> {
         .and_then(|f| f.gamma_api)
         .unwrap_or_else(|| "https://gamma-api.polymarket.com".into());
 
-    // Build wallet & SDK client
+    // Build wallet & SDK client (auto-detect proxy mode from POLY_FUNDER env var)
     let wallet = Wallet::from_hex(&pk)?;
     info!("Wallet: {}", wallet.address());
 
-    let client = ClobClient::new(&base_url, wallet);
-    info!("CLOB: {}", base_url);
+    let client = if let Ok(funder_hex) = std::env::var("POLY_FUNDER") {
+        let funder_addr: polymarket_client_sdk::types::Address = funder_hex.parse()
+            .context("invalid POLY_FUNDER address")?;
+        let creds = match (
+            std::env::var("CLOB_API_KEY").ok(),
+            std::env::var("CLOB_API_SECRET").ok(),
+            std::env::var("CLOB_PASSPHRASE").ok(),
+        ) {
+            (Some(k), Some(s), Some(p)) => Some((k, s, p)),
+            _ => None,
+        };
+        let proxy = ProxyConfig { funder: funder_addr, credentials: creds };
+        info!("CLOB: {} (PROXY mode, funder=0x{:x})", base_url, funder_addr);
+        ClobClient::new_with_proxy(&base_url, wallet, proxy)
+    } else {
+        info!("CLOB: {} (EOA mode)", base_url);
+        ClobClient::new(&base_url, wallet)
+    };
 
     // -- Discover market using the same logic as the main scanner ---------------
     let http = reqwest::Client::new();

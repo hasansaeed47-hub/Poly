@@ -40,7 +40,7 @@ use feeds::{
     build_slug, cl_at, current_window_starts, fetch_books_batch, fetch_market_meta, hour_range,
     run_bn_feed, run_book_feed, run_cl_feed, MarketMeta,
 };
-use order::ClobClient;
+use order::{ClobClient, ProxyConfig};
 use runner::{Tracker, MarketWindow};
 use wallet::Wallet;
 
@@ -160,7 +160,34 @@ async fn main() -> Result<()> {
             let base = wcfg.api_url.clone()
                 .or_else(|| std::env::var("CLOB_API_URL").ok())
                 .unwrap_or_else(|| "https://clob.polymarket.com".into());
-            let client = ClobClient::new(&base, w);
+
+            // Check for proxy/funder mode (Polymarket UI deposits)
+            let funder_opt = std::env::var("POLY_FUNDER").ok();
+            let client = if let Some(funder_hex) = funder_opt {
+                let funder_addr: polymarket_client_sdk::types::Address = funder_hex.parse()
+                    .context("invalid POLY_FUNDER address")?;
+
+                // Load existing API credentials if available
+                let creds = match (
+                    std::env::var("CLOB_API_KEY").ok(),
+                    std::env::var("CLOB_API_SECRET").ok(),
+                    std::env::var("CLOB_PASSPHRASE").ok(),
+                ) {
+                    (Some(k), Some(s), Some(p)) => Some((k, s, p)),
+                    _ => None,
+                };
+
+                let proxy = ProxyConfig {
+                    funder: funder_addr,
+                    credentials: creds,
+                };
+                info!("Proxy mode: funder=0x{:x}", funder_addr);
+                ClobClient::new_with_proxy(&base, w, proxy)
+            } else {
+                info!("EOA mode: direct wallet signing");
+                ClobClient::new(&base, w)
+            };
+
             Some(Arc::new(client))
         }
         None => {

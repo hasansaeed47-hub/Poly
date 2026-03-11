@@ -67,7 +67,14 @@ async fn main() -> Result<()> {
         .with_chain_id(Some(POLYGON));
 
     let wallet_address = signer.address();
-    info!("Wallet: 0x{:x}", wallet_address);
+    info!("Wallet (EOA): 0x{:x}", wallet_address);
+
+    // Check for proxy/funder address (Polymarket UI deposits)
+    let funder_address = std::env::var("POLY_FUNDER").ok()
+        .and_then(|h| h.parse::<Address>().ok());
+    if let Some(funder) = funder_address {
+        info!("Funder (proxy): 0x{:x}", funder);
+    }
 
     let provider = ProviderBuilder::new().connect(RPC_URL).await?;
 
@@ -77,11 +84,19 @@ async fn main() -> Result<()> {
     let usdc = IERC20::new(USDC_ADDRESS, provider.clone());
     let ctf = IERC1155::new(config.conditional_tokens, provider.clone());
 
-    // Check USDC balance
+    // Check USDC balance (EOA wallet)
     let balance = usdc.balanceOf(wallet_address).call().await
         .context("failed to check USDC balance")?;
     let balance_usdc = balance / U256::from(1_000_000);
-    info!("USDC balance: {} (raw: {})", balance_usdc, balance);
+    info!("EOA USDC balance: {} (raw: {})", balance_usdc, balance);
+
+    // Check USDC balance on funder/proxy address (Polymarket UI deposits)
+    if let Some(funder) = funder_address {
+        let funder_balance = usdc.balanceOf(funder).call().await
+            .context("failed to check funder USDC balance")?;
+        let funder_usdc = funder_balance / U256::from(1_000_000);
+        info!("Funder USDC balance: {} (raw: {})", funder_usdc, funder_balance);
+    }
 
     // Check MATIC balance (for gas)
     let matic_balance = provider.get_balance(wallet_address).await
