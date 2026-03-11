@@ -190,8 +190,10 @@ fn hmac_signature(
     body:      &str,
 ) -> Result<String> {
     let secret_bytes = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD, secret
+    ).or_else(|_| base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD, secret
-    ).context("invalid base64 API secret")?;
+    )).context("invalid base64 API secret")?;
 
     let message = format!("{}{}{}{}", timestamp, method, path, body);
 
