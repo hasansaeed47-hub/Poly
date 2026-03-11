@@ -189,13 +189,22 @@ fn hmac_signature(
     path:      &str,
     body:      &str,
 ) -> Result<String> {
+    let secret_trimmed = secret.trim();
+    debug!("[HMAC] secret len={} trimmed_len={} first4={:?}",
+        secret.len(), secret_trimmed.len(),
+        &secret_trimmed[..secret_trimmed.len().min(4)]);
+
     let secret_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE, secret
+        &base64::engine::general_purpose::URL_SAFE, secret_trimmed
     ).or_else(|_| base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD, secret
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD, secret_trimmed
     )).or_else(|_| base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD, secret
-    )).context("invalid base64 API secret")?;
+        &base64::engine::general_purpose::STANDARD, secret_trimmed
+    )).context(format!(
+        "invalid base64 API secret (len={}, bytes={:?})",
+        secret_trimmed.len(),
+        secret_trimmed.as_bytes().iter().take(8).collect::<Vec<_>>()
+    ))?;
 
     let message = format!("{}{}{}{}", timestamp, method, path, body);
 
@@ -496,6 +505,14 @@ mod tests {
         let sig2 = hmac_signature(&secret, "1234567890", "GET", "/test", "").unwrap();
         assert_eq!(sig1, sig2);
         assert!(!sig1.is_empty());
+    }
+
+    #[test]
+    fn hmac_with_real_url_safe_secret() {
+        // Test with an actual URL-safe base64 secret (same format as Polymarket API secrets)
+        let secret = "kdH3YtGkvmfB-giuNd5_I7dWwZt2WCbz-rZ6Ae0ZRK8=";
+        let result = hmac_signature(secret, "1234567890", "POST", "/order", "{\"test\":true}");
+        assert!(result.is_ok(), "HMAC with URL-safe secret failed: {:?}", result.err());
     }
 
     #[test]

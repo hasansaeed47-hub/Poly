@@ -207,9 +207,22 @@ async fn main() -> Result<()> {
             let passphrase = wcfg.passphrase.clone()
                 .or_else(|| std::env::var("CLOB_PASSPHRASE").ok());
 
+            // Validate base64 secret at startup, not at trade time
+            if let Some(ref sec) = api_secret {
+                let trimmed = sec.trim();
+                info!("API secret loaded: len={} last_char={:?}", trimmed.len(),
+                    trimmed.chars().last());
+                use base64::Engine;
+                let decode_ok = base64::engine::general_purpose::URL_SAFE.decode(trimmed).is_ok();
+                if !decode_ok {
+                    warn!("API secret fails base64 URL_SAFE decode! raw bytes: {:?}",
+                        trimmed.as_bytes());
+                }
+            }
+
             let creds = match (api_key, api_secret, passphrase) {
                 (Some(k), Some(s), Some(p)) => Some(order::ApiCreds {
-                    api_key: k, api_secret: s, api_passphrase: p,
+                    api_key: k, api_secret: s.trim().to_string(), api_passphrase: p,
                 }),
                 _ => None,
             };
