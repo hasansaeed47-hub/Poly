@@ -131,13 +131,18 @@ impl ClobClient {
 
         let sdk_side = if side.eq_ignore_ascii_case("BUY") { Side::Buy } else { Side::Sell };
 
+        // Truncate price to 2dp (tick size) and size to 2dp (lot size) to satisfy SDK validation.
+        // f64 → Decimal can introduce noise (e.g. 0.52 → 0.5200000000000001), which the SDK rejects
+        // if scale exceeds the tick/lot size.
         let price_dec = Decimal::try_from(price)
-            .context("invalid price")?;
+            .context("invalid price")?
+            .trunc_with_scale(2);
         let size_dec = Decimal::try_from(size)
-            .context("invalid size")?;
+            .context("invalid size")?
+            .trunc_with_scale(2);
 
-        debug!("[SDK] Building limit order: {} {} @ {} token={}...",
-            side, size, price, &token_id[..16.min(token_id.len())]);
+        debug!("[SDK] Building limit order: {} {} @ {} (dec price={} size={}) token={}...",
+            side, size, price, price_dec, size_dec, &token_id[..16.min(token_id.len())]);
 
         let order = client
             .limit_order()
@@ -180,12 +185,14 @@ impl ClobClient {
         let sdk_side = if side.eq_ignore_ascii_case("BUY") { Side::Buy } else { Side::Sell };
 
         let price_dec = Decimal::try_from(price)
-            .context("invalid price")?;
+            .context("invalid price")?
+            .trunc_with_scale(2);
         let size_dec = Decimal::try_from(size)
-            .context("invalid size")?;
+            .context("invalid size")?
+            .trunc_with_scale(2);
 
-        debug!("[SDK] Building market order: {} {} @ {} token={}...",
-            side, size, price, &token_id[..16.min(token_id.len())]);
+        debug!("[SDK] Building market order: {} {} @ {} (dec price={} size={}) token={}...",
+            side, size, price, price_dec, size_dec, &token_id[..16.min(token_id.len())]);
 
         let order = client
             .market_order()

@@ -547,15 +547,16 @@ async fn main() -> Result<()> {
                             // Live SL: sell position on CLOB
                             if let Some(ref clob) = clob_client {
                                 let c = clob.clone();
-                                let tid = result.slug.clone();
+                                let tid = result.tid.clone();
                                 let exit_px = result.exit_px;
                                 let shares = result.shares;
                                 let eid = result.engine_id.clone();
+                                let slug_s = result.slug.clone();
                                 tokio::spawn(async move {
                                     // Sell at exit_px (taker) to exit quickly
                                     match c.place_market_order(&tid, exit_px, shares, "SELL").await {
-                                        Ok(resp) => info!("[CLOB] [{}] SL SELL placed: {:?}", eid, resp),
-                                        Err(e) => warn!("[CLOB] [{}] SL SELL failed: {}", eid, e),
+                                        Ok(resp) => info!("[CLOB] [{}] SL SELL placed for {}: {:?}", eid, slug_s, resp),
+                                        Err(e) => warn!("[CLOB] [{}] SL SELL failed for {}: {}", eid, slug_s, e),
                                     }
                                 });
                             }

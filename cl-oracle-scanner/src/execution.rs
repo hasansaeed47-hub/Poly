@@ -49,6 +49,7 @@ pub struct TradeResult {
     pub entry_ts:    f64,
     pub exit_ts:     f64,
     pub wmin:        u32,
+    pub tid:         String,      // token ID of our side (for CLOB orders)
 }
 
 // -- Maker/taker entry --------------------------------------------------------
@@ -180,6 +181,7 @@ pub fn execute_sl(pos: &Position, our_bid: f64, exec: &ExecConfig, now: f64) -> 
         entry_ts:    pos.entry_ts,
         exit_ts:     now,
         wmin:        pos.wmin,
+        tid:         pos.tid.clone(),
     }
 }
 
@@ -253,6 +255,7 @@ pub fn execute_settlement(pos: &Position, actual_dir: &str, exec: &ExecConfig, n
         entry_ts:    pos.entry_ts,
         exit_ts:     now,
         wmin:        pos.wmin,
+        tid:         pos.tid.clone(),
     }
 }
 
