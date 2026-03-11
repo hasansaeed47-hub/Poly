@@ -22,7 +22,6 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
-use url::Url;
 
 // -- Constants ----------------------------------------------------------------
 
@@ -85,9 +84,9 @@ pub fn cl_trend(snapshots: &ClSnapshots, cl_prices: &ClPrices, asset: &str, secs
     let cut = now as i64 - secs as i64;
     let cur = cl_prices.get(asset)?.1;
     let old = s.iter()
-        .filter(|(&t, _)| t >= cut)
-        .min_by_key(|(&t, _)| t)
-        .map(|(_, &p)| p)?;
+        .filter(|(t, _)| *t >= &cut)
+        .min_by_key(|(t, _)| *t)
+        .map(|(_, p)| *p)?;
     if old <= 0.0 { return None; }
     Some((cur - old) / old * 100.0)
 }
@@ -100,7 +99,7 @@ pub fn hour_range(snapshots: &ClSnapshots, asset: &str) -> f64 {
         .unwrap_or_default()
         .as_secs_f64() as i64;
     let cut = now - 3600;
-    let prices: Vec<f64> = s.iter().filter(|(&t, _)| t > cut).map(|(_, &p)| p).collect();
+    let prices: Vec<f64> = s.iter().filter(|(t, _)| *t > &cut).map(|(_, p)| *p).collect();
     if prices.len() < 10 { return 999.0; }
     let hi = prices.iter().cloned().fold(f64::MIN, f64::max);
     let lo = prices.iter().cloned().fold(f64::MAX, f64::min);
@@ -515,8 +514,7 @@ async fn connect_cl_feed(
     cl_snapshots:  &ClSnapshots,
     price_history: &PriceHistory,
 ) -> Result<()> {
-    let url = Url::parse(live_ws).context("invalid live WS URL")?;
-    let (mut ws, _) = connect_async(url).await.context("CL WS connect failed")?;
+    let (mut ws, _) = connect_async(live_ws).await.context("CL WS connect failed")?;
 
     // RTDS subscription: single subscription with empty filter = ALL symbols.
     // Per-symbol filters don't work reliably on the RTDS API.
@@ -529,7 +527,7 @@ async fn connect_cl_feed(
             "filters": ""
         }]
     });
-    ws.send(Message::Text(sub.to_string())).await?;
+    ws.send(Message::Text(sub.to_string().into())).await?;
     debug!("[CL] Subscribe msg: {}", serde_json::to_string(&sub).unwrap_or_default());
 
     info!("[CL] Feed connected, watching {} assets: {:?}", assets.len(), assets);
@@ -542,7 +540,7 @@ async fn connect_cl_feed(
         tokio::select! {
             _ = ping_interval.tick() => {
                 ws.send(Message::Text(
-                    serde_json::json!({"action":"ping"}).to_string()
+                    serde_json::json!({"action":"ping"}).to_string().into()
                 )).await?;
             }
             msg = ws.next() => {
@@ -680,8 +678,7 @@ async fn connect_book_feed(
     book_state: &BookState,
     book_live:  &Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
-    let url = Url::parse(clob_ws).context("invalid CLOB WS URL")?;
-    let (mut ws, _) = connect_async(url).await.context("CLOB WS connect failed")?;
+    let (mut ws, _) = connect_async(clob_ws).await.context("CLOB WS connect failed")?;
 
     let ids: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
     if !ids.is_empty() {
@@ -695,7 +692,7 @@ async fn connect_book_feed(
             "custom_feature_enabled": true
         });
         debug!("[BOOK] Subscribe msg: {} tokens", ids.len());
-        ws.send(Message::Text(sub.to_string())).await?;
+        ws.send(Message::Text(sub.to_string().into())).await?;
         info!("[BOOK] Subscribed to {} token IDs", ids.len());
     }
 
@@ -714,7 +711,7 @@ async fn connect_book_feed(
     loop {
         tokio::select! {
             _ = ping_interval.tick() => {
-                ws.send(Message::Text("ping".to_string())).await?;
+                ws.send(Message::Text("ping".into())).await?;
             }
             msg = ws.next() => {
                 match msg {
@@ -930,8 +927,7 @@ async fn connect_bn_feed(
         .map(|a| format!("{}@aggTrade", bn_symbol(a)))
         .collect();
     let url = format!("{}/{}", bn_ws, streams.join("/"));
-    let parsed = Url::parse(&url).context("invalid BN WS URL")?;
-    let (mut ws, _) = connect_async(parsed).await.context("BN WS connect failed")?;
+    let (mut ws, _) = connect_async(&url).await.context("BN WS connect failed")?;
     info!("[BN] Connected, watching {} assets", assets.len());
 
     while let Some(msg) = ws.next().await {

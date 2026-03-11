@@ -100,6 +100,7 @@ struct ScanConfig {
 }
 
 #[derive(Deserialize, Debug, Default)]
+#[allow(dead_code)]
 struct WalletConfig {
     #[serde(default)]
     private_key:     Option<String>,
@@ -188,10 +189,12 @@ async fn main() -> Result<()> {
     };
 
     // -- Initialize CLOB client (config.toml [wallet] → env vars fallback) ----
+    //
+    // The official Polymarket SDK handles API key derivation, EIP-712 signing,
+    // and HMAC auth internally. We just need the private key.
 
     let wcfg = cfg.wallet.unwrap_or_default();
 
-    // Priority: config.toml [wallet] > env var > None
     let pk_opt = wcfg.private_key.clone()
         .or_else(|| std::env::var("PRIVATE_KEY").ok());
 
@@ -200,39 +203,10 @@ async fn main() -> Result<()> {
             let w = Wallet::from_hex(&pk).context("invalid private_key")?;
             info!("Wallet loaded: {}", w.address());
 
-            let api_key = wcfg.api_key.clone()
-                .or_else(|| std::env::var("CLOB_API_KEY").ok());
-            let api_secret = wcfg.api_secret.clone()
-                .or_else(|| std::env::var("CLOB_API_SECRET").ok());
-            let passphrase = wcfg.passphrase.clone()
-                .or_else(|| std::env::var("CLOB_PASSPHRASE").ok());
-
-            // Validate base64 secret at startup, not at trade time
-            if let Some(ref sec) = api_secret {
-                let trimmed = sec.trim();
-                info!("API secret loaded: len={} last_char={:?}", trimmed.len(),
-                    trimmed.chars().last());
-                use base64::Engine;
-                let decode_ok = base64::engine::general_purpose::URL_SAFE.decode(trimmed).is_ok();
-                if !decode_ok {
-                    warn!("API secret fails base64 URL_SAFE decode! raw bytes: {:?}",
-                        trimmed.as_bytes());
-                }
-            }
-
-            let creds = match (api_key, api_secret, passphrase) {
-                (Some(k), Some(s), Some(p)) => Some(order::ApiCreds {
-                    api_key: k, api_secret: s.trim().to_string(), api_passphrase: p,
-                }),
-                _ => None,
-            };
-
-            let neg_risk = wcfg.neg_risk.unwrap_or(false)
-                || std::env::var("NEG_RISK").unwrap_or_default() == "true";
             let base = wcfg.api_url.clone()
                 .or_else(|| std::env::var("CLOB_API_URL").ok())
                 .unwrap_or_else(|| "https://clob.polymarket.com".into());
-            let client = ClobClient::new(&base, w, creds, neg_risk);
+            let client = ClobClient::new(&base, w);
             Some(Arc::new(client))
         }
         None => {
@@ -244,7 +218,7 @@ async fn main() -> Result<()> {
     let live_mode = clob_client.is_some();
 
     info!("═══════════════════════════════════════════════════════");
-    info!("  CL SNIPER v3.0 — {}", if live_mode { "LIVE EXECUTION" } else { "PAPER MODE" });
+    info!("  CL SNIPER v4.0 — {}", if live_mode { "LIVE (SDK)" } else { "PAPER MODE" });
     info!("═══════════════════════════════════════════════════════");
     info!("  Assets: {:?}", cfg.feed.assets);
     info!("  Timeframes: {:?}m", cfg.feed.timeframes);
@@ -634,7 +608,7 @@ async fn main() -> Result<()> {
 
                 // Live entry: place BUY order on CLOB
                 if entered {
-                    if let (Some(ref clob), Some(ref pos)) = (&clob_client, &tr.active) {
+                    if let (Some(clob), Some(pos)) = (&clob_client, &tr.active) {
                         let c = clob.clone();
                         let tid = pos.tid.clone();
                         let px = pos.fill_px;

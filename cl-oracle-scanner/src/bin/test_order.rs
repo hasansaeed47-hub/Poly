@@ -1,4 +1,4 @@
-/// test_order.rs — Force-place a single tiny BUY order to verify CLOB connectivity.
+/// test_order.rs — Force-place a single tiny BUY order using official Polymarket SDK.
 ///
 /// Usage (from cl-oracle-scanner/):
 ///   cargo build --release --bin test_order
@@ -7,9 +7,8 @@
 ///   # Linux/Mac:
 ///   RUST_LOG=test_order=info,lag_scanner=info ./target/release/test_order
 ///
-/// Uses the exact same market discovery as the main scanner (build_slug +
-/// fetch_market_meta via Gamma API). Places a $0.50 GTC BUY on the first
-/// active BTC 5m market it finds.
+/// Uses the exact same market discovery as the main scanner. Places a $0.50 GTC BUY
+/// on the first active BTC 5m market it finds. Authentication is handled by the SDK.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -19,7 +18,7 @@ use tracing::{info, error};
 use tracing_subscriber::EnvFilter;
 
 use lag_scanner::feeds::{build_slug, current_window_starts, fetch_market_meta, RateLimiter};
-use lag_scanner::order::{ApiCreds, ClobClient};
+use lag_scanner::order::ClobClient;
 use lag_scanner::wallet::Wallet;
 
 #[derive(Deserialize)]
@@ -31,11 +30,7 @@ struct MiniConfig {
 #[derive(Deserialize, Default)]
 struct WalletConfig {
     private_key: Option<String>,
-    api_key:     Option<String>,
-    api_secret:  Option<String>,
-    passphrase:  Option<String>,
     api_url:     Option<String>,
-    neg_risk:    Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -58,22 +53,11 @@ async fn main() -> Result<()> {
 
     let wcfg = cfg.wallet.unwrap_or_default();
 
-    // Resolve credentials (config.toml > env vars)
+    // Only need private key — SDK handles API key derivation + auth
     let pk = wcfg.private_key.clone()
         .or_else(|| std::env::var("PRIVATE_KEY").ok())
         .ok_or_else(|| anyhow!("No private_key in config.toml or PRIVATE_KEY env var"))?;
-    let api_key = wcfg.api_key.clone()
-        .or_else(|| std::env::var("CLOB_API_KEY").ok())
-        .ok_or_else(|| anyhow!("No api_key — set in config.toml or CLOB_API_KEY env"))?;
-    let api_secret = wcfg.api_secret.clone()
-        .or_else(|| std::env::var("CLOB_API_SECRET").ok())
-        .ok_or_else(|| anyhow!("No api_secret — set in config.toml or CLOB_API_SECRET env"))?;
-    let passphrase = wcfg.passphrase.clone()
-        .or_else(|| std::env::var("CLOB_PASSPHRASE").ok())
-        .ok_or_else(|| anyhow!("No passphrase — set in config.toml or CLOB_PASSPHRASE env"))?;
 
-    let neg_risk = wcfg.neg_risk.unwrap_or(false)
-        || std::env::var("NEG_RISK").unwrap_or_default() == "true";
     let base_url = wcfg.api_url.clone()
         .or_else(|| std::env::var("CLOB_API_URL").ok())
         .unwrap_or_else(|| "https://clob.polymarket.com".into());
@@ -81,17 +65,12 @@ async fn main() -> Result<()> {
         .and_then(|f| f.gamma_api)
         .unwrap_or_else(|| "https://gamma-api.polymarket.com".into());
 
-    // Build wallet & client
+    // Build wallet & SDK client
     let wallet = Wallet::from_hex(&pk)?;
     info!("Wallet: {}", wallet.address());
 
-    let creds = ApiCreds {
-        api_key,
-        api_secret: api_secret.trim().to_string(),
-        api_passphrase: passphrase,
-    };
-    let client = ClobClient::new(&base_url, wallet, Some(creds), neg_risk);
-    info!("CLOB: {}  neg_risk: {}", base_url, neg_risk);
+    let client = ClobClient::new(&base_url, wallet);
+    info!("CLOB: {}", base_url);
 
     // -- Discover market using the same logic as the main scanner ---------------
     let http = reqwest::Client::new();
@@ -116,7 +95,7 @@ async fn main() -> Result<()> {
                 let slug = build_slug(asset, tf, *ws);
                 match fetch_market_meta(&http, &gamma_url, &slug, asset, tf, &limiter).await {
                     Ok(Some(meta)) => {
-                        info!("Found: {} → token_yes={}...{}", slug,
+                        info!("Found: {} -> token_yes={}...{}", slug,
                             &meta.token_yes[..8], &meta.token_yes[meta.token_yes.len()-8..]);
                         token_id = Some(meta.token_yes.clone());
                         market_desc = slug;
@@ -141,26 +120,25 @@ async fn main() -> Result<()> {
     let price = 0.50;
     let size  = 1.0;
 
-    info!("═══════════════════════════════════════════════════════");
-    info!("  TEST ORDER — FORCE TRADE");
-    info!("═══════════════════════════════════════════════════════");
+    info!("===============================================================");
+    info!("  TEST ORDER — OFFICIAL POLYMARKET SDK");
+    info!("===============================================================");
     info!("  Market:   {}", market_desc);
     info!("  Token:    {}...{}", &token_id[..8], &token_id[token_id.len()-8..]);
     info!("  Side:     BUY");
     info!("  Price:    {}", price);
     info!("  Size:     {} shares (${:.2} USDC)", size, size * price);
     info!("  Type:     GTC (limit)");
-    info!("  neg_risk: {}", neg_risk);
-    info!("═══════════════════════════════════════════════════════");
+    info!("===============================================================");
 
     match client.place_limit_order(&token_id, price, size, "BUY").await {
         Ok(resp) => {
             info!("Order placed successfully!");
-            info!("Response: {}", serde_json::to_string_pretty(&resp).unwrap_or_default());
+            info!("Response: {}", resp);
         }
         Err(e) => {
             error!("Order FAILED: {:#}", e);
-            error!("Check: wallet funded? API creds valid? neg_risk correct?");
+            error!("Check: wallet funded? Private key correct?");
             return Err(e);
         }
     }
