@@ -10,7 +10,7 @@
 /// - Minimum REST_THROTTLE_MS between any two REST calls
 /// - WebSocket feeds are event-driven — no polling
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,11 +33,80 @@ const WS_RECONNECT_SECS: u64 = 5;
 /// CL oracle prices: asset → (unix_ts, price)
 pub type ClPrices = Arc<DashMap<String, (f64, f64)>>;
 
+/// CL price snapshots: asset → HashMap<unix_ts_i64, price> (for cl_at lookups)
+pub type ClSnapshots = Arc<DashMap<String, HashMap<i64, f64>>>;
+
 /// PM order book: token_id → BookEntry (with full level tracking)
 pub type BookState = Arc<DashMap<String, BookEntry>>;
 
 /// CL price history for sigma: asset → Vec<(ts, price)>
 pub type PriceHistory = Arc<DashMap<String, Vec<(f64, f64)>>>;
+
+/// Binance prices: asset → latest price
+pub type BnPrices = Arc<DashMap<String, f64>>;
+
+/// Binance price history: asset → VecDeque<(ts, price)>
+pub type BnHistory = Arc<DashMap<String, VecDeque<(f64, f64)>>>;
+
+// -- BN/CL helper queries -----------------------------------------------------
+
+/// Get CL price snapshot at a specific timestamp (±3s tolerance)
+pub fn cl_at(snapshots: &ClSnapshots, asset: &str, t: i64) -> Option<f64> {
+    let s = snapshots.get(asset)?;
+    for off in [0i64, 1, -1, 2, -2, 3, -3] {
+        if let Some(&p) = s.get(&(t + off)) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Get Binance trend over last N seconds (% change)
+pub fn bn_trend(bn_hist: &BnHistory, asset: &str, secs: u64) -> Option<f64> {
+    let h = bn_hist.get(asset)?;
+    if h.len() < 2 { return None; }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let old = h.iter().find(|(t, _)| *t >= now - secs as f64)?;
+    if old.1 <= 0.0 { return None; }
+    Some((h.back()?.1 - old.1) / old.1 * 100.0)
+}
+
+/// Get CL trend over last N seconds (% change)
+pub fn cl_trend(snapshots: &ClSnapshots, cl_prices: &ClPrices, asset: &str, secs: u64) -> Option<f64> {
+    let s = snapshots.get(asset)?;
+    if s.is_empty() { return None; }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    let cut = now as i64 - secs as i64;
+    let cur = cl_prices.get(asset)?.1;
+    let old = s.iter()
+        .filter(|(&t, _)| t >= cut)
+        .min_by_key(|(&t, _)| t)
+        .map(|(_, &p)| p)?;
+    if old <= 0.0 { return None; }
+    Some((cur - old) / old * 100.0)
+}
+
+/// Get 1-hour price range (%)
+pub fn hour_range(snapshots: &ClSnapshots, asset: &str) -> f64 {
+    let s = match snapshots.get(asset) { Some(s) => s, None => return 0.0 };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64() as i64;
+    let cut = now - 3600;
+    let prices: Vec<f64> = s.iter().filter(|(&t, _)| t > cut).map(|(_, &p)| p).collect();
+    if prices.len() < 10 { return 999.0; }
+    let hi = prices.iter().cloned().fold(f64::MIN, f64::max);
+    let lo = prices.iter().cloned().fold(f64::MAX, f64::min);
+    if lo <= 0.0 { return 0.0; }
+    (hi - lo) / lo * 100.0
+}
 
 /// Full order book entry — maintains all levels for correct delta application.
 ///
@@ -430,12 +499,13 @@ pub async fn run_cl_feed(
     live_ws:       String,
     assets:        Vec<String>,
     cl_prices:     ClPrices,
+    cl_snapshots:  ClSnapshots,
     price_history: PriceHistory,
 ) {
     loop {
         info!("[CL] Connecting to {}", live_ws);
 
-        match connect_cl_feed(&live_ws, &assets, &cl_prices, &price_history).await {
+        match connect_cl_feed(&live_ws, &assets, &cl_prices, &cl_snapshots, &price_history).await {
             Ok(_)  => warn!("[CL] Feed closed cleanly, reconnecting..."),
             Err(e) => error!("[CL] Feed error: {}, reconnecting in {}s", e, WS_RECONNECT_SECS),
         }
@@ -448,6 +518,7 @@ async fn connect_cl_feed(
     live_ws:       &str,
     assets:        &[String],
     cl_prices:     &ClPrices,
+    cl_snapshots:  &ClSnapshots,
     price_history: &PriceHistory,
 ) -> Result<()> {
     let url = Url::parse(live_ws).context("invalid live WS URL")?;
@@ -489,7 +560,7 @@ async fn connect_cl_feed(
                         }
                         if text.contains("payload") {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                                process_cl_message(&v, cl_prices, price_history);
+                                process_cl_message(&v, cl_prices, cl_snapshots, price_history);
                             }
                         }
                     }
@@ -514,6 +585,7 @@ async fn connect_cl_feed(
 fn process_cl_message(
     v:             &serde_json::Value,
     cl_prices:     &ClPrices,
+    cl_snapshots:  &ClSnapshots,
     price_history: &PriceHistory,
 ) {
     // RTDS message format:
@@ -568,6 +640,15 @@ fn process_cl_message(
     cl_prices.insert(asset.clone(), (ts, price));
     if is_new {
         info!("[CL] First price for {}: {:.2} at ts={:.0}", asset, price, ts);
+    }
+
+    // Store snapshot for cl_at() lookups (±3s settlement resolution)
+    {
+        let mut snap = cl_snapshots.entry(asset.clone()).or_default();
+        snap.insert(ts as i64, price);
+        // Retain last 2 hours
+        let cutoff = ts as i64 - 7200;
+        snap.retain(|k, _| *k > cutoff);
     }
 
     let mut hist = price_history.entry(asset).or_default();
@@ -809,6 +890,102 @@ fn apply_price_change(
             book_state.insert(asset_id.to_string(), entry);
         }
     }
+}
+
+// -- Binance aggTrade WebSocket feed ------------------------------------------
+
+pub async fn run_bn_feed(
+    bn_ws:     String,
+    assets:    Vec<String>,
+    bn_prices: BnPrices,
+    bn_hist:   BnHistory,
+) {
+    loop {
+        info!("[BN] Connecting to {}", bn_ws);
+
+        match connect_bn_feed(&bn_ws, &assets, &bn_prices, &bn_hist).await {
+            Ok(_)  => warn!("[BN] Feed closed cleanly, reconnecting..."),
+            Err(e) => error!("[BN] Feed error: {}, reconnecting in {}s", e, WS_RECONNECT_SECS),
+        }
+
+        tokio::time::sleep(Duration::from_secs(WS_RECONNECT_SECS)).await;
+    }
+}
+
+fn bn_symbol(asset: &str) -> String {
+    format!("{}usdt", asset)
+}
+
+fn bn_asset(sym: &str) -> Option<&'static str> {
+    match sym {
+        "btcusdt" | "BTCUSDT" => Some("btc"),
+        "ethusdt" | "ETHUSDT" => Some("eth"),
+        "solusdt" | "SOLUSDT" => Some("sol"),
+        "xrpusdt" | "XRPUSDT" => Some("xrp"),
+        _ => None,
+    }
+}
+
+async fn connect_bn_feed(
+    bn_ws:     &str,
+    assets:    &[String],
+    bn_prices: &BnPrices,
+    bn_hist:   &BnHistory,
+) -> Result<()> {
+    let streams: Vec<String> = assets.iter()
+        .map(|a| format!("{}@aggTrade", bn_symbol(a)))
+        .collect();
+    let url = format!("{}/{}", bn_ws, streams.join("/"));
+    let parsed = Url::parse(&url).context("invalid BN WS URL")?;
+    let (mut ws, _) = connect_async(parsed).await.context("BN WS connect failed")?;
+    info!("[BN] Connected, watching {} assets", assets.len());
+
+    while let Some(msg) = ws.next().await {
+        match msg {
+            Ok(Message::Text(t)) => {
+                let d: serde_json::Value = match serde_json::from_str(&t) {
+                    Ok(d) => d,
+                    _ => continue,
+                };
+                // Binance combined stream: {"stream":"btcusdt@aggTrade","data":{...}}
+                // or direct: {"s":"BTCUSDT","p":"67000.00",...}
+                let inner = d.get("data").unwrap_or(&d);
+                let sym = inner.get("s")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let px = inner.get("p")
+                    .and_then(|p| p.as_str().and_then(|s| s.parse::<f64>().ok()));
+
+                if let (Some(asset), Some(price)) = (bn_asset(&sym), px) {
+                    if price > 0.0 {
+                        let is_new = !bn_prices.contains_key(asset);
+                        bn_prices.insert(asset.to_string(), price);
+                        if is_new {
+                            info!("[BN] First price for {}: {:.2}", asset.to_uppercase(), price);
+                        }
+
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs_f64();
+                        let mut h = bn_hist.entry(asset.to_string()).or_default();
+                        h.push_back((now, price));
+                        if h.len() > 14400 {
+                            h.pop_front();
+                        }
+                    }
+                }
+            }
+            Ok(Message::Ping(data)) => {
+                let _ = ws.send(Message::Pong(data)).await;
+            }
+            Err(e) => return Err(anyhow::anyhow!("BN WS error: {}", e)),
+            _ => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Parse price levels from a JSON asks/bids array
