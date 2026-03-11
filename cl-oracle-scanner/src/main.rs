@@ -55,6 +55,7 @@ struct AppConfig {
     feed:     FeedConfig,
     scan:     ScanConfig,
     exec:     Option<ExecConfig>,
+    wallet:   Option<WalletConfig>,
     engines:  Option<HashMap<String, EngineConfig>>,
     // Keep old paper configs for backward compat
     #[allow(dead_code)]
@@ -96,6 +97,22 @@ fn default_open_delay() -> f64 { 5.0 }
 #[derive(Deserialize, Debug)]
 struct ScanConfig {
     tick_ms: u64,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct WalletConfig {
+    #[serde(default)]
+    private_key:     Option<String>,
+    #[serde(default)]
+    api_key:         Option<String>,
+    #[serde(default)]
+    api_secret:      Option<String>,
+    #[serde(default)]
+    passphrase:      Option<String>,
+    #[serde(default)]
+    api_url:         Option<String>,
+    #[serde(default)]
+    neg_risk:        Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -170,32 +187,43 @@ async fn main() -> Result<()> {
         None => default_engines(),
     };
 
-    // -- Initialize CLOB client (optional: only if PRIVATE_KEY is set) --------
+    // -- Initialize CLOB client (config.toml [wallet] → env vars fallback) ----
 
-    let clob_client: Option<Arc<ClobClient>> = match std::env::var("PRIVATE_KEY") {
-        Ok(pk) => {
-            let w = Wallet::from_hex(&pk).context("invalid PRIVATE_KEY")?;
+    let wcfg = cfg.wallet.unwrap_or_default();
+
+    // Priority: config.toml [wallet] > env var > None
+    let pk_opt = wcfg.private_key.clone()
+        .or_else(|| std::env::var("PRIVATE_KEY").ok());
+
+    let clob_client: Option<Arc<ClobClient>> = match pk_opt {
+        Some(pk) => {
+            let w = Wallet::from_hex(&pk).context("invalid private_key")?;
             info!("Wallet loaded: {}", w.address());
 
-            let creds = match (
-                std::env::var("CLOB_API_KEY"),
-                std::env::var("CLOB_API_SECRET"),
-                std::env::var("CLOB_PASSPHRASE"),
-            ) {
-                (Ok(k), Ok(s), Ok(p)) => Some(order::ApiCreds {
+            let api_key = wcfg.api_key.clone()
+                .or_else(|| std::env::var("CLOB_API_KEY").ok());
+            let api_secret = wcfg.api_secret.clone()
+                .or_else(|| std::env::var("CLOB_API_SECRET").ok());
+            let passphrase = wcfg.passphrase.clone()
+                .or_else(|| std::env::var("CLOB_PASSPHRASE").ok());
+
+            let creds = match (api_key, api_secret, passphrase) {
+                (Some(k), Some(s), Some(p)) => Some(order::ApiCreds {
                     api_key: k, api_secret: s, api_passphrase: p,
                 }),
                 _ => None,
             };
 
-            let neg_risk = std::env::var("NEG_RISK").unwrap_or_default() == "true";
-            let base = std::env::var("CLOB_API_URL")
-                .unwrap_or_else(|_| "https://clob.polymarket.com".into());
+            let neg_risk = wcfg.neg_risk.unwrap_or(false)
+                || std::env::var("NEG_RISK").unwrap_or_default() == "true";
+            let base = wcfg.api_url.clone()
+                .or_else(|| std::env::var("CLOB_API_URL").ok())
+                .unwrap_or_else(|| "https://clob.polymarket.com".into());
             let client = ClobClient::new(&base, w, creds, neg_risk);
             Some(Arc::new(client))
         }
-        Err(_) => {
-            warn!("PRIVATE_KEY not set — running in PAPER mode (no live orders)");
+        None => {
+            warn!("private_key not set — running in PAPER mode (no live orders)");
             None
         }
     };
