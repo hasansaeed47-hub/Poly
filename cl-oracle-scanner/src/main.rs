@@ -323,6 +323,8 @@ async fn main() -> Result<()> {
 
     let mut settled: HashMap<String, bool> = HashMap::new();
     let max_open_delay = cfg.feed.max_open_delay;
+    let mut hour_ranges: HashMap<String, f64> = HashMap::new();
+    let mut market_slugs: Vec<String> = Vec::with_capacity(32);
 
     loop {
         let sleep_ms = if trackers.iter().any(|t| t.active.is_some()) {
@@ -420,18 +422,21 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── Compute hour ranges for regime filter ───────────────────────
-        let hour_ranges: HashMap<String, f64> = cfg.feed.assets.iter()
-            .map(|a| (a.clone(), hour_range(&cl_snapshots, a)))
-            .collect();
+        // ── Compute hour ranges for regime filter (every 10 ticks ~5s) ──
+        if tick_count % 10 == 1 {
+            for a in &cfg.feed.assets {
+                hour_ranges.insert(a.clone(), hour_range(&cl_snapshots, a));
+            }
+        }
 
         // ── Process each market ─────────────────────────────────────────
 
         let live_since = book_live.load(Ordering::Relaxed);
         let book_ready = live_since > 0 && now_u.saturating_sub(live_since) >= cfg.feed.book_warmup_secs;
 
-        // Collect market list to iterate (avoid borrow issues)
-        let market_slugs: Vec<String> = markets.keys().cloned().collect();
+        // Reuse pre-allocated Vec (avoid alloc per tick)
+        market_slugs.clear();
+        market_slugs.extend(markets.keys().cloned());
 
         for slug in &market_slugs {
             let meta = match markets.get_mut(slug) {
@@ -587,7 +592,5 @@ async fn main() -> Result<()> {
 }
 
 fn slug_ts(slug: &str) -> i64 {
-    slug.rsplit('-').next()
-        .and_then(|s| s.parse::<i64>().ok())
-        .unwrap_or(0)
+    runner::slug_ts(slug)
 }
