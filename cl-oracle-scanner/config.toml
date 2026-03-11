@@ -8,10 +8,9 @@
 # Config.toml takes priority over env vars.
 
 [wallet]
-# Polygon wallet private key (required for live execution)
+# Credentials loaded from .env file automatically (see .env.example)
+# You can also place them here — config.toml takes priority over env vars:
 # private_key  = "0x..."
-
-# L2 API credentials (from Polymarket CLOB dashboard or auto-derived)
 # api_key      = "..."
 # api_secret   = "..."
 # passphrase   = "..."
