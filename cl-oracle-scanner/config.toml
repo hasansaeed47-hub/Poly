@@ -1,22 +1,24 @@
-# Lag Scanner — external config
-# All thresholds here, nothing hardcoded in binary
+# CL Sniper v3.0 — Hybrid Live Execution Config
+# All thresholds here — nothing hardcoded in binary
 
 [feed]
-# Assets to scan
-# Only assets with Chainlink feeds on Polymarket RTDS
-assets = ["btc", "eth", "sol"]
+# Assets with Chainlink feeds on Polymarket RTDS
+assets = ["btc", "eth", "sol", "xrp"]
 
 # Window timeframes in minutes
 timeframes = [5, 15]
 
-# Polymarket CLOB REST base (for batch book fetches)
+# Polymarket CLOB REST base (batch book fetches)
 clob_rest    = "https://clob.polymarket.com"
 
-# Polymarket CLOB WebSocket (order book updates)
+# Polymarket CLOB WebSocket (order book updates — primary)
 clob_ws      = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-# Polymarket live data WebSocket (CL prices)
+# Polymarket live data WebSocket (CL oracle prices)
 live_ws      = "wss://ws-live-data.polymarket.com"
+
+# Binance aggTrade WebSocket (cross-validation)
+bn_ws        = "wss://stream.binance.com:9443/ws"
 
 # Gamma API (market discovery)
 gamma_api    = "https://gamma-api.polymarket.com"
@@ -34,138 +36,129 @@ book_warmup_secs = 5
 max_open_delay = 5.0
 
 [scan]
-# Scan tick interval in milliseconds
+# Scan tick interval in milliseconds (500ms active, 1000ms idle — auto)
 tick_ms = 500
 
-# --- Per-timeframe scan parameters ---
+# ==============================================================================
+# EXECUTION PARAMETERS — proven from cl-sniper-10mar (v2.0, 100% WR day)
+# ==============================================================================
 
-[scan_5m]
-# Sigma estimation: rolling window in seconds (3 minutes for 5m windows)
-sigma_window_secs = 180
-# Seconds after window_end before settling (wait for CL oracle confirmation)
-settle_delay_secs = 10
-
-[scan_15m]
-# Sigma estimation: rolling window in seconds (10 minutes for 15m windows)
-sigma_window_secs = 600
-# Seconds after window_end before settling
-settle_delay_secs = 15
-
-[paper]
-# Stake per trade in USD (paper only)
+[exec]
+# Stake per trade per engine
 stake = 5.0
 
-# Taker fee rate (Polymarket curve approximation)
-taker_fee_rate = 0.015
+# Cumulative drawdown kill switch
+max_dd = 50.0
 
-# Maker fee rate (unused — scanner is always taker)
-maker_fee_rate = 0.0
+# Stop-loss: bid <= this fraction of fill price
+sl_pct = 0.50
+
+# SL confirmation: opposing side bid must be >= this to confirm flip is real
+sl_confirm_bid = 0.80
+
+# Taker slippage (added to ask for taker orders)
+slip = 0.005
+
+# Maker chase: ticks before switching to taker (4 ticks x 500ms = 2s)
+maker_chase_ticks = 4
+
+# Settlement delay: seconds after window_end to wait for CLOB resolution
+settle_delay_secs = 8
+
+# Regime filter: 1h range below this % = chop, skip
+regime_thresh = 0.3
+
+# Binance contra-momentum filter threshold (%)
+bn_contra_thresh = 0.02
+
+# CL fade filter threshold (%)
+cl_fade_thresh = 0.03
+
+# BN lookback (seconds) for contra filter
+bn_contra_secs = 15
+
+# CL lookback (seconds) for fade filter
+cl_fade_secs = 10
 
 # ==============================================================================
-# CONFIGS — 5 strategies per timeframe, each independently paper-traded
+# ENGINES — 5 engines matching proven 10-Mar configuration
 #
-# Each config specifies:
-#   name          — unique identifier (appears in logs)
-#   tf            — timeframe in minutes (5 or 15) — ONLY processes matching markets
-#   min_edge      — minimum fee-adjusted edge to enter (fair - book×(1+fee))
-#   max_secs_left — max seconds remaining in window to consider entry
-#   min_secs      — min seconds remaining (skip near-expiry noise)
-#   stop_loss     — exit if current fair drops below entry price
-#   take_profit   — exit if book reprices to fair_at_entry
+# A: 5m sniper  — low delta (0.04%), continuity=4 ticks, all filters
+# B: 5m D1      — high delta (0.15%), instant, all filters
+# C: 15m sniper — low delta (0.04%), continuity=4 ticks, all filters
+# D: 15m D1     — high delta (0.15%), instant, all filters
+# E: late scalp — book-price driven, no filters, last 25s only
+#
+# Stdev scaling: delta thresholds auto-scale per asset volatility
+#   BTC: 1.000x  ETH: 1.162x  SOL: 1.479x  XRP: 2.635x
 # ==============================================================================
 
-# --- 5-Minute Configs ---
-# 5m windows: faster decay, tighter edges, allow entries closer to expiry
+[engines.a]
+id              = "A"
+tf              = 5
+delta           = 0.04
+continuity      = 4
+bn_contra       = true
+cl_fade         = true
+regime          = true
+is_late_scalper = false
+entry_start     = 57
+taker_deadline  = 44
+min_entry       = 0.88
+max_entry       = 0.98
 
-[configs.c1]
-name           = "5M_BASE"
-tf             = 5
-min_edge       = 0.08
-max_secs_left  = 270
-min_secs       = 20
-stop_loss      = false
-take_profit    = false
+[engines.b]
+id              = "B"
+tf              = 5
+delta           = 0.15
+continuity      = 0
+bn_contra       = true
+cl_fade         = true
+regime          = true
+is_late_scalper = false
+entry_start     = 57
+taker_deadline  = 44
+min_entry       = 0.88
+max_entry       = 0.98
 
-[configs.c2]
-name           = "5M_LATE"
-tf             = 5
-min_edge       = 0.08
-max_secs_left  = 90
-min_secs       = 15
-stop_loss      = false
-take_profit    = false
+[engines.c]
+id              = "C"
+tf              = 15
+delta           = 0.04
+continuity      = 4
+bn_contra       = true
+cl_fade         = true
+regime          = true
+is_late_scalper = false
+entry_start     = 57
+taker_deadline  = 44
+min_entry       = 0.88
+max_entry       = 0.98
 
-[configs.c3]
-name           = "5M_EDGE"
-tf             = 5
-min_edge       = 0.20
-max_secs_left  = 270
-min_secs       = 20
-stop_loss      = false
-take_profit    = false
+[engines.d]
+id              = "D"
+tf              = 15
+delta           = 0.15
+continuity      = 0
+bn_contra       = true
+cl_fade         = true
+regime          = true
+is_late_scalper = false
+entry_start     = 57
+taker_deadline  = 44
+min_entry       = 0.88
+max_entry       = 0.98
 
-[configs.c4]
-name           = "5M_SL"
-tf             = 5
-min_edge       = 0.08
-max_secs_left  = 270
-min_secs       = 20
-stop_loss      = true
-take_profit    = false
-
-[configs.c5]
-name           = "5M_TP"
-tf             = 5
-min_edge       = 0.08
-max_secs_left  = 270
-min_secs       = 20
-stop_loss      = false
-take_profit    = true
-
-# --- 15-Minute Configs ---
-# 15m windows: more time for mean reversion, need larger edges
-
-[configs.c6]
-name           = "15M_BASE"
-tf             = 15
-min_edge       = 0.12
-max_secs_left  = 840
-min_secs       = 60
-stop_loss      = false
-take_profit    = false
-
-[configs.c7]
-name           = "15M_LATE"
-tf             = 15
-min_edge       = 0.12
-max_secs_left  = 300
-min_secs       = 45
-stop_loss      = false
-take_profit    = false
-
-[configs.c8]
-name           = "15M_EDGE"
-tf             = 15
-min_edge       = 0.25
-max_secs_left  = 840
-min_secs       = 60
-stop_loss      = false
-take_profit    = false
-
-[configs.c9]
-name           = "15M_SL"
-tf             = 15
-min_edge       = 0.12
-max_secs_left  = 840
-min_secs       = 60
-stop_loss      = true
-take_profit    = false
-
-[configs.c10]
-name           = "15M_TP"
-tf             = 15
-min_edge       = 0.12
-max_secs_left  = 840
-min_secs       = 60
-stop_loss      = false
-take_profit    = true
+[engines.e]
+id              = "E"
+tf              = 0
+delta           = 0.0
+continuity      = 0
+bn_contra       = false
+cl_fade         = false
+regime          = false
+is_late_scalper = true
+entry_start     = 25
+taker_deadline  = 3
+min_entry       = 0.95
+max_entry       = 0.975

@@ -1,23 +1,25 @@
-/// main.rs — Lag Scanner
+/// main.rs — CL Sniper v3.0 — Hybrid Live Execution Architecture
 ///
-/// Polymarket CL oracle lag scanner.
-/// Detects mispricing between Chainlink oracle prices and Polymarket order books
-/// on crypto up/down prediction markets (5m and 15m windows).
+/// Merges the scanner's modular data infrastructure (WS feeds, config-driven)
+/// with the proven 5-engine execution logic from cl-sniper-10mar.
 ///
 /// Architecture:
-/// 1. Discover active markets via Gamma API
-/// 2. CL price feed (WebSocket) — real-time oracle prices
-/// 3. PM book feed (WebSocket + REST fallback) — order book state
-/// 4. Scan loop (500ms): compute fair values, detect edge, dispatch to runners
-/// 5. Per-config runners: independent paper trading with different strategies
+/// 1. Three WS feeds: CL (Polymarket RTDS), BN (Binance aggTrade), PM Book (CLOB)
+/// 2. REST fallback: batch book refresh every 2s for new tokens
+/// 3. Market discovery: Gamma API, auto-refresh every 60s
+/// 4. Five engines (A-E) evaluate entry signals independently
+/// 5. Maker-first entry (ask-0.01 for 2s, then taker fallback)
+/// 6. SL with flip confirmation (bid ≤ 50% AND opp_bid ≥ 0.80)
+/// 7. Settlement: CLOB post-settle bids (ground truth) + CL fallback
+/// 8. Kill switch: cumulative P&L ≤ -$50 halts all engines
 ///
-/// Logging (all JSONL, one object per line):
-/// - logs/scan.jsonl   — every signal computation (all data points per tick)
-/// - logs/events.jsonl — market lifecycle (DISCOVER, OPEN, OPEN_MISSED, SETTLE_CAPTURE, SETTLE)
-/// - logs/{name}.jsonl — trade logs per config (entries, exits, PnL)
+/// All thresholds in config.toml — nothing hardcoded except defaults.
 
+mod engine;
+mod execution;
 mod feeds;
 mod runner;
+#[allow(dead_code)]
 mod signal;
 
 use std::collections::HashMap;
@@ -25,22 +27,22 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use engine::{EngineConfig, ExecConfig, default_engines, default_exec};
 use feeds::{
-    BookState, ClPrices, MarketMeta, PriceHistory, RateLimiter,
-    build_slug, current_window_starts, fetch_books_batch, fetch_market_meta,
-    run_book_feed, run_cl_feed,
+    BookState, BnHistory, BnPrices, ClPrices, ClSnapshots, PriceHistory, RateLimiter,
+    build_slug, cl_at, current_window_starts, fetch_books_batch, fetch_market_meta, hour_range,
+    run_bn_feed, run_book_feed, run_cl_feed, MarketMeta,
 };
-use runner::{ConfigRunner, RunnerConfig};
-use signal::{compute, estimate_sigma};
+use runner::{Tracker, MarketWindow};
 
 // -- Config file types --------------------------------------------------------
 
@@ -48,10 +50,17 @@ use signal::{compute, estimate_sigma};
 struct AppConfig {
     feed:     FeedConfig,
     scan:     ScanConfig,
-    scan_5m:  TfScanConfig,
-    scan_15m: TfScanConfig,
-    paper:    PaperConfig,
-    configs:  HashMap<String, RunnerConfig>,
+    exec:     Option<ExecConfig>,
+    engines:  Option<HashMap<String, EngineConfig>>,
+    // Keep old paper configs for backward compat
+    #[allow(dead_code)]
+    scan_5m:  Option<TfScanConfig>,
+    #[allow(dead_code)]
+    scan_15m: Option<TfScanConfig>,
+    #[allow(dead_code)]
+    paper:    Option<PaperConfig>,
+    #[allow(dead_code)]
+    configs:  Option<HashMap<String, runner::RunnerConfig>>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -62,12 +71,23 @@ struct FeedConfig {
     clob_ws:          String,
     live_ws:          String,
     gamma_api:        String,
+    #[serde(default = "default_bn_ws")]
+    bn_ws:            String,
     #[allow(dead_code)]
+    #[serde(default)]
     book_batch_size:  usize,
+    #[serde(default = "default_throttle")]
     rest_throttle_ms: u64,
+    #[serde(default = "default_warmup")]
     book_warmup_secs: u64,
+    #[serde(default = "default_open_delay")]
     max_open_delay:   f64,
 }
+
+fn default_bn_ws() -> String { "wss://stream.binance.com:9443/ws".into() }
+fn default_throttle() -> u64 { 500 }
+fn default_warmup() -> u64 { 5 }
+fn default_open_delay() -> f64 { 5.0 }
 
 #[derive(Deserialize, Debug)]
 struct ScanConfig {
@@ -75,44 +95,36 @@ struct ScanConfig {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct TfScanConfig {
     sigma_window_secs: f64,
     settle_delay_secs: u64,
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct PaperConfig {
     stake:          f64,
     taker_fee_rate: f64,
+    #[serde(default)]
+    maker_fee_rate: f64,
 }
 
 // -- Helpers ------------------------------------------------------------------
 
 fn now_secs() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64()
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
 }
 
 fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-
-fn tf_scan_config(cfg: &AppConfig, tf: u32) -> &TfScanConfig {
-    if tf == 5 { &cfg.scan_5m } else { &cfg.scan_15m }
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 // -- Log writers --------------------------------------------------------------
 
 fn open_log(path: &str) -> BufWriter<File> {
     let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+        .create(true).append(true).open(path)
         .unwrap_or_else(|e| panic!("Cannot open {}: {}", path, e));
     BufWriter::new(file)
 }
@@ -136,41 +148,69 @@ async fn main() -> Result<()> {
         .with_target(false)
         .init();
 
+    dotenvy::dotenv().ok();
+
     // Load config
     let cfg_text = std::fs::read_to_string("config.toml")
         .context("cannot read config.toml")?;
     let cfg: AppConfig = toml::from_str(&cfg_text)
         .context("invalid config.toml")?;
 
-    info!("Lag Scanner starting");
-    info!("Assets: {:?}", cfg.feed.assets);
-    info!("Timeframes: {:?}m", cfg.feed.timeframes);
-    info!("Configs: {} (5m sigma={}s, 15m sigma={}s)",
-        cfg.configs.len(), cfg.scan_5m.sigma_window_secs, cfg.scan_15m.sigma_window_secs);
+    let exec_cfg = cfg.exec.unwrap_or_else(default_exec);
+    let engine_cfgs: Vec<EngineConfig> = match cfg.engines {
+        Some(ref map) => {
+            let mut v: Vec<EngineConfig> = map.values().cloned().collect();
+            v.sort_by(|a, b| a.id.cmp(&b.id));
+            v
+        }
+        None => default_engines(),
+    };
+
+    info!("═══════════════════════════════════════════════════════");
+    info!("  CL SNIPER v3.0 — HYBRID LIVE EXECUTION");
+    info!("═══════════════════════════════════════════════════════");
+    info!("  Assets: {:?}", cfg.feed.assets);
+    info!("  Timeframes: {:?}m", cfg.feed.timeframes);
+    info!("  Engines: {}", engine_cfgs.len());
+    for eng in &engine_cfgs {
+        if eng.is_late_scalper {
+            info!("    [{}] late scalper  book>={:.2}  entry<={}s",
+                eng.id, eng.min_entry, eng.entry_start);
+        } else {
+            info!("    [{}] tf={}m  d>={:.2}%  cont={}  bn={} cl={} regime={}",
+                eng.id, eng.tf, eng.delta, eng.continuity,
+                eng.bn_contra, eng.cl_fade, eng.regime);
+        }
+    }
+    info!("  Stake: ${:.0}  Max DD: ${:.0}  SL: bid<={}%  Confirm: opp>={:.2}",
+        exec_cfg.stake, exec_cfg.max_dd, (exec_cfg.sl_pct * 100.0) as u32, exec_cfg.sl_confirm_bid);
+    info!("  Maker chase: {} ticks  Slip: {:.3}  Settle delay: {}s",
+        exec_cfg.maker_chase_ticks, exec_cfg.slip, exec_cfg.settle_delay_secs);
+    info!("═══════════════════════════════════════════════════════");
 
     // Create log directory
     std::fs::create_dir_all("logs").context("cannot create logs/")?;
 
     // Open log files
-    let mut scan_log  = open_log("logs/scan.jsonl");
     let mut event_log = open_log("logs/events.jsonl");
 
     // Shared state
     let cl_prices:     ClPrices      = Arc::new(DashMap::new());
+    let cl_snapshots:  ClSnapshots   = Arc::new(DashMap::new());
     let book_state:    BookState     = Arc::new(DashMap::new());
     let price_history: PriceHistory  = Arc::new(DashMap::new());
+    let bn_prices:     BnPrices      = Arc::new(DashMap::new());
+    let bn_hist:       BnHistory     = Arc::new(DashMap::new());
     let token_ids:     Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
     let book_live:     Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
-    // HTTP client (shared, connection pooled)
+    // HTTP client
     let http = Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .context("HTTP client build failed")?;
 
     let limiter = Arc::new(RateLimiter::new(cfg.feed.rest_throttle_ms));
-
-    let fee_rate = cfg.paper.taker_fee_rate;
 
     // -- Discover markets -----------------------------------------------------
 
@@ -202,30 +242,28 @@ async fn main() -> Result<()> {
                             "token_no": &meta.token_no,
                         }));
                         token_ids.insert(meta.token_yes.clone(), ());
-                        token_ids.insert(meta.token_no.clone(),  ());
+                        token_ids.insert(meta.token_no.clone(), ());
                         markets.insert(slug, meta);
                     }
-                    Ok(None) => debug!("[DISCOVER] {} not found", slug),
-                    Err(e)   => warn!("[DISCOVER] {} error: {}", slug, e),
+                    Ok(None) => {}
+                    Err(e) => warn!("[DISCOVER] {} error: {}", slug, e),
                 }
             }
         }
     }
 
     info!("Discovered {} active markets", markets.len());
-    if markets.is_empty() {
-        warn!("No markets found — will retry on scan ticks");
-    }
 
     // -- Start WebSocket feeds ------------------------------------------------
 
     {
         let cp = cl_prices.clone();
+        let cs = cl_snapshots.clone();
         let ph = price_history.clone();
         let assets = cfg.feed.assets.clone();
         let ws = cfg.feed.live_ws.clone();
         tokio::spawn(async move {
-            run_cl_feed(ws, assets, cp, ph).await;
+            run_cl_feed(ws, assets, cp, cs, ph).await;
         });
     }
 
@@ -239,49 +277,96 @@ async fn main() -> Result<()> {
         });
     }
 
-    // -- Build runners --------------------------------------------------------
+    {
+        let bp = bn_prices.clone();
+        let bh = bn_hist.clone();
+        let assets = cfg.feed.assets.clone();
+        let ws = cfg.feed.bn_ws.clone();
+        tokio::spawn(async move {
+            run_bn_feed(ws, assets, bp, bh).await;
+        });
+    }
 
-    let mut runners: Vec<ConfigRunner> = cfg.configs.values()
-        .map(|rc| ConfigRunner::new(rc.clone(), cfg.paper.stake, cfg.paper.taker_fee_rate, "logs"))
+    // -- Build engine trackers ------------------------------------------------
+
+    let mut trackers: Vec<Tracker> = engine_cfgs.into_iter()
+        .map(|ec| Tracker::new(ec, exec_cfg.clone(), "logs"))
         .collect();
 
-    // Sort by name for consistent ordering
-    runners.sort_by(|a, b| a.config.name.cmp(&b.config.name));
+    // -- CL open prices -------------------------------------------------------
 
-    info!("{} runners initialized:", runners.len());
-    for r in &runners {
-        info!("  [{}] tf={}m edge>={:.2} secs=[{:.0}..{:.0}] sl={} tp={}",
-            r.config.name, r.config.tf, r.config.min_edge,
-            r.config.min_secs, r.config.max_secs_left,
-            r.config.stop_loss, r.config.take_profit);
-    }
+    let mut cl_opens: HashMap<String, f64> = HashMap::new();
 
     // -- Warmup gate ----------------------------------------------------------
 
-    info!("Waiting {}s for book feed warmup...", cfg.feed.book_warmup_secs);
+    info!("Waiting {}s for feed warmup...", cfg.feed.book_warmup_secs);
     tokio::time::sleep(Duration::from_secs(cfg.feed.book_warmup_secs)).await;
+
+    // Log initial feed state
+    {
+        for asset in &cfg.feed.assets {
+            let cl = cl_prices.get(asset.as_str()).map(|e| e.1).unwrap_or(0.0);
+            let bn = bn_prices.get(asset.as_str()).map(|v| *v).unwrap_or(0.0);
+            info!("  {}: CL=${:.2} BN=${:.2}", asset.to_uppercase(), cl, bn);
+        }
+    }
     info!("Warmup complete — scan loop starting");
 
     // -- Main scan loop -------------------------------------------------------
 
-    let tick = Duration::from_millis(cfg.scan.tick_ms);
     let mut tick_count:    u64 = 0;
-    let mut last_stats_ts: f64 = now_secs();
+    let mut last_stats:    Instant = Instant::now();
+    let mut last_detail:   Instant = Instant::now();
     let mut last_discover: f64 = now_secs();
+    let mut halted = false;
+    let start_time = Instant::now();
 
     let mut settled: HashMap<String, bool> = HashMap::new();
-
     let max_open_delay = cfg.feed.max_open_delay;
 
     loop {
-        tokio::time::sleep(tick).await;
+        let sleep_ms = if trackers.iter().any(|t| t.active.is_some()) {
+            cfg.scan.tick_ms
+        } else {
+            cfg.scan.tick_ms * 2 // idle — slower tick
+        };
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
         tick_count += 1;
 
         let now = now_secs();
         let now_u = now as u64;
+        let now_i = now as i64;
 
-        // -- Periodic market rediscovery (every 60s) --------------------------
+        // ── Kill switch ─────────────────────────────────────────────────
+        if halted {
+            if last_stats.elapsed().as_secs() >= 30 {
+                let cum: f64 = trackers.iter().map(|t| t.stats.pnl).sum();
+                info!("HALTED cum=${:+.2}", cum);
+                last_stats = Instant::now();
+            }
+            continue;
+        }
 
+        let cum_pnl: f64 = trackers.iter().map(|t| t.stats.pnl).sum();
+        if cum_pnl <= -exec_cfg.max_dd {
+            info!("═══════════════════════════════════════════════════════");
+            info!("  KILL SWITCH  Cumulative P&L: ${:+.2}", cum_pnl);
+            info!("  Max DD ${:.0} breached — HALTING ALL ENGINES", exec_cfg.max_dd);
+            info!("═══════════════════════════════════════════════════════");
+            // Force-close any open positions
+            for tr in &mut trackers {
+                if let Some(pos) = tr.active.take() {
+                    let loss = -exec_cfg.stake;
+                    info!("[DD] FORCE_CLOSE [{}] {} {} — ${:+.2}", tr.cfg.id, pos.dir, pos.asset.to_uppercase(), loss);
+                    tr.stats.pnl += loss;
+                    tr.stats.losses += 1;
+                }
+            }
+            halted = true;
+            continue;
+        }
+
+        // ── Periodic market rediscovery (every 60s) ─────────────────────
         if now - last_discover > 60.0 {
             last_discover = now;
             for asset in &cfg.feed.assets {
@@ -292,18 +377,15 @@ async fn main() -> Result<()> {
                             if let Ok(Some(meta)) = fetch_market_meta(
                                 &http, &cfg.feed.gamma_api, &slug, asset, tf, &limiter,
                             ).await {
-                                info!("[DISCOVER] New: {} ws={} we={}",
-                                    slug, meta.window_start, meta.window_end);
+                                info!("[DISCOVER] New: {} ws={} we={}", slug, meta.window_start, meta.window_end);
                                 log_json(&mut event_log, &serde_json::json!({
                                     "event": "DISCOVER", "ts": now,
                                     "slug": &slug, "asset": asset, "tf": tf,
                                     "window_start": meta.window_start,
                                     "window_end": meta.window_end,
-                                    "token_yes": &meta.token_yes,
-                                    "token_no": &meta.token_no,
                                 }));
                                 token_ids.insert(meta.token_yes.clone(), ());
-                                token_ids.insert(meta.token_no.clone(),  ());
+                                token_ids.insert(meta.token_no.clone(), ());
                                 markets.insert(slug, meta);
                             }
                         }
@@ -312,11 +394,20 @@ async fn main() -> Result<()> {
             }
         }
 
-        // -- Batch book refresh (every 2s via REST as fallback) ---------------
-        // REST covers newly discovered tokens that WS hasn't subscribed to yet.
-
+        // ── Batch book refresh (every 2s via REST fallback) ─────────────
         if tick_count % 4 == 0 {
-            let all_tokens: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
+            // Include active position token IDs
+            let mut all_tokens: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
+            for tr in &trackers {
+                if let Some(pos) = &tr.active {
+                    all_tokens.push(pos.tid.clone());
+                    all_tokens.push(pos.tid_up.clone());
+                    all_tokens.push(pos.tid_dn.clone());
+                }
+            }
+            all_tokens.sort();
+            all_tokens.dedup();
+
             if !all_tokens.is_empty() {
                 match fetch_books_batch(&http, &cfg.feed.clob_rest, &all_tokens, &limiter).await {
                     Ok(books) => {
@@ -329,255 +420,174 @@ async fn main() -> Result<()> {
             }
         }
 
-        // -- Process each market ----------------------------------------------
+        // ── Compute hour ranges for regime filter ───────────────────────
+        let hour_ranges: HashMap<String, f64> = cfg.feed.assets.iter()
+            .map(|a| (a.clone(), hour_range(&cl_snapshots, a)))
+            .collect();
+
+        // ── Process each market ─────────────────────────────────────────
 
         let live_since = book_live.load(Ordering::Relaxed);
         let book_ready = live_since > 0 && now_u.saturating_sub(live_since) >= cfg.feed.book_warmup_secs;
 
-        for (slug, meta) in &mut markets {
+        // Collect market list to iterate (avoid borrow issues)
+        let market_slugs: Vec<String> = markets.keys().cloned().collect();
+
+        for slug in &market_slugs {
+            let meta = match markets.get_mut(slug) {
+                Some(m) => m,
+                None => continue,
+            };
+
             // Skip fully settled markets
             if settled.get(slug.as_str()).copied().unwrap_or(false) {
                 continue;
             }
 
-            // --- Settle price capture ----------------------------------------
-            // Capture CL price at window_end (first opportunity).
-            // Uses the CL tick closest to window_end for accurate settlement.
-            if now >= meta.window_end as f64 && meta.settle_price <= 0.0
-                && !meta.open_missed && meta.open_price > 0.0
-            {
-                if let Some(cl_entry) = cl_prices.get(&meta.asset) {
-                    let (cl_ts, cl_price) = *cl_entry;
-                    // Accept if CL timestamp is within 2s before window_end or after
-                    if cl_ts >= meta.window_end as f64 - 2.0 && cl_price > 0.0 {
-                        meta.settle_price = cl_price;
-                        meta.settle_cl_ts = cl_ts;
-                        let delay = now - meta.window_end as f64;
-                        info!("[SETTLE_CAPTURE] {} price={:.2} open={:.2} delay={:.1}s cl_ts_delta={:.1}s",
-                            slug, cl_price, meta.open_price, delay, cl_ts - meta.window_end as f64);
-                        log_json(&mut event_log, &serde_json::json!({
-                            "event": "SETTLE_CAPTURE", "ts": now,
-                            "slug": slug, "asset": &meta.asset, "tf": meta.tf,
-                            "settle_price": cl_price,
-                            "open_price": meta.open_price,
-                            "capture_delay_s": delay,
-                            "cl_ts": cl_ts,
-                            "cl_ts_delta_from_end_s": cl_ts - meta.window_end as f64,
-                            "window_start": meta.window_start,
-                            "window_end": meta.window_end,
-                        }));
-                    }
-                }
-            }
-
-            // --- Execute settlement ------------------------------------------
-            // Wait settle_delay after window_end, then settle using captured price.
-            if meta.settle_price > 0.0 && meta.open_price > 0.0 {
-                let tf_cfg = tf_scan_config(&cfg, meta.tf);
-                if now_u >= meta.window_end + tf_cfg.settle_delay_secs {
-                    let outcome = if meta.settle_price > meta.open_price { 1.0 } else { 0.0 };
-                    let result_str = if outcome == 1.0 { "YES" } else { "NO" };
-
-                    info!("[SETTLE] {} tf={}m open={:.2} settle={:.2} outcome={}",
-                        slug, meta.tf, meta.open_price, meta.settle_price, result_str);
-                    log_json(&mut event_log, &serde_json::json!({
-                        "event": "SETTLE", "ts": now,
-                        "slug": slug, "asset": &meta.asset, "tf": meta.tf,
-                        "open_price": meta.open_price,
-                        "open_cl_ts": meta.open_cl_ts,
-                        "settle_price": meta.settle_price,
-                        "settle_cl_ts": meta.settle_cl_ts,
-                        "outcome": result_str,
-                        "window_start": meta.window_start,
-                        "window_end": meta.window_end,
-                    }));
-
-                    for runner in &mut runners {
-                        runner.on_settlement(slug, outcome, now).await;
-                    }
-
-                    settled.insert(slug.clone(), true);
-                    continue;
-                }
-            }
-
-            // --- Window not started yet --------------------------------------
-            if now < meta.window_start as f64 {
-                continue;
-            }
-
-            // --- Capture open price ------------------------------------------
-            // Use first CL tick at or after window_start.
-            // Reject if we're more than max_open_delay seconds late.
-            if meta.open_price <= 0.0 {
-                if meta.open_missed {
-                    continue;
-                }
-
+            // --- Capture CL open price -----------------------------------
+            if meta.open_price <= 0.0 && !meta.open_missed {
+                if now < meta.window_start as f64 { continue; }
                 let delay = now - meta.window_start as f64;
                 if delay > max_open_delay {
                     meta.open_missed = true;
-                    warn!("[OPEN] {} MISSED — {:.1}s late (max {}s), skipping window",
-                        slug, delay, max_open_delay);
-                    log_json(&mut event_log, &serde_json::json!({
-                        "event": "OPEN_MISSED", "ts": now,
-                        "slug": slug, "asset": &meta.asset, "tf": meta.tf,
-                        "delay_s": delay,
-                        "max_open_delay": max_open_delay,
-                        "window_start": meta.window_start,
-                        "window_end": meta.window_end,
-                    }));
+                    warn!("[OPEN] {} MISSED — {:.1}s late", slug, delay);
                     continue;
                 }
 
-                // First CL tick with timestamp at or after window_start
-                if let Some(cl_entry) = cl_prices.get(&meta.asset) {
+                // Prefer exact CL snapshot at window_start
+                if let Some(px) = cl_at(&cl_snapshots, &meta.asset, meta.window_start as i64) {
+                    if px > 0.0 {
+                        meta.open_price = px;
+                        meta.open_cl_ts = meta.window_start as f64;
+                        cl_opens.insert(slug.clone(), px);
+                        info!("[OPEN] {} tf={}m open={:.2} delay={:.1}s", slug, meta.tf, px, delay);
+                        log_json(&mut event_log, &serde_json::json!({
+                            "event": "OPEN", "ts": now, "slug": slug,
+                            "asset": &meta.asset, "tf": meta.tf,
+                            "open_price": px, "delay_s": delay,
+                        }));
+                    }
+                } else if let Some(cl_entry) = cl_prices.get(&meta.asset) {
                     let (cl_ts, cl_price) = *cl_entry;
                     if cl_ts >= meta.window_start as f64 && cl_price > 0.0 {
                         meta.open_price = cl_price;
                         meta.open_cl_ts = cl_ts;
-                        info!("[OPEN] {} tf={}m open={:.2} delay={:.1}s cl_ts={:.3}",
-                            slug, meta.tf, cl_price, delay, cl_ts);
-                        log_json(&mut event_log, &serde_json::json!({
-                            "event": "OPEN", "ts": now,
-                            "slug": slug, "asset": &meta.asset, "tf": meta.tf,
-                            "open_price": cl_price,
-                            "cl_ts": cl_ts,
-                            "delay_s": delay,
-                            "window_start": meta.window_start,
-                            "window_end": meta.window_end,
-                        }));
+                        cl_opens.insert(slug.clone(), cl_price);
+                        info!("[OPEN] {} tf={}m open={:.2} delay={:.1}s (live)", slug, meta.tf, cl_price, delay);
                     }
                 }
                 continue;
             }
 
-            // --- Skip if window ended (waiting for settlement) ---------------
-            if now >= meta.window_end as f64 {
-                continue;
-            }
+            if meta.open_missed || meta.open_price <= 0.0 { continue; }
 
-            // --- Skip if book feed not ready ---------------------------------
-            if !book_ready {
-                continue;
-            }
+            let secs_left = meta.window_end as i64 - now_i;
 
-            // --- Signal computation ------------------------------------------
-
-            let secs_left = meta.window_end as f64 - now;
-
-            // Get CL price
-            let (cl_ts, cl) = match cl_prices.get(&meta.asset) {
-                Some(v) => (v.0, v.1),
-                None    => continue,
-            };
-
-            // Get book prices + timestamps
-            let (book_yes, book_yes_ts) = match book_state.get(&meta.token_yes) {
-                Some(b) => (b.best_ask, b.ts),
-                None    => continue,
-            };
-            let (book_no, book_no_ts) = match book_state.get(&meta.token_no) {
-                Some(b) => (b.best_ask, b.ts),
-                None    => continue,
-            };
-
-            // Skip if book data is stale (>30s old — likely WS dropped)
-            let book_age = (now - book_yes_ts).max(now - book_no_ts);
-            if book_age > 30.0 {
-                debug!("[SCAN] {} book stale by {:.0}s, skipping", slug, book_age);
-                continue;
-            }
-
-            // Estimate sigma (per-TF window)
-            let tf_cfg = tf_scan_config(&cfg, meta.tf);
-            let sigma = {
-                let hist = price_history.get(&meta.asset);
-                match hist {
-                    Some(h) => estimate_sigma(&h, tf_cfg.sigma_window_secs, now),
-                    None    => 0.001,
+            // --- SL check for all trackers with active positions ---------
+            for tr in &mut trackers {
+                if let Some(pos) = &tr.active {
+                    if pos.slug == *slug {
+                        tr.check_stop_loss(&book_state, now);
+                    }
                 }
-            };
-
-            // Compute signal ONCE — shared across all runners
-            let sig = match compute(
-                slug, &meta.asset, meta.tf,
-                meta.open_price, cl, sigma, secs_left,
-                book_yes, book_no, fee_rate, now,
-            ) {
-                Some(s) => s,
-                None    => continue,
-            };
-
-            // --- Log to scan.jsonl (every tick, all data points) -------------
-            log_json(&mut scan_log, &serde_json::json!({
-                "ts": now,
-                "slug": slug,
-                "asset": &meta.asset,
-                "tf": meta.tf,
-                "cl": cl,
-                "cl_ts": cl_ts,
-                "cl_age_ms": ((now - cl_ts) * 1000.0).round(),
-                "open": meta.open_price,
-                "open_cl_ts": meta.open_cl_ts,
-                "sigma": (sigma * 10000.0).round() / 10000.0,
-                "secs_left": secs_left.round(),
-                "fair_y": (sig.fair_yes * 10000.0).round() / 10000.0,
-                "fair_n": (sig.fair_no * 10000.0).round() / 10000.0,
-                "bk_y": book_yes,
-                "bk_n": book_no,
-                "bk_y_ts": book_yes_ts,
-                "bk_n_ts": book_no_ts,
-                "bk_y_age_ms": ((now - book_yes_ts) * 1000.0).round(),
-                "bk_n_age_ms": ((now - book_no_ts) * 1000.0).round(),
-                "edge_y": (sig.edge_yes * 10000.0).round() / 10000.0,
-                "edge_n": (sig.edge_no * 10000.0).round() / 10000.0,
-                "best_side": sig.best_side.map(|s| s.to_string()).unwrap_or_default(),
-                "best_edge": (sig.best_edge * 10000.0).round() / 10000.0,
-                "window_start": meta.window_start,
-                "window_end": meta.window_end,
-            }));
-
-            // Log interesting edges at INFO
-            if sig.best_edge > 0.01 {
-                info!(
-                    "[SCAN] {} tf={}m cl={:.2} open={:.2} fair_y={:.3} bk_y={:.3} bk_n={:.3} edge={:+.3} sig={:.4} secs={:.0}",
-                    slug, meta.tf, cl, meta.open_price, sig.fair_yes, book_yes, book_no, sig.best_edge, sigma, secs_left
-                );
             }
 
-            // Dispatch to all runners (each filters by own tf)
-            for runner in &mut runners {
-                runner.on_signal(&sig, meta.window_end).await;
+            // --- Settlement check ----------------------------------------
+            if secs_left <= 0 {
+                let settle_ready = now_u >= meta.window_end + exec_cfg.settle_delay_secs;
+                if settle_ready {
+                    for tr in &mut trackers {
+                        tr.check_settlement(&book_state, &cl_snapshots, &cl_opens, now);
+                    }
+                    settled.insert(slug.clone(), true);
+
+                    log_json(&mut event_log, &serde_json::json!({
+                        "event": "SETTLE", "ts": now, "slug": slug,
+                        "asset": &meta.asset, "tf": meta.tf,
+                    }));
+                }
+                continue;
+            }
+
+            // --- Skip if book not ready ----------------------------------
+            if !book_ready { continue; }
+
+            // --- Entry evaluation for all engines ------------------------
+            let win = MarketWindow {
+                slug,
+                asset:     &meta.asset,
+                wmin:      meta.tf,
+                start_ts:  meta.window_start as i64,
+                end_ts:    meta.window_end as i64,
+                tid_up:    &meta.token_yes,
+                tid_dn:    &meta.token_no,
+                secs_left,
+            };
+
+            for tr in &mut trackers {
+                tr.evaluate_entry(
+                    &win, &cl_prices, &cl_snapshots, &cl_opens,
+                    &book_state, &bn_prices, &bn_hist, &hour_ranges, now,
+                );
             }
         }
 
-        // -- Flush logs periodically (every 10s) -----------------------------
-
+        // ── Flush logs periodically (every 10s) ─────────────────────────
         if tick_count % 20 == 0 {
-            let _ = scan_log.flush();
             let _ = event_log.flush();
         }
 
-        // -- Periodic stats print (every 60s) ---------------------------------
+        // ── Status every 60s ────────────────────────────────────────────
+        if last_stats.elapsed().as_secs() >= 60 {
+            let px: Vec<String> = cfg.feed.assets.iter()
+                .filter_map(|a| cl_prices.get(a.as_str()).map(|e| format!("{}=${:.0}", a.to_uppercase(), e.1)))
+                .collect();
+            let hrs = start_time.elapsed().as_secs_f64() / 3600.0;
+            let active = trackers.iter().filter(|t| t.active.is_some()).count();
+            let cum: f64 = trackers.iter().map(|t| t.stats.pnl).sum();
+            let statuses: Vec<String> = trackers.iter().map(|t| t.status()).collect();
+            info!("── {} | {:.1}h | active={} cum=${:+.2} | {} ──",
+                px.join(" "), hrs, active, cum, statuses.join(" | "));
+            last_stats = Instant::now();
+        }
 
-        if now - last_stats_ts >= 60.0 {
-            last_stats_ts = now;
-            info!("──────────────────────────────────────────────────────");
-            info!("5m runners:");
-            for runner in runners.iter().filter(|r| r.config.tf == 5) {
-                runner.print_stats();
+        // ── Detailed stats every 5 min ──────────────────────────────────
+        if last_detail.elapsed().as_secs() >= 300 {
+            info!("═══════════════════════════════════════════════════════");
+            info!("  STATS — {:.1}h elapsed", start_time.elapsed().as_secs_f64() / 3600.0);
+            for tr in &trackers {
+                tr.print_stats();
             }
-            info!("15m runners:");
-            for runner in runners.iter().filter(|r| r.config.tf == 15) {
-                runner.print_stats();
+            let cum: f64 = trackers.iter().map(|t| t.stats.pnl).sum();
+            info!("  CUMULATIVE: ${:+.2} / -${:.0} DD limit", cum, exec_cfg.max_dd);
+            info!("  Markets: {} active, {} settled, book_state={}, cl={}",
+                markets.len() - settled.len(), settled.len(), book_state.len(), cl_prices.len());
+            info!("═══════════════════════════════════════════════════════");
+            last_detail = Instant::now();
+        }
+
+        // ── Cleanup stale data (every 60s) ──────────────────────────────
+        if tick_count % 120 == 0 {
+            let cutoff = now_i - 3600;
+            cl_opens.retain(|k, _| slug_ts(k) > cutoff);
+            for tr in &mut trackers {
+                tr.cleanup(cutoff);
             }
-            let active = markets.values().filter(|m| !m.open_missed && m.open_price > 0.0).count();
-            let missed = markets.values().filter(|m| m.open_missed).count();
-            info!("markets={} active={} settled={} missed={} book={} cl={}",
-                markets.len(), active, settled.len(), missed,
-                book_state.len(), cl_prices.len(),
-            );
+            // Remove old settled markets
+            let stale: Vec<String> = markets.keys()
+                .filter(|k| slug_ts(k) < cutoff)
+                .cloned()
+                .collect();
+            for k in stale {
+                markets.remove(&k);
+                settled.remove(&k);
+            }
         }
     }
+}
+
+fn slug_ts(slug: &str) -> i64 {
+    slug.rsplit('-').next()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(0)
 }
