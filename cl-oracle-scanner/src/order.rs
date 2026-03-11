@@ -93,6 +93,8 @@ pub struct PostOrderBody {
     pub order_type: String,
     #[serde(rename = "postOnly")]
     pub post_only:  bool,
+    #[serde(rename = "negRisk")]
+    pub neg_risk:   bool,
 }
 
 // -- EIP-712 hashing ----------------------------------------------------------
@@ -357,6 +359,7 @@ impl ClobClient {
             order,
             order_type: order_type.to_string(),
             post_only,
+            neg_risk:   self.neg_risk,
         };
 
         let body_str = serde_json::to_string(&body)
