@@ -607,7 +607,6 @@ async fn main() -> Result<()> {
                 slug,
                 asset:     &meta.asset,
                 wmin:      meta.tf,
-                start_ts:  meta.window_start as i64,
                 end_ts:    meta.window_end as i64,
                 tid_up:    &meta.token_yes,
                 tid_dn:    &meta.token_no,
