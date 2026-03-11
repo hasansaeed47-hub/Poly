@@ -25,7 +25,7 @@ use polymarket_client_sdk::{POLYGON, contract_config};
 use tracing::{info, error};
 use tracing_subscriber::EnvFilter;
 
-const RPC_URL: &str = "https://polygon-rpc.com";
+const RPC_URL: &str = "https://polygon-bor-rpc.publicnode.com";
 const USDC_ADDRESS: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 
 sol! {
