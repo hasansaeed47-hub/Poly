@@ -378,7 +378,7 @@ async fn main() -> Result<()> {
     let mut market_slugs: Vec<String> = Vec::with_capacity(32);
 
     loop {
-        let sleep_ms = if trackers.iter().any(|t| t.active.is_some()) {
+        let sleep_ms = if trackers.iter().any(|t| !t.active.is_empty()) {
             cfg.scan.tick_ms
         } else {
             cfg.scan.tick_ms * 2 // idle — slower tick
@@ -408,7 +408,7 @@ async fn main() -> Result<()> {
             info!("═══════════════════════════════════════════════════════");
             // Force-close any open positions
             for tr in &mut trackers {
-                if let Some(pos) = tr.active.take() {
+                for pos in tr.active.drain(..) {
                     let loss = -exec_cfg.stake;
                     info!("[DD] FORCE_CLOSE [{}] {} {} — ${:+.2}", tr.cfg.id, pos.dir, pos.asset.to_uppercase(), loss);
                     tr.stats.pnl += loss;
@@ -452,7 +452,7 @@ async fn main() -> Result<()> {
             // Include active position token IDs
             let mut all_tokens: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
             for tr in &trackers {
-                if let Some(pos) = &tr.active {
+                for pos in &tr.active {
                     all_tokens.push(pos.tid.clone());
                     all_tokens.push(pos.tid_up.clone());
                     all_tokens.push(pos.tid_dn.clone());
@@ -541,31 +541,29 @@ async fn main() -> Result<()> {
 
             // --- SL check for all trackers with active positions ---------
             for tr in &mut trackers {
-                if let Some(pos) = &tr.active {
-                    if pos.slug == *slug {
-                        if let Some(result) = tr.check_stop_loss(&book_state, now) {
-                            // Live SL: sell position on CLOB
-                            if let Some(ref clob) = clob_client {
-                                let c = clob.clone();
-                                let tid = result.tid.clone();
-                                let exit_px = result.exit_px;
-                                let shares = result.shares;
-                                let eid = result.engine_id.clone();
-                                let slug_s = result.slug.clone();
-                                tokio::spawn(async move {
-                                    // Sell at exit_px (taker) to exit quickly
-                                    match c.place_market_order(&tid, exit_px, shares, "SELL").await {
-                                        Ok(resp) => info!("[CLOB] [{}] SL SELL placed for {}: {:?}", eid, slug_s, resp),
-                                        Err(e) => warn!("[CLOB] [{}] SL SELL failed for {}: {}", eid, slug_s, e),
-                                    }
-                                });
-                            }
-                            log_json(&mut event_log, &serde_json::json!({
-                                "event": "SL", "ts": now, "slug": slug,
-                                "engine": result.engine_id, "dir": result.dir,
-                                "pnl": result.pnl, "exit_px": result.exit_px,
-                            }));
+                let has_slug = tr.active.iter().any(|p| p.slug == *slug);
+                if has_slug {
+                    if let Some(result) = tr.check_stop_loss(&book_state, now) {
+                        // Live SL: sell position on CLOB
+                        if let Some(ref clob) = clob_client {
+                            let c = clob.clone();
+                            let tid = result.tid.clone();
+                            let exit_px = result.exit_px;
+                            let shares = result.shares;
+                            let eid = result.engine_id.clone();
+                            let slug_s = result.slug.clone();
+                            tokio::spawn(async move {
+                                match c.place_market_order(&tid, exit_px, shares, "SELL").await {
+                                    Ok(resp) => info!("[CLOB] [{}] SL SELL placed for {}: {:?}", eid, slug_s, resp),
+                                    Err(e) => warn!("[CLOB] [{}] SL SELL failed for {}: {}", eid, slug_s, e),
+                                }
+                            });
                         }
+                        log_json(&mut event_log, &serde_json::json!({
+                            "event": "SL", "ts": now, "slug": slug,
+                            "engine": result.engine_id, "dir": result.dir,
+                            "pnl": result.pnl, "exit_px": result.exit_px,
+                        }));
                     }
                 }
             }
@@ -609,28 +607,30 @@ async fn main() -> Result<()> {
 
                 // Live entry: place BUY order on CLOB
                 if entered {
-                    if let (Some(clob), Some(pos)) = (&clob_client, &tr.active) {
-                        let c = clob.clone();
-                        let tid = pos.tid.clone();
-                        let px = pos.fill_px;
-                        let shares = pos.shares;
-                        let eid = pos.engine_id.clone();
-                        let slug_s = pos.slug.clone();
-                        tokio::spawn(async move {
-                            match c.place_limit_order(&tid, px, shares, "BUY").await {
-                                Ok(resp) => info!("[CLOB] [{}] BUY placed for {}: {:?}", eid, slug_s, resp),
-                                Err(e) => warn!("[CLOB] [{}] BUY failed for {}: {}", eid, slug_s, e),
-                            }
-                        });
-                    }
+                    if let Some(pos) = tr.active.last() {
+                        if let Some(clob) = &clob_client {
+                            let c = clob.clone();
+                            let tid = pos.tid.clone();
+                            let px = pos.fill_px;
+                            let shares = pos.shares;
+                            let eid = pos.engine_id.clone();
+                            let slug_s = pos.slug.clone();
+                            tokio::spawn(async move {
+                                match c.place_limit_order(&tid, px, shares, "BUY").await {
+                                    Ok(resp) => info!("[CLOB] [{}] BUY placed for {}: {:?}", eid, slug_s, resp),
+                                    Err(e) => warn!("[CLOB] [{}] BUY failed for {}: {}", eid, slug_s, e),
+                                }
+                            });
+                        }
 
-                    log_json(&mut event_log, &serde_json::json!({
-                        "event": "ENTRY", "ts": now, "slug": slug,
-                        "engine": tr.cfg.id,
-                        "dir": tr.active.as_ref().map(|p| p.dir.as_str()).unwrap_or("?"),
-                        "fill_px": tr.active.as_ref().map(|p| p.fill_px).unwrap_or(0.0),
-                        "asset": tr.active.as_ref().map(|p| p.asset.as_str()).unwrap_or("?"),
-                    }));
+                        log_json(&mut event_log, &serde_json::json!({
+                            "event": "ENTRY", "ts": now, "slug": slug,
+                            "engine": tr.cfg.id,
+                            "dir": pos.dir,
+                            "fill_px": pos.fill_px,
+                            "asset": pos.asset,
+                        }));
+                    }
                 }
             }
         }
@@ -646,7 +646,7 @@ async fn main() -> Result<()> {
                 .filter_map(|a| cl_prices.get(a.as_str()).map(|e| format!("{}=${:.0}", a.to_uppercase(), e.1)))
                 .collect();
             let hrs = start_time.elapsed().as_secs_f64() / 3600.0;
-            let active = trackers.iter().filter(|t| t.active.is_some()).count();
+            let active: usize = trackers.iter().map(|t| t.active.len()).sum();
             let cum: f64 = trackers.iter().map(|t| t.stats.pnl).sum();
             let statuses: Vec<String> = trackers.iter().map(|t| t.status()).collect();
             info!("── {} | {:.1}h | active={} cum=${:+.2} | {} ──",

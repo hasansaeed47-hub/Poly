@@ -81,7 +81,7 @@ pub struct Tracker {
     pub cfg:          EngineConfig,
     pub exec:         ExecConfig,
     pub stats:        TrackerStats,
-    pub active:       Option<Position>,
+    pub active:       Vec<Position>,
     done:             HashSet<String>,          // slugs already traded this cycle
     delta_ticks:      HashMap<String, u32>,     // continuity counter
     maker_ticks:      HashMap<String, u32>,     // maker chase counter
@@ -105,7 +105,7 @@ impl Tracker {
             cfg,
             exec,
             stats: TrackerStats::default(),
-            active: None,
+            active: Vec::new(),
             done: HashSet::new(),
             delta_ticks: HashMap::new(),
             maker_ticks: HashMap::new(),
@@ -117,23 +117,39 @@ impl Tracker {
     // -- SL check (called every tick while position is active) ----------------
 
     pub fn check_stop_loss(&mut self, book_state: &BookState, now: f64) -> Option<TradeResult> {
-        let pos = self.active.as_ref()?;
+        if self.active.is_empty() { return None; }
 
-        let our_bk = book_state.get(&pos.tid)?;
-        let opp_tid = if pos.dir == "UP" { &pos.tid_dn } else { &pos.tid_up };
-        let opp_bk = book_state.get(opp_tid)?;
+        // Find index of position to SL (if any)
+        let mut sl_idx: Option<usize> = None;
+        for (i, pos) in self.active.iter().enumerate() {
+            let our_bk = match book_state.get(&pos.tid) { Some(b) => b, None => continue };
+            let opp_tid = if pos.dir == "UP" { &pos.tid_dn } else { &pos.tid_up };
+            let opp_bk = match book_state.get(opp_tid) { Some(b) => b, None => continue };
 
-        let (fire, reason) = check_sl(
-            our_bk.best_bid,
-            our_bk.best_bid > 0.0,
-            pos.sl_px,
-            opp_bk.best_bid,
-            opp_bk.best_bid > 0.0,
-            self.exec.sl_confirm_bid,
-        );
+            let (fire, reason) = check_sl(
+                our_bk.best_bid,
+                our_bk.best_bid > 0.0,
+                pos.sl_px,
+                opp_bk.best_bid,
+                opp_bk.best_bid > 0.0,
+                self.exec.sl_confirm_bid,
+            );
 
-        if fire {
-            let pos = self.active.take().unwrap();
+            if fire {
+                sl_idx = Some(i);
+                break;
+            } else if reason == "THIN_BOOK" && !self.sl_skip_logged {
+                info!("  [{}] SL skip: bid={:.3}<={:.3} but opp_bid={:.3} (thin book, holding)",
+                    self.cfg.id, our_bk.best_bid, pos.sl_px, opp_bk.best_bid);
+                self.sl_skip_logged = true;
+            }
+        }
+
+        if let Some(idx) = sl_idx {
+            let pos = self.active.remove(idx);
+            let our_bk = book_state.get(&pos.tid).unwrap();
+            let opp_tid = if pos.dir == "UP" { &pos.tid_dn } else { &pos.tid_up };
+            let opp_bk = book_state.get(opp_tid).unwrap();
             let result = execute_sl(&pos, our_bk.best_bid, &self.exec, now);
 
             info!("═══════════════════════════════════════════════════════");
@@ -148,10 +164,6 @@ impl Tracker {
             self.done.insert(pos.slug.clone());
             self.log_trade(&result);
             return Some(result);
-        } else if reason == "THIN_BOOK" && !self.sl_skip_logged {
-            info!("  [{}] SL skip: bid={:.3}<={:.3} but opp_bid={:.3} (thin book, holding)",
-                self.cfg.id, our_bk.best_bid, pos.sl_px, opp_bk.best_bid);
-            self.sl_skip_logged = true;
         }
 
         None
@@ -166,14 +178,21 @@ impl Tracker {
         cl_opens:     &HashMap<String, f64>,
         now:          f64,
     ) -> Option<TradeResult> {
-        let pos = self.active.as_ref()?;
+        if self.active.is_empty() { return None; }
+
         let now_ts = now as i64;
 
-        if now_ts < pos.end_ts + self.exec.settle_delay_secs as i64 {
-            return None;
+        // Find first position ready for settlement
+        let mut settle_idx: Option<usize> = None;
+        for (i, pos) in self.active.iter().enumerate() {
+            if now_ts >= pos.end_ts + self.exec.settle_delay_secs as i64 {
+                settle_idx = Some(i);
+                break;
+            }
         }
 
-        let pos = self.active.take().unwrap();
+        let idx = settle_idx?;
+        let pos = self.active.remove(idx);
         let actual = resolve_settlement(book_state, cl_snapshots, cl_opens, &pos);
 
         if let Some(actual_dir) = actual {
@@ -200,7 +219,6 @@ impl Tracker {
             Some(result)
         } else {
             warn!("[{}] NO_SETTLE {} — returning stake", self.cfg.id, pos.slug);
-            self.active = None;
             None
         }
     }
@@ -219,8 +237,8 @@ impl Tracker {
         hour_ranges:  &HashMap<String, f64>,
         now:          f64,
     ) -> bool {
-        // Already have a position
-        if self.active.is_some() { return false; }
+        // Already at max positions
+        if self.active.len() >= self.cfg.max_positions { return false; }
 
         // Already traded this slug
         if self.done.contains(win.slug) { return false; }
@@ -298,7 +316,7 @@ impl Tracker {
             pos.entry_fee, pos.sl_px);
         info!("═══════════════════════════════════════════════════════");
 
-        self.active = Some(pos);
+        self.active.push(pos);
         self.sl_skip_logged = false;
         self.done.insert(win.slug.to_string());
         self.maker_ticks.remove(win.slug);
@@ -417,7 +435,7 @@ impl Tracker {
             crate::execution::maker_price(best_ask, self.cfg.min_entry), pos.entry_fee, pos.sl_px);
         info!("═══════════════════════════════════════════════════════");
 
-        self.active = Some(pos);
+        self.active.push(pos);
         self.sl_skip_logged = false;
         self.done.insert(win.slug.to_string());
         self.delta_ticks.remove(win.slug);
@@ -454,20 +472,22 @@ impl Tracker {
     // -- Status ---------------------------------------------------------------
 
     pub fn status(&self) -> String {
-        let active = if self.active.is_some() { "*" } else { "" };
+        let n = self.active.len();
+        let active = if n > 0 { format!("*{}", n) } else { String::new() };
         if self.stats.total() > 0 {
             format!("{}{}:{}W/{}L/{}S${:+.1}",
                 self.cfg.id, active, self.stats.wins, self.stats.losses,
                 self.stats.sl_count, self.stats.pnl)
-        } else if self.active.is_some() {
-            format!("{}*:active", self.cfg.id)
+        } else if n > 0 {
+            format!("{}{}:active", self.cfg.id, active)
         } else {
             format!("{}:-", self.cfg.id)
         }
     }
 
     pub fn print_stats(&self) {
-        let active = if self.active.is_some() { " [ACTIVE]" } else { "" };
+        let n = self.active.len();
+        let active = if n > 0 { format!(" [ACTIVE x{}]", n) } else { String::new() };
         info!("  [{}] {}W/{}L/{}S  WR={:.0}%  P&L=${:+.2}{}",
             self.cfg.id, self.stats.wins, self.stats.losses, self.stats.sl_count,
             self.stats.wr(), self.stats.pnl, active);

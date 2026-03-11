@@ -180,3 +180,4 @@ entry_start     = 25
 taker_deadline  = 3
 min_entry       = 0.95
 max_entry       = 0.975
+max_positions   = 2

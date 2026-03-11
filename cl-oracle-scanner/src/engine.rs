@@ -25,8 +25,8 @@ pub const STDEV_BASE: f64 = 0.167;
 pub const MIN_DELTA: &[(&str, f64)] = &[
     ("btc", 0.015),
     ("eth", 0.020),
-    ("sol", 0.030),
-    ("xrp", 0.050),
+    ("sol", 0.0375),
+    ("xrp", 0.0625),
 ];
 
 pub fn stdev_scale(asset: &str) -> f64 {
@@ -63,7 +63,13 @@ pub struct EngineConfig {
     // Book price range
     pub min_entry:       f64,       // minimum ask price to enter
     pub max_entry:       f64,       // maximum ask price to enter
+
+    // Max concurrent positions (default 1)
+    #[serde(default = "default_max_pos")]
+    pub max_positions:   usize,
 }
+
+fn default_max_pos() -> usize { 1 }
 
 impl EngineConfig {
     /// Get the stdev-scaled delta threshold for a specific asset
@@ -98,26 +104,31 @@ pub fn default_engines() -> Vec<EngineConfig> {
             id: "A".into(), tf: 5, delta: 0.04, continuity: 4,
             bn_contra: true, cl_fade: true, regime: true, is_late_scalper: false,
             entry_start: 57, taker_deadline: 44, min_entry: 0.88, max_entry: 0.98,
+            max_positions: 1,
         },
         EngineConfig {
             id: "B".into(), tf: 5, delta: 0.15, continuity: 0,
             bn_contra: true, cl_fade: true, regime: true, is_late_scalper: false,
             entry_start: 57, taker_deadline: 44, min_entry: 0.88, max_entry: 0.98,
+            max_positions: 1,
         },
         EngineConfig {
             id: "C".into(), tf: 15, delta: 0.04, continuity: 4,
             bn_contra: true, cl_fade: true, regime: true, is_late_scalper: false,
             entry_start: 57, taker_deadline: 44, min_entry: 0.88, max_entry: 0.98,
+            max_positions: 1,
         },
         EngineConfig {
             id: "D".into(), tf: 15, delta: 0.15, continuity: 0,
             bn_contra: true, cl_fade: true, regime: true, is_late_scalper: false,
             entry_start: 57, taker_deadline: 44, min_entry: 0.88, max_entry: 0.98,
+            max_positions: 1,
         },
         EngineConfig {
             id: "E".into(), tf: 0, delta: 0.0, continuity: 0,
             bn_contra: false, cl_fade: false, regime: false, is_late_scalper: true,
             entry_start: 25, taker_deadline: 3, min_entry: 0.95, max_entry: 0.975,
+            max_positions: 2,
         },
     ]
 }
