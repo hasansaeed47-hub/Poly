@@ -116,6 +116,12 @@ impl ClobClient {
         }).await
     }
 
+    /// Pre-authenticate so the first real order doesn't pay the auth latency.
+    pub async fn ensure_auth(&self) -> Result<()> {
+        let _ = self.client().await?;
+        Ok(())
+    }
+
     /// Build, sign, and place a limit order (GTC)
     pub async fn place_limit_order(
         &self,

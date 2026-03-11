@@ -198,6 +198,13 @@ async fn main() -> Result<()> {
 
     let live_mode = clob_client.is_some();
 
+    // Pre-authenticate SDK so first order doesn't pay 1-2s auth latency
+    if let Some(ref clob) = clob_client {
+        if let Err(e) = clob.ensure_auth().await {
+            warn!("SDK pre-auth failed (will retry on first order): {:#}", e);
+        }
+    }
+
     info!("═══════════════════════════════════════════════════════");
     info!("  SNIPER FINAL v1.0 — {}", if live_mode { "LIVE (SDK)" } else { "PAPER MODE" });
     info!("═══════════════════════════════════════════════════════");
@@ -574,16 +581,19 @@ async fn main() -> Result<()> {
                     if let (Some(clob), Some(pos)) = (&clob_client, &tr.active) {
                         let c = clob.clone();
                         let tid = pos.tid.clone();
-                        let px = pos.fill_px;
+                        // Use tight limit price: current book ask + slip (not fill_px which can be
+                        // much higher and would sweep a crashed book if there's auth/network delay)
+                        let book_ask = book_state.get(&tid).map(|b| b.best_ask).unwrap_or(pos.fill_px);
+                        let limit_px = (book_ask + exec_cfg.slip).min(pos.fill_px);
                         let shares = pos.shares;
                         let eid = pos.engine_id.clone();
                         let slug_s = pos.slug.clone();
                         tokio::spawn(async move {
-                            debug!("[CLOB] [{}] BUY attempt for {}: px={} shares={} tid={}",
-                                eid, slug_s, px, shares, &tid[..tid.len().min(20)]);
-                            match c.place_limit_order(&tid, px, shares, "BUY").await {
+                            debug!("[CLOB] [{}] BUY attempt for {}: limit_px={} shares={} tid={}",
+                                eid, slug_s, limit_px, shares, &tid[..tid.len().min(20)]);
+                            match c.place_limit_order(&tid, limit_px, shares, "BUY").await {
                                 Ok(resp) => info!("[CLOB] [{}] BUY placed for {}: {:?}", eid, slug_s, resp),
-                                Err(e) => warn!("[CLOB] [{}] BUY failed for {} (px={} sz={}): {:#}", eid, slug_s, px, shares, e),
+                                Err(e) => warn!("[CLOB] [{}] BUY failed for {} (px={} sz={}): {:#}", eid, slug_s, limit_px, shares, e),
                             }
                         });
                     }
