@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 # -- Official Polymarket SDK (replaces hand-rolled wallet.rs + order.rs) --
 polymarket-client-sdk = { version = "0.4", features = ["clob"] }
-alloy    = { version = "1", features = ["signers", "signer-local"] }
+alloy    = { version = "1", features = ["signers", "signer-local", "contract", "provider-http"] }
 rust_decimal       = "1"
 rust_decimal_macros = "1"
 
@@ -41,6 +41,14 @@ path = "src/main.rs"
 [[bin]]
 name = "test_order"
 path = "src/bin/test_order.rs"
+
+[[bin]]
+name = "check_approvals"
+path = "src/bin/check_approvals.rs"
+
+[[bin]]
+name = "set_approvals"
+path = "src/bin/set_approvals.rs"
 
 [dev-dependencies]
 tempfile = "3"
