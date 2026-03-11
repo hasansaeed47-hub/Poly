@@ -1,6 +1,6 @@
 [package]
 name    = "lag_scanner"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
 
 [dependencies]
@@ -20,6 +20,15 @@ chrono           = { version = "0.4", features = ["serde"] }
 tokio-retry      = "0.3"
 url              = "2"
 dotenvy          = "0.15"
+
+# -- Crypto / signing (EIP-712 order signing + HMAC L2 auth) --
+k256             = { version = "0.13", features = ["ecdsa"] }
+sha3             = "0.10"              # keccak256
+sha2             = "0.10"              # HMAC-SHA256
+hmac             = "0.12"
+base64           = "0.22"
+hex              = "0.4"
+rand             = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
