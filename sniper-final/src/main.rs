@@ -513,7 +513,7 @@ async fn main() -> Result<()> {
                         if let Some(result) = tr.check_stop_loss(&book_state, now) {
                             if let Some(ref clob) = clob_client {
                                 let c = clob.clone();
-                                let tid = result.slug.clone();
+                                let tid = result.tid.clone();
                                 let exit_px = result.exit_px;
                                 let shares = result.shares;
                                 let eid = result.engine_id.clone();

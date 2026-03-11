@@ -37,6 +37,7 @@ pub struct Position {
 pub struct TradeResult {
     pub engine_id:   String,
     pub slug:        String,
+    pub tid:         String,      // token ID of our side (for CLOB sell)
     pub asset:       String,
     pub dir:         String,
     pub fill_px:     f64,
@@ -168,6 +169,7 @@ pub fn execute_sl(pos: &Position, our_bid: f64, exec: &ExecConfig, now: f64) -> 
     TradeResult {
         engine_id:   pos.engine_id.clone(),
         slug:        pos.slug.clone(),
+        tid:         pos.tid.clone(),
         asset:       pos.asset.clone(),
         dir:         pos.dir.clone(),
         fill_px:     pos.fill_px,
@@ -241,6 +243,7 @@ pub fn execute_settlement(pos: &Position, actual_dir: &str, exec: &ExecConfig, n
     TradeResult {
         engine_id:   pos.engine_id.clone(),
         slug:        pos.slug.clone(),
+        tid:         pos.tid.clone(),
         asset:       pos.asset.clone(),
         dir:         pos.dir.clone(),
         fill_px:     pos.fill_px,
