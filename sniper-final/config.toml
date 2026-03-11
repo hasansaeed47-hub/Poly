@@ -1,0 +1,126 @@
+# Sniper Final v1.0 — Hybrid Live Execution Config
+# Order placement via official Polymarket Rust SDK (polymarket-client-sdk).
+# All thresholds here — nothing hardcoded in binary.
+#
+# If private_key is not set (here or via env vars), runs in PAPER mode.
+
+# ── WALLET ───────────────────────────────────────────────────────────
+# SDK handles API key derivation, EIP-712 signing, HMAC auth internally.
+# Only private_key is needed.
+
+[wallet]
+# private_key = "0x..."
+# api_url     = "https://clob.polymarket.com"
+
+[feed]
+assets = ["btc", "eth", "sol", "xrp"]
+timeframes = [5, 15]
+
+clob_rest    = "https://clob.polymarket.com"
+clob_ws      = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+live_ws      = "wss://ws-live-data.polymarket.com"
+bn_ws        = "wss://stream.binance.com:9443/ws"
+gamma_api    = "https://gamma-api.polymarket.com"
+
+rest_throttle_ms = 500
+book_warmup_secs = 5
+max_open_delay = 5.0
+
+[scan]
+tick_ms = 500
+
+# ── EXECUTION — proven from cl-sniper-10mar (100% WR day) ───────────
+
+[exec]
+stake = 5.0
+max_dd = 50.0
+sl_pct = 0.50
+sl_confirm_bid = 0.80
+slip = 0.005
+maker_chase_ticks = 4
+settle_delay_secs = 8
+regime_thresh = 0.3
+bn_contra_thresh = 0.02
+cl_fade_thresh = 0.03
+bn_contra_secs = 15
+cl_fade_secs = 10
+
+# ── ENGINES A-E ─────────────────────────────────────────────────────
+#
+# A: 5m sniper  — low delta (0.04%), continuity=4 ticks, all filters
+# B: 5m D1      — high delta (0.15%), instant, all filters
+# C: 15m sniper — low delta (0.04%), continuity=4 ticks, all filters
+# D: 15m D1     — high delta (0.15%), instant, all filters
+# E: late scalp — book-price driven, no filters, last 25s only
+#
+# Stdev scaling per asset: BTC 1.0x  ETH 1.16x  SOL 1.48x  XRP 2.63x
+
+[engines.a]
+id              = "A"
+tf              = 5
+delta           = 0.04
+continuity      = 4
+bn_contra       = true
+cl_fade         = true
+regime          = true
+is_late_scalper = false
+entry_start     = 57
+taker_deadline  = 44
+min_entry       = 0.88
+max_entry       = 0.98
+
+[engines.b]
+id              = "B"
+tf              = 5
+delta           = 0.15
+continuity      = 0
+bn_contra       = true
+cl_fade         = true
+regime          = true
+is_late_scalper = false
+entry_start     = 57
+taker_deadline  = 44
+min_entry       = 0.88
+max_entry       = 0.98
+
+[engines.c]
+id              = "C"
+tf              = 15
+delta           = 0.04
+continuity      = 4
+bn_contra       = true
+cl_fade         = true
+regime          = true
+is_late_scalper = false
+entry_start     = 57
+taker_deadline  = 44
+min_entry       = 0.88
+max_entry       = 0.98
+
+[engines.d]
+id              = "D"
+tf              = 15
+delta           = 0.15
+continuity      = 0
+bn_contra       = true
+cl_fade         = true
+regime          = true
+is_late_scalper = false
+entry_start     = 57
+taker_deadline  = 44
+min_entry       = 0.88
+max_entry       = 0.98
+
+[engines.e]
+id              = "E"
+tf              = 0
+delta           = 0.0
+continuity      = 0
+bn_contra       = false
+cl_fade         = false
+regime          = false
+is_late_scalper = true
+entry_start     = 25
+taker_deadline  = 3
+min_entry       = 0.95
+max_entry       = 0.975
