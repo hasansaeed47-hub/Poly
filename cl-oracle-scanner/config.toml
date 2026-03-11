@@ -1,5 +1,16 @@
 # CL Sniper v3.0 — Hybrid Live Execution Config
 # All thresholds here — nothing hardcoded in binary
+#
+# ── WALLET / API CREDENTIALS (env vars or .env file) ─────────────────
+# PRIVATE_KEY       = "0x..."    (Polygon wallet, required for live mode)
+# CLOB_API_KEY      = "..."      (L2 API key, optional — auto-derived if missing)
+# CLOB_API_SECRET   = "..."      (L2 API secret, base64)
+# CLOB_PASSPHRASE   = "..."      (L2 API passphrase)
+# CLOB_API_URL      = "https://clob.polymarket.com"  (default)
+# NEG_RISK          = "true"     (use neg-risk exchange, default: false)
+#
+# If PRIVATE_KEY is not set, runs in PAPER mode (no live orders).
+# ─────────────────────────────────────────────────────────────────────
 
 [feed]
 # Assets with Chainlink feeds on Polymarket RTDS
