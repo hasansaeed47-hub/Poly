@@ -85,6 +85,7 @@ pub struct Order {
 }
 
 /// Signed order ready for POST /order
+/// Matches py-clob-client: order_to_json(order, owner=api_key, orderType, postOnly)
 #[derive(Debug, Serialize)]
 pub struct PostOrderBody {
     pub order:      Order,
@@ -93,8 +94,6 @@ pub struct PostOrderBody {
     pub order_type: String,
     #[serde(rename = "postOnly")]
     pub post_only:  bool,
-    #[serde(rename = "negRisk")]
-    pub neg_risk:   bool,
 }
 
 // -- EIP-712 hashing ----------------------------------------------------------
@@ -354,18 +353,21 @@ impl ClobClient {
     ) -> Result<serde_json::Value> {
         let path = "/order";
 
+        // owner = API key (not wallet address) — matches py-clob-client
+        let creds = self.creds.as_ref()
+            .ok_or_else(|| anyhow!("API credentials not set"))?;
+
         let body = PostOrderBody {
-            owner:      self.wallet.address().to_string(),
+            owner:      creds.api_key.clone(),
             order,
             order_type: order_type.to_string(),
             post_only,
-            neg_risk:   self.neg_risk,
         };
 
         let body_str = serde_json::to_string(&body)
             .context("serialize order body")?;
-        // Replace single quotes for HMAC compat (matches py-clob-client behavior)
-        let body_str = body_str.replace('\'', "\"");
+
+        debug!("[ORDER] POST /order body: {}", body_str);
 
         let headers = self.l2_headers("POST", path, &body_str)?;
 
