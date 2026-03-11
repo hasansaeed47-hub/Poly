@@ -18,9 +18,11 @@
 mod engine;
 mod execution;
 mod feeds;
+mod order;
 mod runner;
 #[allow(dead_code)]
 mod signal;
+mod wallet;
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -42,7 +44,9 @@ use feeds::{
     build_slug, cl_at, current_window_starts, fetch_books_batch, fetch_market_meta, hour_range,
     run_bn_feed, run_book_feed, run_cl_feed, MarketMeta,
 };
+use order::ClobClient;
 use runner::{Tracker, MarketWindow};
+use wallet::Wallet;
 
 // -- Config file types --------------------------------------------------------
 
@@ -166,8 +170,40 @@ async fn main() -> Result<()> {
         None => default_engines(),
     };
 
+    // -- Initialize CLOB client (optional: only if PRIVATE_KEY is set) --------
+
+    let clob_client: Option<Arc<ClobClient>> = match std::env::var("PRIVATE_KEY") {
+        Ok(pk) => {
+            let w = Wallet::from_hex(&pk).context("invalid PRIVATE_KEY")?;
+            info!("Wallet loaded: {}", w.address());
+
+            let creds = match (
+                std::env::var("CLOB_API_KEY"),
+                std::env::var("CLOB_API_SECRET"),
+                std::env::var("CLOB_PASSPHRASE"),
+            ) {
+                (Ok(k), Ok(s), Ok(p)) => Some(order::ApiCreds {
+                    api_key: k, api_secret: s, api_passphrase: p,
+                }),
+                _ => None,
+            };
+
+            let neg_risk = std::env::var("NEG_RISK").unwrap_or_default() == "true";
+            let base = std::env::var("CLOB_API_URL")
+                .unwrap_or_else(|_| "https://clob.polymarket.com".into());
+            let client = ClobClient::new(&base, w, creds, neg_risk);
+            Some(Arc::new(client))
+        }
+        Err(_) => {
+            warn!("PRIVATE_KEY not set — running in PAPER mode (no live orders)");
+            None
+        }
+    };
+
+    let live_mode = clob_client.is_some();
+
     info!("═══════════════════════════════════════════════════════");
-    info!("  CL SNIPER v3.0 — HYBRID LIVE EXECUTION");
+    info!("  CL SNIPER v3.0 — {}", if live_mode { "LIVE EXECUTION" } else { "PAPER MODE" });
     info!("═══════════════════════════════════════════════════════");
     info!("  Assets: {:?}", cfg.feed.assets);
     info!("  Timeframes: {:?}m", cfg.feed.timeframes);
@@ -492,7 +528,28 @@ async fn main() -> Result<()> {
             for tr in &mut trackers {
                 if let Some(pos) = &tr.active {
                     if pos.slug == *slug {
-                        tr.check_stop_loss(&book_state, now);
+                        if let Some(result) = tr.check_stop_loss(&book_state, now) {
+                            // Live SL: sell position on CLOB
+                            if let Some(ref clob) = clob_client {
+                                let c = clob.clone();
+                                let tid = result.slug.clone();
+                                let exit_px = result.exit_px;
+                                let shares = result.shares;
+                                let eid = result.engine_id.clone();
+                                tokio::spawn(async move {
+                                    // Sell at exit_px (taker) to exit quickly
+                                    match c.place_market_order(&tid, exit_px, shares, "SELL").await {
+                                        Ok(resp) => info!("[CLOB] [{}] SL SELL placed: {:?}", eid, resp),
+                                        Err(e) => warn!("[CLOB] [{}] SL SELL failed: {}", eid, e),
+                                    }
+                                });
+                            }
+                            log_json(&mut event_log, &serde_json::json!({
+                                "event": "SL", "ts": now, "slug": slug,
+                                "engine": result.engine_id, "dir": result.dir,
+                                "pnl": result.pnl, "exit_px": result.exit_px,
+                            }));
+                        }
                     }
                 }
             }
@@ -530,10 +587,36 @@ async fn main() -> Result<()> {
             };
 
             for tr in &mut trackers {
-                tr.evaluate_entry(
+                let entered = tr.evaluate_entry(
                     &win, &cl_prices, &cl_snapshots, &cl_opens,
                     &book_state, &bn_prices, &bn_hist, &hour_ranges, now,
                 );
+
+                // Live entry: place BUY order on CLOB
+                if entered {
+                    if let (Some(ref clob), Some(ref pos)) = (&clob_client, &tr.active) {
+                        let c = clob.clone();
+                        let tid = pos.tid.clone();
+                        let px = pos.fill_px;
+                        let shares = pos.shares;
+                        let eid = pos.engine_id.clone();
+                        let slug_s = pos.slug.clone();
+                        tokio::spawn(async move {
+                            match c.place_limit_order(&tid, px, shares, "BUY").await {
+                                Ok(resp) => info!("[CLOB] [{}] BUY placed for {}: {:?}", eid, slug_s, resp),
+                                Err(e) => warn!("[CLOB] [{}] BUY failed for {}: {}", eid, slug_s, e),
+                            }
+                        });
+                    }
+
+                    log_json(&mut event_log, &serde_json::json!({
+                        "event": "ENTRY", "ts": now, "slug": slug,
+                        "engine": tr.cfg.id,
+                        "dir": tr.active.as_ref().map(|p| p.dir.as_str()).unwrap_or("?"),
+                        "fill_px": tr.active.as_ref().map(|p| p.fill_px).unwrap_or(0.0),
+                        "asset": tr.active.as_ref().map(|p| p.asset.as_str()).unwrap_or("?"),
+                    }));
+                }
             }
         }
 
