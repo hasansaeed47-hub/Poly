@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use hmac::{Hmac, Mac};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Serializer};
 use sha2::Sha256;
 use tracing::{info, warn, debug};
 
@@ -60,11 +60,33 @@ pub struct ApiCreds {
 
 // -- Order struct (EIP-712) ---------------------------------------------------
 
+// Custom serializer: serialize u128 as JSON string (for large uint256 values like salt)
+fn ser_u128_as_str<S: Serializer>(v: &u128, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(&v.to_string())
+}
+
+// Custom serializer: serialize u128 as JSON integer (for small values like nonce, expiration)
+fn ser_u128_as_int<S: Serializer>(v: &u128, s: S) -> std::result::Result<S::Ok, S::Error> {
+    // Safe for values < u64::MAX
+    s.serialize_u64(*v as u64)
+}
+
+// Custom serializer: side u8 → "BUY"/"SELL" string for JSON
+fn ser_side<S: Serializer>(v: &u8, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_str(if *v == SIDE_BUY { "BUY" } else { "SELL" })
+}
+
+// Custom serializer: u8 as JSON integer
+fn ser_u8_as_int<S: Serializer>(v: &u8, s: S) -> std::result::Result<S::Ok, S::Error> {
+    s.serialize_u8(*v)
+}
+
 /// Order fields matching the on-chain CTF Exchange Order struct.
-/// All uint256 fields are stored as String for JSON serialization.
+/// Types match what the Polymarket CLOB REST API expects in JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
-    pub salt:           String,
+    #[serde(serialize_with = "ser_u128_as_str")]
+    pub salt:           u128,
     pub maker:          String,
     pub signer:         String,
     pub taker:          String,
@@ -74,13 +96,16 @@ pub struct Order {
     pub maker_amount:   String,
     #[serde(rename = "takerAmount")]
     pub taker_amount:   String,
-    pub expiration:     String,
-    pub nonce:          String,
-    #[serde(rename = "feeRateBps")]
-    pub fee_rate_bps:   String,
-    pub side:           String,
-    #[serde(rename = "signatureType")]
-    pub signature_type: String,
+    #[serde(serialize_with = "ser_u128_as_int")]
+    pub expiration:     u128,
+    #[serde(serialize_with = "ser_u128_as_int")]
+    pub nonce:          u128,
+    #[serde(rename = "feeRateBps", serialize_with = "ser_u128_as_int")]
+    pub fee_rate_bps:   u128,
+    #[serde(serialize_with = "ser_side")]
+    pub side:           u8,
+    #[serde(rename = "signatureType", serialize_with = "ser_u8_as_int")]
+    pub signature_type: u8,
     pub signature:      String,
 }
 
@@ -126,18 +151,18 @@ fn order_struct_hash(order: &Order) -> [u8; 32] {
 
     let mut encoded = Vec::with_capacity(416);
     encoded.extend_from_slice(&type_hash);
-    encoded.extend_from_slice(&uint256_from_str(&order.salt));
+    encoded.extend_from_slice(&uint256_bytes(order.salt));
     encoded.extend_from_slice(&address_bytes(&order.maker));
     encoded.extend_from_slice(&address_bytes(&order.signer));
     encoded.extend_from_slice(&address_bytes(&order.taker));
     encoded.extend_from_slice(&uint256_from_str(&order.token_id));
     encoded.extend_from_slice(&uint256_from_str(&order.maker_amount));
     encoded.extend_from_slice(&uint256_from_str(&order.taker_amount));
-    encoded.extend_from_slice(&uint256_from_str(&order.expiration));
-    encoded.extend_from_slice(&uint256_from_str(&order.nonce));
-    encoded.extend_from_slice(&uint256_from_str(&order.fee_rate_bps));
-    encoded.extend_from_slice(&uint8_bytes(order.side.parse::<u8>().unwrap_or(0)));
-    encoded.extend_from_slice(&uint8_bytes(order.signature_type.parse::<u8>().unwrap_or(0)));
+    encoded.extend_from_slice(&uint256_bytes(order.expiration));
+    encoded.extend_from_slice(&uint256_bytes(order.nonce));
+    encoded.extend_from_slice(&uint256_bytes(order.fee_rate_bps));
+    encoded.extend_from_slice(&uint8_bytes(order.side));
+    encoded.extend_from_slice(&uint8_bytes(order.signature_type));
 
     keccak256(&encoded)
 }
@@ -312,18 +337,18 @@ impl ClobClient {
         let side_u8 = if side == "BUY" { SIDE_BUY } else { SIDE_SELL };
 
         let mut order = Order {
-            salt:           salt.to_string(),
+            salt,
             maker:          self.wallet.address().to_string(),
             signer:         self.wallet.address().to_string(),
             taker:          ZERO_ADDRESS.to_string(),
             token_id:       token_id.to_string(),
             maker_amount:   maker_amount.to_string(),
             taker_amount:   taker_amount.to_string(),
-            expiration:     "0".to_string(),
-            nonce:          "0".to_string(),
-            fee_rate_bps:   fee_rate_bps.to_string(),
-            side:           side_u8.to_string(),
-            signature_type: SIG_EOA.to_string(),
+            expiration:     0,
+            nonce:          0,
+            fee_rate_bps:   fee_rate_bps as u128,
+            side:           side_u8,
+            signature_type: SIG_EOA,
             signature:      String::new(),
         };
 
@@ -435,18 +460,18 @@ mod tests {
     #[test]
     fn order_struct_hash_deterministic() {
         let order = Order {
-            salt: "12345".into(),
+            salt: 12345,
             maker: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".into(),
             signer: "0xf39fd6e51aad88f6f4ce6ab8827279cfffb92266".into(),
             taker: ZERO_ADDRESS.into(),
             token_id: "71321045679252212594626385532706912750332728571942532289631379312455583992563".into(),
             maker_amount: "5000000".into(),
             taker_amount: "10000000".into(),
-            expiration: "0".into(),
-            nonce: "0".into(),
-            fee_rate_bps: "0".into(),
-            side: "0".into(),
-            signature_type: "0".into(),
+            expiration: 0,
+            nonce: 0,
+            fee_rate_bps: 0,
+            side: SIDE_BUY,
+            signature_type: SIG_EOA,
             signature: String::new(),
         };
         let h1 = order_struct_hash(&order);
@@ -479,8 +504,19 @@ mod tests {
         // BUY 10 shares @ 0.50: maker pays 5 USDC (5_000_000), receives 10 shares (10_000_000)
         assert_eq!(order.maker_amount, "5000000");
         assert_eq!(order.taker_amount, "10000000");
-        assert_eq!(order.side, "0"); // BUY
+        assert_eq!(order.side, SIDE_BUY);
         assert!(order.signature.starts_with("0x"));
+
+        // Verify JSON serialization matches Polymarket API format
+        let json = serde_json::to_value(&order).unwrap();
+        assert!(json["salt"].is_string(), "salt must be string (large uint256)");
+        assert_eq!(json["side"].as_str().unwrap(), "BUY", "side must be BUY string");
+        assert!(json["expiration"].is_number(), "expiration must be integer");
+        assert!(json["nonce"].is_number(), "nonce must be integer");
+        assert!(json["feeRateBps"].is_number(), "feeRateBps must be integer");
+        assert!(json["signatureType"].is_number(), "signatureType must be integer");
+        assert!(json["makerAmount"].is_string(), "makerAmount must be string");
+        assert!(json["takerAmount"].is_string(), "takerAmount must be string");
     }
 
     #[test]
@@ -499,7 +535,7 @@ mod tests {
         // SELL 5 shares @ 0.90: maker pays 5 shares (5_000_000), receives 4.5 USDC (4_500_000)
         assert_eq!(order.maker_amount, "5000000");
         assert_eq!(order.taker_amount, "4500000");
-        assert_eq!(order.side, "1"); // SELL
+        assert_eq!(order.side, SIDE_SELL);
     }
 
     #[test]
