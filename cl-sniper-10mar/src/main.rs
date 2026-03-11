@@ -492,6 +492,7 @@ struct Tracker {
     done: HashSet<String>,        // slugs already traded or SL'd this cycle
     delta_ticks: HashMap<String, u32>,
     maker_ticks: HashMap<String, u32>,  // slug → ticks since maker posted
+    sl_skip_logged: bool,               // throttle "thin book" SL skip log
 }
 
 impl Tracker {
@@ -501,6 +502,7 @@ impl Tracker {
             active: None, done: HashSet::new(),
             delta_ticks: HashMap::new(),
             maker_ticks: HashMap::new(),
+            sl_skip_logged: false,
         }
     }
     fn total(&self) -> u32 { self.w + self.l + self.sl_count }
@@ -609,34 +611,41 @@ impl Sniper {
             if let Some(pt) = &tr.active {
                 let now = Utc::now().timestamp();
 
-                // SL: bid ≤ 50% of fill
-                // Skip SL in last 15s — books get thin near settlement causing false triggers
-                let secs_left = pt.end_ts - now;
-                let sl_enabled = if tr.cfg.is_late_scalper {
-                    false  // Engine E: never SL — too little time, hold to settlement
-                } else {
-                    secs_left > 15  // A-D: disable SL in last 15s
-                };
-
+                // SL: bid ≤ 50% of fill — but only if the opposing side confirms
+                // A real adverse move: our bid tanks AND opposing bid is high (market flipped)
+                // A thin book: our bid tanks AND opposing bid is ALSO low (no market)
                 let bk = self.bk.get(&pt.tid);
-                if sl_enabled && bk.hb && bk.bb <= pt.sl_px {
-                    let recovery = pt.shares * (bk.bb - SLIP).max(0.0);
-                    let exit_fee = pm_fee(bk.bb) * pt.shares;
-                    let pnl = recovery - STAKE - pt.entry_fee - exit_fee;
+                let opp_tid = if pt.dir == "UP" { &pt.tid_dn } else { &pt.tid_up };
+                let opp = self.bk.get(opp_tid);
 
-                    info!("═══════════════════════════════════════════════════════");
-                    info!("  [{}] ██ SL ██ {} {} {}m", tr.cfg.id, pt.dir, pt.asset.to_uppercase(), wins.iter().find(|w| w.slug == pt.slug).map(|w| w.wmin).unwrap_or(0));
-                    info!("  bid={:.3} ≤ {:.3} (50% of {:.3})", bk.bb, pt.sl_px, pt.px);
-                    info!("  recovery=${:.2}  fee=${:.2}  P&L=${:+.2}", recovery, pt.entry_fee + exit_fee, pnl);
-                    info!("  ⚠ SELL NOW at market — skip rest of window");
-                    info!("═══════════════════════════════════════════════════════");
+                if bk.hb && bk.bb <= pt.sl_px {
+                    let real_flip = opp.hb && opp.bb >= 0.80;
 
-                    tr.sl_count += 1;
-                    tr.pnl += pnl;
-                    // Window skip: mark slug as done so no re-entry
-                    tr.done.insert(pt.slug.clone());
-                    tr.active = None;
-                    continue;
+                    if real_flip {
+                        // Confirmed adverse move — opposing side bid is high
+                        let recovery = pt.shares * (bk.bb - SLIP).max(0.0);
+                        let exit_fee = pm_fee(bk.bb) * pt.shares;
+                        let pnl = recovery - STAKE - pt.entry_fee - exit_fee;
+
+                        info!("═══════════════════════════════════════════════════════");
+                        info!("  [{}] ██ SL ██ {} {} {}m", tr.cfg.id, pt.dir, pt.asset.to_uppercase(), wins.iter().find(|w| w.slug == pt.slug).map(|w| w.wmin).unwrap_or(0));
+                        info!("  bid={:.3} ≤ {:.3} (50% of {:.3})  opp_bid={:.3} ← CONFIRMED",
+                            bk.bb, pt.sl_px, pt.px, opp.bb);
+                        info!("  recovery=${:.2}  fee=${:.2}  P&L=${:+.2}", recovery, pt.entry_fee + exit_fee, pnl);
+                        info!("  ⚠ SELL NOW at market — skip rest of window");
+                        info!("═══════════════════════════════════════════════════════");
+
+                        tr.sl_count += 1;
+                        tr.pnl += pnl;
+                        tr.done.insert(pt.slug.clone());
+                        tr.active = None;
+                        continue;
+                    } else if !tr.sl_skip_logged {
+                        // Thin book — our bid is low but opposing side isn't high
+                        info!("  [{}] SL skip: bid={:.3}≤{:.3} but opp_bid={:.3} (thin book, holding)",
+                            tr.cfg.id, bk.bb, pt.sl_px, opp.bb);
+                        tr.sl_skip_logged = true;
+                    }
                 }
 
                 // Settlement: end_ts + 8s (give PM time to settle books)
@@ -772,6 +781,7 @@ impl Sniper {
                         tid_up: w.tid_up.clone(), tid_dn: w.tid_dn.clone(),
                         slug: w.slug.clone(), entry_fee,
                     });
+                    tr.sl_skip_logged = false;
                     tr.done.insert(w.slug.clone());
                     tr.maker_ticks.remove(&w.slug);
                     break;
@@ -873,6 +883,7 @@ impl Sniper {
                         tid_up: w.tid_up.clone(), tid_dn: w.tid_dn.clone(),
                         slug: w.slug.clone(), entry_fee,
                     });
+                    tr.sl_skip_logged = false;
                     tr.done.insert(w.slug.clone());
                     tr.delta_ticks.remove(&w.slug);
                     tr.maker_ticks.remove(&w.slug);
