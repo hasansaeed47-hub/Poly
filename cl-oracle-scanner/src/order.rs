@@ -2,12 +2,8 @@
 ///
 /// Implements:
 /// 1. EIP-712 order signing (domain: "Polymarket CTF Exchange", v1)
-/// 2. L1 auth: EIP-712 signed ClobAuthDomain messages
-/// 3. L2 auth: HMAC-SHA256 request signing with API credentials
-/// 4. POST /order — place signed limit orders
-/// 5. DELETE /order — cancel orders
-/// 6. GET /data/order — poll order status
-/// 7. POST /auth/derive-api-key — derive L2 credentials from wallet
+/// 2. L2 auth: HMAC-SHA256 request signing with API credentials
+/// 3. POST /order — place signed limit / market orders
 ///
 /// Reference: https://docs.polymarket.com/developers/CLOB/authentication
 /// Order struct: https://github.com/Polymarket/python-order-utils
@@ -40,11 +36,6 @@ const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 // EIP-712 domain for order signing
 const ORDER_DOMAIN_NAME: &str = "Polymarket CTF Exchange";
 const ORDER_DOMAIN_VERSION: &str = "1";
-
-// EIP-712 domain for CLOB auth
-const CLOB_DOMAIN_NAME: &str = "ClobAuthDomain";
-const CLOB_DOMAIN_VERSION: &str = "1";
-const CLOB_AUTH_MSG: &str = "This message attests that I control the given wallet";
 
 // BUY = 0, SELL = 1
 const SIDE_BUY: u8 = 0;
@@ -102,17 +93,6 @@ pub struct PostOrderBody {
     pub order_type: String,
     #[serde(rename = "postOnly")]
     pub post_only:  bool,
-}
-
-/// Order status from GET /data/order
-#[derive(Debug, Deserialize)]
-pub struct OrderStatus {
-    pub id:              Option<String>,
-    pub status:          Option<String>,
-    #[serde(default)]
-    pub size_matched:    Option<String>,
-    #[serde(default)]
-    pub associate_trades: Option<serde_json::Value>,
 }
 
 // -- EIP-712 hashing ----------------------------------------------------------
@@ -285,88 +265,6 @@ impl ClobClient {
         ])
     }
 
-    /// Build L1 auth headers (EIP-712 wallet signature)
-    fn l1_headers(&self, nonce: u64) -> Result<Vec<(String, String)>> {
-        let ts = now_timestamp();
-
-        // Build ClobAuth EIP-712 struct
-        let type_hash = keccak256(
-            b"ClobAuth(address address,string timestamp,uint256 nonce,string message)"
-        );
-        let addr_bytes = address_bytes(self.wallet.address());
-        let ts_hash = keccak256(ts.as_bytes());
-        let nonce_bytes = uint256_bytes(nonce as u128);
-        let msg_hash = keccak256(CLOB_AUTH_MSG.as_bytes());
-
-        let mut encoded = Vec::with_capacity(160);
-        encoded.extend_from_slice(&type_hash);
-        encoded.extend_from_slice(&addr_bytes);
-        encoded.extend_from_slice(&ts_hash);
-        encoded.extend_from_slice(&nonce_bytes);
-        encoded.extend_from_slice(&msg_hash);
-
-        let struct_hash = keccak256(&encoded);
-        let domain_sep = domain_separator(CLOB_DOMAIN_NAME, CLOB_DOMAIN_VERSION, CHAIN_ID, ZERO_ADDRESS);
-        let hash = eip712_hash(&domain_sep, &struct_hash);
-
-        let signature = self.wallet.sign_hash(&hash)?;
-
-        Ok(vec![
-            ("POLY_ADDRESS".into(),   self.wallet.address().to_string()),
-            ("POLY_SIGNATURE".into(), signature),
-            ("POLY_TIMESTAMP".into(), ts),
-            ("POLY_NONCE".into(),     nonce.to_string()),
-        ])
-    }
-
-    // -- API key derivation ---------------------------------------------------
-
-    /// Derive L2 API credentials from wallet (L1 auth)
-    pub async fn derive_api_key(&mut self) -> Result<ApiCreds> {
-        let path = "/auth/derive-api-key";
-        let headers = self.l1_headers(0)?;
-
-        let mut req = self.http.get(format!("{}{}", self.base_url, path));
-        for (k, v) in &headers {
-            req = req.header(k, v);
-        }
-
-        let resp = req.send().await.context("derive API key request failed")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("derive API key failed ({}): {}", status, &body[..body.len().min(500)]));
-        }
-
-        let creds: ApiCreds = resp.json().await.context("parse API creds")?;
-        info!("[ORDER] API key derived: {}...", &creds.api_key[..8.min(creds.api_key.len())]);
-        self.creds = Some(creds.clone());
-        Ok(creds)
-    }
-
-    /// Create new L2 API credentials (L1 auth)
-    pub async fn create_api_key(&mut self) -> Result<ApiCreds> {
-        let path = "/auth/api-key";
-        let headers = self.l1_headers(0)?;
-
-        let mut req = self.http.post(format!("{}{}", self.base_url, path));
-        for (k, v) in &headers {
-            req = req.header(k, v);
-        }
-
-        let resp = req.send().await.context("create API key request failed")?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("create API key failed ({}): {}", status, &body[..body.len().min(500)]));
-        }
-
-        let creds: ApiCreds = resp.json().await.context("parse API creds")?;
-        info!("[ORDER] API key created: {}...", &creds.api_key[..8.min(creds.api_key.len())]);
-        self.creds = Some(creds.clone());
-        Ok(creds)
-    }
-
     // -- Order building & signing ---------------------------------------------
 
     /// Build and sign an order
@@ -474,70 +372,6 @@ impl ClobClient {
 
         info!("[ORDER] Placed: {:?}", resp_body);
         Ok(resp_body)
-    }
-
-    // -- DELETE /order (cancel) -----------------------------------------------
-
-    /// Cancel an order by ID
-    pub async fn cancel_order(&self, order_id: &str) -> Result<serde_json::Value> {
-        let path = "/order";
-        let body = serde_json::json!({"orderID": order_id});
-        let body_str = body.to_string();
-
-        let headers = self.l2_headers("DELETE", path, &body_str)?;
-
-        let mut req = self.http.delete(format!("{}{}", self.base_url, path))
-            .header("Content-Type", "application/json")
-            .body(body_str);
-        for (k, v) in &headers {
-            req = req.header(k, v);
-        }
-
-        let resp = req.send().await.context("DELETE /order failed")?;
-        let resp_body: serde_json::Value = resp.json().await
-            .unwrap_or_else(|_| serde_json::json!({"error": "parse failed"}));
-        Ok(resp_body)
-    }
-
-    // -- GET /data/order (poll status) ----------------------------------------
-
-    /// Get order status by ID
-    pub async fn get_order(&self, order_id: &str) -> Result<OrderStatus> {
-        let path = format!("/data/order/{}", order_id);
-        let headers = self.l2_headers("GET", &path, "")?;
-
-        let mut req = self.http.get(format!("{}{}", self.base_url, path));
-        for (k, v) in &headers {
-            req = req.header(k, v);
-        }
-
-        let resp = req.send().await.context("GET /data/order failed")?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("GET /data/order {} failed", resp.status()));
-        }
-
-        resp.json().await.context("parse order status")
-    }
-
-    // -- GET /balance-allowance -----------------------------------------------
-
-    /// Check USDC balance and allowance
-    pub async fn get_balance_allowance(&self, token_id: &str) -> Result<serde_json::Value> {
-        let path = "/balance-allowance";
-        let body = serde_json::json!({
-            "asset_type": "CONDITIONAL",
-            "token_id": token_id,
-        });
-        let body_str = body.to_string();
-        let headers = self.l2_headers("GET", path, &body_str)?;
-
-        let mut req = self.http.get(format!("{}{}?asset_type=CONDITIONAL&token_id={}", self.base_url, path, token_id));
-        for (k, v) in &headers {
-            req = req.header(k, v);
-        }
-
-        let resp = req.send().await.context("GET /balance-allowance failed")?;
-        resp.json().await.context("parse balance-allowance")
     }
 
     // -- Convenience: build + place -------------------------------------------
