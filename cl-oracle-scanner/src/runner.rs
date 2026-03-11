@@ -483,7 +483,7 @@ impl Tracker {
     }
 }
 
-fn slug_ts(slug: &str) -> i64 {
+pub fn slug_ts(slug: &str) -> i64 {
     slug.rsplit('-').next()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0)
