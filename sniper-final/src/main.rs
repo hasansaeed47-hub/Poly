@@ -31,7 +31,7 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{info, warn, debug};
 use tracing_subscriber::EnvFilter;
 
 use engine::{EngineConfig, ExecConfig, default_engines, default_exec};
@@ -520,7 +520,7 @@ async fn main() -> Result<()> {
                                 tokio::spawn(async move {
                                     match c.place_market_order(&tid, exit_px, shares, "SELL").await {
                                         Ok(resp) => info!("[CLOB] [{}] SL SELL placed: {:?}", eid, resp),
-                                        Err(e) => warn!("[CLOB] [{}] SL SELL failed: {}", eid, e),
+                                        Err(e) => warn!("[CLOB] [{}] SL SELL failed (px={} sz={}): {:#}", eid, exit_px, shares, e),
                                     }
                                 });
                             }
@@ -579,9 +579,11 @@ async fn main() -> Result<()> {
                         let eid = pos.engine_id.clone();
                         let slug_s = pos.slug.clone();
                         tokio::spawn(async move {
+                            debug!("[CLOB] [{}] BUY attempt for {}: px={} shares={} tid={}",
+                                eid, slug_s, px, shares, &tid[..tid.len().min(20)]);
                             match c.place_limit_order(&tid, px, shares, "BUY").await {
                                 Ok(resp) => info!("[CLOB] [{}] BUY placed for {}: {:?}", eid, slug_s, resp),
-                                Err(e) => warn!("[CLOB] [{}] BUY failed for {}: {}", eid, slug_s, e),
+                                Err(e) => warn!("[CLOB] [{}] BUY failed for {} (px={} sz={}): {:#}", eid, slug_s, px, shares, e),
                             }
                         });
                     }

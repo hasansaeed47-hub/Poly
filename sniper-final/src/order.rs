@@ -147,7 +147,7 @@ impl ClobClient {
             .side(sdk_side)
             .build()
             .await
-            .context("SDK order build failed")?;
+            .context(format!("SDK order build failed (side={side} price={price} size={size})"))?;
 
         let signed = client
             .sign(signer, order)
@@ -195,7 +195,7 @@ impl ClobClient {
             .side(sdk_side)
             .build()
             .await
-            .context("SDK market order build failed")?;
+            .context(format!("SDK market order build failed (side={side} price={price} size={size})"))?;
 
         let signed = client
             .sign(signer, order)
