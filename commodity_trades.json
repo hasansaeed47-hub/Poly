@@ -1,0 +1,93 @@
+{
+  "generated": "2026-03-12T20:47:59.502958+00:00",
+  "scanner_version": "1.0.0",
+  "top_trades": [
+    {
+      "commodity": "Wheat (CBOT)",
+      "symbol": "ZW",
+      "direction": "LONG",
+      "conviction": "VERY_HIGH",
+      "timeframe": "Position (1-4 weeks)",
+      "entry": 600.1,
+      "stop_loss": 573.1,
+      "target_1": 625.0,
+      "target_2": 644.92,
+      "risk_reward": 0.92,
+      "position_size_pct": 10,
+      "composite_score": 81.3,
+      "technical_score": 87.0,
+      "sentiment_score": 0.66,
+      "catalysts": [
+        "Broke above critical $6.00/bushel resistance level",
+        "Hormuz blockade cuts 1/3 of global seaborne fertilizer supply",
+        "Russian strikes cut Ukraine export capacity by 30%",
+        "Funds bought 31,000 SRW contracts in 2 days (massive short covering)",
+        "Severe dryness in Kansas/Oklahoma \u2014 winterkill fears",
+        "TradingView Strong Buy \u2014 technicals and fundamentals aligned"
+      ],
+      "risks": [
+        "Managed money near record net-long \u2014 crowded trade risk",
+        "Oil correlation means reversal if crude collapses",
+        "USDA ending stocks adequate at 931M bushels",
+        "15-cent plunge on March 11 shows downside volatility"
+      ]
+    },
+    {
+      "commodity": "WTI Crude Oil",
+      "symbol": "CL",
+      "direction": "LONG",
+      "conviction": "VERY_HIGH",
+      "timeframe": "Swing (1-5 days)",
+      "entry": 94.91,
+      "stop_loss": 84.71,
+      "target_1": 105.0,
+      "target_2": 113.07,
+      "risk_reward": 0.99,
+      "position_size_pct": 10,
+      "composite_score": 80.6,
+      "technical_score": 85.0,
+      "sentiment_score": 0.52,
+      "catalysts": [
+        "Strait of Hormuz closed \u2014 10M bbl/day removed from market",
+        "Iran declares Hormuz closure will continue",
+        "WTI up 51.65% in one month on war premium",
+        "Large speculators net-long at 33-week high (172k contracts)"
+      ],
+      "risks": [
+        "RSI at 78.5 \u2014 overbought; violent mean-reversion possible",
+        "Historic 400M barrel reserve release by 32 nations",
+        "War premium ($20-30) could deflate overnight on ceasefire",
+        "$10-15 daily swings \u2014 extreme volatility risk",
+        "Trump signaled Iran war nearing end \u2014 bearish catalyst imminent"
+      ]
+    },
+    {
+      "commodity": "Copper",
+      "symbol": "HG",
+      "direction": "LONG",
+      "conviction": "VERY_HIGH",
+      "timeframe": "Position (1-4 weeks)",
+      "entry": 5.9,
+      "stop_loss": 5.72,
+      "target_1": 6.1,
+      "target_2": 6.26,
+      "risk_reward": 1.11,
+      "position_size_pct": 10,
+      "composite_score": 75.8,
+      "technical_score": 79.0,
+      "sentiment_score": 0.6,
+      "catalysts": [
+        "AI data centers require 30-47 tonnes copper per MW (10x traditional)",
+        "ICSG projects 150k-330k tonne supply deficit in 2026",
+        "Citi $12,000/ton base case with $14,000 bull case",
+        "Rising Three Methods bullish continuation pattern on weekly chart",
+        "LME all-time high of $13,238/tonne hit in Jan 2026"
+      ],
+      "risks": [
+        "Red Cloud forecasts 126k tonne surplus; tariffs may weigh",
+        "Energy cost inflation squeezing industrial demand",
+        "Risk-off positioning in broader markets"
+      ]
+    }
+  ]
+}
