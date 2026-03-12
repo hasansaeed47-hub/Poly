@@ -1,0 +1,17 @@
+[Unit]
+Description=Hydra-Arb Final v2 Paper Trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/Poly/hydra-arb-final
+ExecStart=/root/Poly/hydra-arb-final/target/release/hydra_arb_final
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/root/Poly/hydra-arb-final/hydra-arb-final.log
+StandardError=append:/root/Poly/hydra-arb-final/hydra-arb-final.log
+Environment=RUST_LOG=hydra_arb_final=info
+
+[Install]
+WantedBy=multi-user.target
