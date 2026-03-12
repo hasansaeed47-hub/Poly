@@ -6,8 +6,9 @@ use statrs::distribution::{ContinuousCDF, Normal};
 // ── Constants ────────────────────────────────────────────────────────────────
 
 const SECS_PER_YEAR: f64 = 365.25 * 24.0 * 3600.0;
-const MIN_SIGMA:     f64 = 1e-6;
+const MIN_SIGMA:     f64 = 0.30;  // floor: 30% annualised (crypto is volatile)
 const MIN_T:         f64 = 1.0 / SECS_PER_YEAR; // 1 second minimum
+const MIN_SAMPLES:   usize = 30;  // need at least 30 price ticks before trusting sigma
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -78,8 +79,8 @@ pub fn estimate_sigma(prices: &[(f64, f64)], window_secs: f64, now: f64) -> f64 
         .map(|(_, p)| *p)
         .collect();
 
-    if window.len() < 2 {
-        return 0.001; // fallback — very low vol, wide time gate will filter this out
+    if window.len() < MIN_SAMPLES {
+        return 0.50; // fallback — assume ~50% annualised vol until we have enough data
     }
 
     // Log returns
@@ -95,7 +96,7 @@ pub fn estimate_sigma(prices: &[(f64, f64)], window_secs: f64, now: f64) -> f64 
 
     // Annualise: assume 1-second samples
     let annualised = std * SECS_PER_YEAR.sqrt();
-    annualised.max(MIN_SIGMA)
+    annualised.clamp(MIN_SIGMA, 5.0) // floor 30%, cap 500%
 }
 
 // ── Signal computation ────────────────────────────────────────────────────────
