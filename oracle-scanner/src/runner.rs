@@ -371,8 +371,10 @@ impl ConfigRunner {
     }
 
     pub fn print_stats(&self) {
+        let total_staked = self.stats.entries as f64 * self.stake;
+        let roi = if total_staked > 0.0 { self.stats.net_pnl / total_staked * 100.0 } else { 0.0 };
         info!(
-            "[{}] sig={} entries={} W={} L={} WR={:.1}% net={:+.2} fee={:.2} settle={} sl={} tp={}",
+            "[{}] sig={} entries={} W={} L={} WR={:.1}% net={:+.2} fee={:.2} ROI={:+.1}% open={} settle={} sl={} tp={}",
             self.config.name,
             self.stats.signals,
             self.stats.entries,
@@ -381,6 +383,8 @@ impl ConfigRunner {
             self.stats.wr(),
             self.stats.net_pnl,
             self.stats.total_fee,
+            roi,
+            self.positions.len(),
             self.stats.settlement_exits,
             self.stats.stop_loss_exits,
             self.stats.take_profit_exits,
