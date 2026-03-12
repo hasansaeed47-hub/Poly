@@ -72,10 +72,38 @@ struct GammaEvent {
 #[serde(rename_all = "camelCase")]
 struct GammaMarket {
     condition_id:   Option<String>,
+    #[serde(default, deserialize_with = "deserialize_stringified_vec")]
     clob_token_ids: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_stringified_vec")]
     outcomes:       Option<Vec<String>>,
     start_date_iso: Option<String>,
     end_date_iso:   Option<String>,
+}
+
+/// Gamma API returns these fields as stringified JSON arrays, e.g. "[\"Up\", \"Down\"]"
+fn deserialize_stringified_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    let opt: Option<serde_json::Value> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(None),
+        Some(serde_json::Value::Array(arr)) => {
+            // Already a real array
+            let v: Vec<String> = arr.iter()
+                .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                .collect();
+            Ok(Some(v))
+        }
+        Some(serde_json::Value::String(s)) => {
+            // Stringified JSON array — parse it
+            let v: Vec<String> = serde_json::from_str(&s)
+                .map_err(|e| D::Error::custom(format!("bad stringified array: {}", e)))?;
+            Ok(Some(v))
+        }
+        Some(other) => Err(D::Error::custom(format!("expected string or array, got {:?}", other))),
+    }
 }
 
 // ── CLOB REST book response ───────────────────────────────────────────────────
