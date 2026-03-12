@@ -24,7 +24,7 @@ use anyhow::{Context, Result};
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use feeds::{
