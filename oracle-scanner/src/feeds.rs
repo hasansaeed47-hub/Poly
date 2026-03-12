@@ -282,7 +282,9 @@ pub async fn fetch_books_batch(
             .context("CLOB batch book request failed")?;
 
         if !resp.status().is_success() {
-            warn!("CLOB batch book returned {}", resp.status());
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!("CLOB batch book returned {} body={}", status, &body[..body.len().min(200)]);
             continue;
         }
 

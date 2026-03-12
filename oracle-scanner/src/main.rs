@@ -18,20 +18,19 @@ mod signal;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use feeds::{
     BookState, ClPrices, MarketMeta, PriceHistory, RateLimiter,
     build_slug, current_window_starts, fetch_books_batch, fetch_market_meta,
-    run_book_feed, run_cl_feed,
+    run_cl_feed,
 };
 use runner::{ConfigRunner, RunnerConfig};
 use signal::{compute, estimate_sigma};
@@ -125,10 +124,10 @@ async fn main() -> Result<()> {
     let book_state:    BookState     = Arc::new(DashMap::new());
     let price_history: PriceHistory  = Arc::new(DashMap::new());
     let token_ids:     Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
-    let book_live:     Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
 
     // HTTP client (shared, connection pooled)
     let http = Client::builder()
+        .user_agent("cl-oracle-scanner/1")
         .timeout(Duration::from_secs(10))
         .build()
         .context("HTTP client build failed")?;
@@ -184,15 +183,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    {
-        let bs = book_state.clone();
-        let ti = token_ids.clone();
-        let bl = book_live.clone();
-        let ws = cfg.feed.clob_ws.clone();
-        tokio::spawn(async move {
-            run_book_feed(ws, ti, bs, bl).await;
-        });
-    }
+    // Book data via REST polling only (WS book feed removed — unreliable)
 
     // ── Build runners ─────────────────────────────────────────────────────────
 
@@ -206,9 +197,7 @@ async fn main() -> Result<()> {
 
     // ── Warmup gate ───────────────────────────────────────────────────────────
 
-    info!("Waiting {}s for book feed warmup...", cfg.feed.book_warmup_secs);
-    tokio::time::sleep(Duration::from_secs(cfg.feed.book_warmup_secs)).await;
-    info!("Warmup complete — scan loop starting");
+    info!("Starting scan loop (REST book polling, {}s warmup)...", cfg.feed.book_warmup_secs);
 
     // ── Main scan loop ────────────────────────────────────────────────────────
 
@@ -251,8 +240,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── Batch book refresh (every 2s via REST as fallback) ────────────────
-        // WS is primary; REST fills gaps for markets WS hasn't snapped yet
+        // ── Batch book refresh (every 2s via REST) ──────────────────────────
 
         if tick_count % 4 == 0 {
             let all_tokens: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
@@ -307,10 +295,9 @@ async fn main() -> Result<()> {
 
         // ── Signal computation + runner dispatch ──────────────────────────────
 
-        // Check book warmup gate
-        let live_since = book_live.load(Ordering::Relaxed);
-        if live_since == 0 || now_u - live_since < cfg.feed.book_warmup_secs {
-            continue; // book not warm yet
+        // Simple warmup: skip first N ticks to let REST book data populate
+        if tick_count < (cfg.feed.book_warmup_secs * 1000 / cfg.scan.tick_ms) {
+            continue;
         }
 
         for (slug, meta) in &mut markets {
