@@ -1,10 +1,15 @@
 {
-  "generated": "2026-03-12T20:47:59.502958+00:00",
-  "scanner_version": "1.0.0",
+  "generated": "2026-03-12T20:56:01.968734+00:00",
+  "scanner_version": "2.0.0",
+  "broker": "Vantage Markets",
+  "platform": "MT4 / MT5 / TradingView / Vantage App",
   "top_trades": [
     {
       "commodity": "Wheat (CBOT)",
       "symbol": "ZW",
+      "vantage_symbol": "WHEAT-C",
+      "vantage_available": true,
+      "max_leverage": "1:10",
       "direction": "LONG",
       "conviction": "VERY_HIGH",
       "timeframe": "Position (1-4 weeks)",
@@ -35,6 +40,9 @@
     {
       "commodity": "WTI Crude Oil",
       "symbol": "CL",
+      "vantage_symbol": "USOUSD",
+      "vantage_available": true,
+      "max_leverage": "1:20",
       "direction": "LONG",
       "conviction": "VERY_HIGH",
       "timeframe": "Swing (1-5 days)",
@@ -64,6 +72,9 @@
     {
       "commodity": "Copper",
       "symbol": "HG",
+      "vantage_symbol": "COPPER-C",
+      "vantage_available": true,
+      "max_leverage": "1:20",
       "direction": "LONG",
       "conviction": "VERY_HIGH",
       "timeframe": "Position (1-4 weeks)",

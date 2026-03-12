@@ -53,6 +53,8 @@ class PriceData:
     prev_close: float
     fifty_two_week_high: float
     fifty_two_week_low: float
+    vantage_symbol: str = ""      # Vantage Markets CFD symbol
+    vantage_available: bool = True
     timestamp: str = ""
 
 
@@ -88,6 +90,9 @@ class TradeIdea:
     technical_score: float
     sentiment_score: float
     composite_score: float
+    vantage_symbol: str = ""
+    vantage_available: bool = True
+    max_leverage: str = ""
     catalysts: list = field(default_factory=list)
     risks: list = field(default_factory=list)
     technicals: list = field(default_factory=list)
@@ -108,6 +113,7 @@ def get_live_prices() -> dict[str, PriceData]:
             month_change_pct=51.65, year_change_pct=39.0,
             day_high=100.50, day_low=87.20, prev_close=87.24,
             fifty_two_week_high=119.00, fifty_two_week_low=55.12,
+            vantage_symbol="USOUSD", vantage_available=True,
             timestamp="2026-03-12T16:00:00Z",
         ),
         "GC": PriceData(
@@ -117,6 +123,7 @@ def get_live_prices() -> dict[str, PriceData]:
             month_change_pct=3.5, year_change_pct=100.0,
             day_high=5184.75, day_low=5095.00, prev_close=5184.75,
             fifty_two_week_high=5413.00, fifty_two_week_low=2300.00,
+            vantage_symbol="XAUUSD", vantage_available=True,
             timestamp="2026-03-12T16:00:00Z",
         ),
         "SI": PriceData(
@@ -126,6 +133,7 @@ def get_live_prices() -> dict[str, PriceData]:
             month_change_pct=5.2, year_change_pct=153.0,
             day_high=88.38, day_low=84.50, prev_close=88.38,
             fifty_two_week_high=92.00, fifty_two_week_low=28.50,
+            vantage_symbol="XAGUSD", vantage_available=True,
             timestamp="2026-03-12T16:00:00Z",
         ),
         "HG": PriceData(
@@ -135,6 +143,7 @@ def get_live_prices() -> dict[str, PriceData]:
             month_change_pct=4.8, year_change_pct=42.0,
             day_high=5.96, day_low=5.85, prev_close=5.93,
             fifty_two_week_high=6.58, fifty_two_week_low=3.90,
+            vantage_symbol="COPPER-C", vantage_available=True,
             timestamp="2026-03-12T16:00:00Z",
         ),
         "NG": PriceData(
@@ -144,6 +153,7 @@ def get_live_prices() -> dict[str, PriceData]:
             month_change_pct=12.0, year_change_pct=15.0,
             day_high=3.12, day_low=2.98, prev_close=2.99,
             fifty_two_week_high=4.20, fifty_two_week_low=1.80,
+            vantage_symbol="NG-C", vantage_available=True,
             timestamp="2026-03-12T16:00:00Z",
         ),
         "ZW": PriceData(
@@ -153,6 +163,7 @@ def get_live_prices() -> dict[str, PriceData]:
             month_change_pct=18.0, year_change_pct=-3.7,
             day_high=605.25, day_low=594.75, prev_close=595.00,
             fifty_two_week_high=650.00, fifty_two_week_low=480.00,
+            vantage_symbol="WHEAT-C", vantage_available=True,
             timestamp="2026-03-12T16:00:00Z",
         ),
         "BRN": PriceData(
@@ -162,6 +173,7 @@ def get_live_prices() -> dict[str, PriceData]:
             month_change_pct=48.0, year_change_pct=36.0,
             day_high=105.00, day_low=93.50, prev_close=94.10,
             fifty_two_week_high=119.00, fifty_two_week_low=57.00,
+            vantage_symbol="UKOUSD", vantage_available=True,
             timestamp="2026-03-12T16:00:00Z",
         ),
     }
@@ -588,6 +600,13 @@ class TradeScanner:
         win_prob = composite / 100
         pos_size = min(max((win_prob * rr - (1 - win_prob)) / rr * 100, 1), 10)
 
+        # Vantage Markets leverage limits (commodity CFDs)
+        leverage_map = {
+            "CL": "1:20", "BRN": "1:20", "NG": "1:20",
+            "GC": "1:20", "SI": "1:20",
+            "HG": "1:20", "ZW": "1:10",
+        }
+
         return TradeIdea(
             commodity=price.name,
             symbol=symbol,
@@ -603,6 +622,9 @@ class TradeScanner:
             technical_score=round(tech_score, 1),
             sentiment_score=round(sent_score, 2),
             composite_score=round(composite, 1),
+            vantage_symbol=price.vantage_symbol,
+            vantage_available=price.vantage_available,
+            max_leverage=leverage_map.get(symbol, "1:10"),
             catalysts=self._get_catalysts(symbol),
             risks=self._get_risks(symbol),
             technicals=tech_signals,
@@ -714,16 +736,22 @@ def format_trade_report(ideas: list[TradeIdea], top_n: int = 3) -> str:
 
     # Market overview
     prices = get_live_prices()
-    lines.append("  MARKET SNAPSHOT")
+    lines.append("  MARKET SNAPSHOT (Vantage Markets CFDs)")
+    lines.append("  " + "-" * 76)
+    lines.append(f"  {'Commodity':<20} {'Price':>10} {'Unit':<15} {'Change':>10} {'Vantage':>12}")
     lines.append("  " + "-" * 76)
     for sym, p in prices.items():
         chg = f"+{p.day_change_pct:.2f}%" if p.day_change_pct > 0 else f"{p.day_change_pct:.2f}%"
-        lines.append(f"  {p.name:<20} {p.current_price:>10.2f} {p.price_unit:<15} {chg:>10}")
+        vtg = p.vantage_symbol if p.vantage_available else "N/A"
+        lines.append(f"  {p.name:<20} {p.current_price:>10.2f} {p.price_unit:<15} {chg:>10} {vtg:>12}")
+    lines.append("")
+    lines.append("  All 7 commodities are available on Vantage Markets as CFDs.")
+    lines.append("  Platform: MT4 / MT5 / TradingView / Vantage App")
     lines.append("")
 
     # Top trades
     top = ideas[:top_n]
-    lines.append(f"  TOP {top_n} TRADE RECOMMENDATIONS")
+    lines.append(f"  TOP {top_n} TRADE RECOMMENDATIONS — VANTAGE MARKETS")
     lines.append("  " + "=" * 76)
 
     for i, t in enumerate(top, 1):
@@ -731,6 +759,7 @@ def format_trade_report(ideas: list[TradeIdea], top_n: int = 3) -> str:
         lines.append("")
         lines.append(f"  {'─' * 76}")
         lines.append(f"  TRADE #{i}: {dir_emoji} {t.commodity} ({t.symbol})")
+        lines.append(f"  Vantage Symbol:  {t.vantage_symbol}")
         lines.append(f"  {'─' * 76}")
         lines.append(f"  Conviction:      {t.conviction.value}")
         lines.append(f"  Timeframe:       {t.timeframe.value}")
@@ -738,12 +767,15 @@ def format_trade_report(ideas: list[TradeIdea], top_n: int = 3) -> str:
         lines.append(f"    - Technical:   {t.technical_score}/100")
         lines.append(f"    - Sentiment:   {t.sentiment_score:+.2f} (-1 to +1)")
         lines.append("")
-        lines.append(f"  EXECUTION PLAN:")
+        lines.append(f"  VANTAGE EXECUTION:")
+        lines.append(f"    Symbol:        {t.vantage_symbol}")
+        lines.append(f"    Direction:     {dir_emoji} (Buy)" if t.direction == Direction.LONG else f"    Direction:     {dir_emoji} (Sell)")
         lines.append(f"    Entry:         {t.entry_price}")
         lines.append(f"    Stop Loss:     {t.stop_loss}")
-        lines.append(f"    Target 1:      {t.target_1}")
-        lines.append(f"    Target 2:      {t.target_2}")
+        lines.append(f"    Take Profit 1: {t.target_1}")
+        lines.append(f"    Take Profit 2: {t.target_2}")
         lines.append(f"    Risk/Reward:   {t.risk_reward}:1")
+        lines.append(f"    Max Leverage:  {t.max_leverage}")
         lines.append(f"    Position Size: {t.position_size_pct}% of capital")
         lines.append("")
         lines.append(f"  TECHNICAL SIGNALS:")
@@ -794,13 +826,18 @@ def export_json(ideas: list[TradeIdea], path: str = "commodity_trades.json"):
     """Export trade ideas as structured JSON for downstream consumption."""
     data = {
         "generated": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "scanner_version": "1.0.0",
+        "scanner_version": "2.0.0",
+        "broker": "Vantage Markets",
+        "platform": "MT4 / MT5 / TradingView / Vantage App",
         "top_trades": [],
     }
     for t in ideas[:3]:
         data["top_trades"].append({
             "commodity": t.commodity,
             "symbol": t.symbol,
+            "vantage_symbol": t.vantage_symbol,
+            "vantage_available": t.vantage_available,
+            "max_leverage": t.max_leverage,
             "direction": t.direction.value,
             "conviction": t.conviction.value,
             "timeframe": t.timeframe.value,
