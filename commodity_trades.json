@@ -1,41 +1,9 @@
 {
-  "generated": "2026-03-12T21:02:32.456661+00:00",
+  "generated": "2026-03-12T22:32:35.656256+00:00",
   "scanner_version": "2.0.0",
   "broker": "Vantage Markets",
   "platform": "MT4 / MT5 / TradingView / Vantage App",
   "top_trades": [
-    {
-      "commodity": "WTI Crude Oil",
-      "symbol": "CL",
-      "vantage_symbol": "USOUSD",
-      "vantage_available": true,
-      "max_leverage": "1:20",
-      "direction": "LONG",
-      "conviction": "VERY_HIGH",
-      "timeframe": "Swing (1-5 days)",
-      "entry": 96.1,
-      "stop_loss": 84.85,
-      "target_1": 110.0,
-      "target_2": 121.12,
-      "risk_reward": 1.24,
-      "position_size_pct": 10,
-      "composite_score": 78.3,
-      "technical_score": 80.0,
-      "sentiment_score": 0.52,
-      "catalysts": [
-        "Strait of Hormuz closed \u2014 10M bbl/day removed from market",
-        "Iran declares Hormuz closure will continue",
-        "WTI up 51.65% in one month on war premium",
-        "Large speculators net-long at 33-week high (172k contracts)"
-      ],
-      "risks": [
-        "RSI at 82 \u2014 deeply overbought; violent mean-reversion possible",
-        "Historic 400M barrel reserve release by 32 nations",
-        "War premium ($20-30) could deflate overnight on ceasefire",
-        "$10-15 daily swings \u2014 extreme volatility risk",
-        "Trump signaled Iran war nearing end \u2014 bearish catalyst imminent"
-      ]
-    },
     {
       "commodity": "Copper",
       "symbol": "HG",
@@ -46,12 +14,12 @@
       "conviction": "VERY_HIGH",
       "timeframe": "Position (1-4 weeks)",
       "entry": 5.88,
-      "stop_loss": 5.71,
+      "stop_loss": 5.64,
       "target_1": 6.1,
       "target_2": 6.27,
-      "risk_reward": 1.19,
+      "risk_reward": 0.9,
       "position_size_pct": 10,
-      "composite_score": 75.8,
+      "composite_score": 80.8,
       "technical_score": 79.0,
       "sentiment_score": 0.6,
       "catalysts": [
@@ -68,37 +36,35 @@
       ]
     },
     {
-      "commodity": "Wheat",
-      "symbol": "ZW",
-      "vantage_symbol": "Wheat-Cr",
+      "commodity": "WTI Crude Oil",
+      "symbol": "CL",
+      "vantage_symbol": "USOUSD",
       "vantage_available": true,
-      "max_leverage": "1:10",
+      "max_leverage": "1:20",
       "direction": "LONG",
-      "conviction": "HIGH",
-      "timeframe": "Position (1-4 weeks)",
-      "entry": 5.86,
-      "stop_loss": 5.59,
-      "target_1": 6.1,
-      "target_2": 6.29,
-      "risk_reward": 0.9,
+      "conviction": "VERY_HIGH",
+      "timeframe": "Swing (1-5 days)",
+      "entry": 96.1,
+      "stop_loss": 81.1,
+      "target_1": 110.0,
+      "target_2": 121.12,
+      "risk_reward": 0.93,
       "position_size_pct": 10,
-      "composite_score": 72.0,
-      "technical_score": 75.0,
-      "sentiment_score": 0.54,
+      "composite_score": 75.3,
+      "technical_score": 80.0,
+      "sentiment_score": 0.52,
       "catalysts": [
-        "Holding near $5.86 after pullback \u2014 consolidating above MAs",
-        "Hormuz blockade cuts 1/3 of global seaborne fertilizer supply",
-        "Russian strikes cut Ukraine export capacity by 30%",
-        "Funds bought 31,000 SRW contracts recently (short covering)",
-        "Severe dryness in Kansas/Oklahoma \u2014 winterkill fears",
-        "ING/JPM bullish on wheat for 2026"
+        "Strait of Hormuz closed \u2014 10M bbl/day removed from market",
+        "Iran declares Hormuz closure will continue",
+        "WTI up 51.65% in one month on war premium",
+        "Large speculators net-long at 33-week high (172k contracts)"
       ],
       "risks": [
-        "Managed money near record net-long \u2014 crowded trade risk",
-        "Oil correlation means reversal if crude collapses",
-        "USDA ending stocks adequate at 931M bushels",
-        "Pulled back from $5.94 highs \u2014 momentum stalling near term",
-        "Currently in your portfolio at a loss \u2014 watch $5.70 support"
+        "RSI at 82 \u2014 deeply overbought; violent mean-reversion possible",
+        "Historic 400M barrel reserve release by 32 nations",
+        "War premium ($20-30) could deflate overnight on ceasefire",
+        "$10-15 daily swings \u2014 extreme volatility risk",
+        "Trump signaled Iran war nearing end \u2014 bearish catalyst imminent"
       ]
     }
   ]
