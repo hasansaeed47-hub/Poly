@@ -30,7 +30,7 @@ use tracing_subscriber::EnvFilter;
 use feeds::{
     BookState, ClPrices, MarketMeta, PriceHistory, RateLimiter,
     build_slug, current_window_starts, fetch_books_batch, fetch_market_meta,
-    run_book_feed, run_cl_feed,
+    run_cl_feed,
 };
 use runner::{ConfigRunner, RunnerConfig};
 use signal::{compute, estimate_sigma};
@@ -183,15 +183,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Book WS feed (best-effort, REST polling is primary fallback)
-    {
-        let bs = book_state.clone();
-        let ti = token_ids.clone();
-        let ws = cfg.feed.clob_ws.clone();
-        tokio::spawn(async move {
-            run_book_feed(ws, ti, bs).await;
-        });
-    }
+    // Book data via REST polling (CLOB WS requires API key auth — disabled)
 
     // ── Build runners ─────────────────────────────────────────────────────────
 
@@ -255,6 +247,9 @@ async fn main() -> Result<()> {
             if !all_tokens.is_empty() {
                 match fetch_books_batch(&http, &cfg.feed.clob_rest, &all_tokens, &limiter).await {
                     Ok(books) => {
+                        if tick_count <= 10 && !books.is_empty() {
+                            info!("[BOOK REST] Got {} books", books.len());
+                        }
                         for (tid, entry) in books {
                             book_state.insert(tid, entry);
                         }
