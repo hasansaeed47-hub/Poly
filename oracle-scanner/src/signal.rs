@@ -43,12 +43,21 @@ pub struct Signal {
     pub fair_no:     f64,         // = 1 - fair_yes
     pub book_yes:    f64,         // current PM best ask for YES
     pub book_no:     f64,         // current PM best ask for NO
-    pub edge_yes:    f64,         // fair_yes - book_yes
-    pub edge_no:     f64,         // fair_no  - book_no
+    pub edge_yes:    f64,         // fair_yes - book_yes (using best ask)
+    pub edge_no:     f64,         // fair_no  - book_no  (using best ask)
     pub best_side:   Option<Side>,// which side has edge (if any above threshold)
     pub best_edge:   f64,         // magnitude of best edge
-    pub best_book:   f64,         // entry price on best side
+    pub best_book:   f64,         // entry price on best side (best ask)
     pub best_fair:   f64,         // fair value on best side
+    // Realistic fill data
+    pub fill_yes:    Option<f64>, // VWAP fill price for YES (walk the book)
+    pub fill_no:     Option<f64>, // VWAP fill price for NO
+    pub depth_yes:   f64,         // total USD liquidity on YES ask side
+    pub depth_no:    f64,         // total USD liquidity on NO ask side
+    pub bid_yes:     f64,         // best bid for YES (exit price)
+    pub bid_no:      f64,         // best bid for NO  (exit price)
+    pub edge_fill_yes: f64,       // fair_yes - fill_yes (realistic edge)
+    pub edge_fill_no:  f64,       // fair_no  - fill_no  (realistic edge)
     pub ts:          f64,         // unix timestamp of this signal
 }
 
@@ -101,6 +110,17 @@ pub fn estimate_sigma(prices: &[(f64, f64)], window_secs: f64, now: f64) -> f64 
 
 // ── Signal computation ────────────────────────────────────────────────────────
 
+use crate::feeds::{PriceLevel, vwap_fill};
+
+/// Book data passed to signal computation
+#[allow(dead_code)]
+pub struct BookData {
+    pub best_ask:  f64,
+    pub best_bid:  f64,
+    pub asks:      Vec<PriceLevel>,
+    pub bids:      Vec<PriceLevel>,
+}
+
 /// Compute one signal for a market.
 /// Returns None if data is insufficient (no open price, no book, etc.)
 pub fn compute(
@@ -111,36 +131,53 @@ pub fn compute(
     cl_price:   f64,
     sigma:      f64,
     secs_left:  f64,
-    book_yes:   f64,  // best ask for YES (what you pay to buy YES)
-    book_no:    f64,  // best ask for NO
+    book_yes:   &BookData,
+    book_no:    &BookData,
+    stake:      f64,   // USD stake for VWAP fill calculation
     ts:         f64,
 ) -> Option<Signal> {
     // Guard: need valid inputs
     if open_price <= 0.0 || cl_price <= 0.0 || secs_left <= 0.0 {
         return None;
     }
-    if book_yes <= 0.0 || book_no <= 0.0 {
+    if book_yes.best_ask <= 0.0 || book_no.best_ask <= 0.0 {
         return None;
     }
 
     let fy = fair_yes(cl_price, open_price, sigma, secs_left);
     let fn_ = 1.0 - fy;
 
-    let edge_yes = fy  - book_yes;
-    let edge_no  = fn_ - book_no;
+    // Edge using best ask (optimistic)
+    let edge_yes = fy  - book_yes.best_ask;
+    let edge_no  = fn_ - book_no.best_ask;
 
-    // Determine best side (only positive edge matters)
-    let best_side = if edge_yes > edge_no && edge_yes > 0.0 {
+    // VWAP fill prices (realistic)
+    let fill_yes_data = vwap_fill(&book_yes.asks, stake);
+    let fill_no_data  = vwap_fill(&book_no.asks, stake);
+
+    let fill_yes = fill_yes_data.map(|(p, _)| p);
+    let fill_no  = fill_no_data.map(|(p, _)| p);
+
+    // Realistic edge using VWAP fill
+    let edge_fill_yes = fill_yes.map(|f| fy  - f).unwrap_or(0.0);
+    let edge_fill_no  = fill_no.map(|f| fn_ - f).unwrap_or(0.0);
+
+    // Total depth (USD) available
+    let depth_yes: f64 = book_yes.asks.iter().map(|l| l.price * l.size).sum();
+    let depth_no:  f64 = book_no.asks.iter().map(|l| l.price * l.size).sum();
+
+    // Determine best side using REALISTIC fill edge
+    let best_side = if edge_fill_yes > edge_fill_no && edge_fill_yes > 0.0 {
         Some(Side::Yes)
-    } else if edge_no > edge_yes && edge_no > 0.0 {
+    } else if edge_fill_no > edge_fill_yes && edge_fill_no > 0.0 {
         Some(Side::No)
     } else {
         None
     };
 
     let (best_edge, best_book, best_fair) = match best_side {
-        Some(Side::Yes) => (edge_yes, book_yes, fy),
-        Some(Side::No)  => (edge_no,  book_no,  fn_),
+        Some(Side::Yes) => (edge_fill_yes, fill_yes.unwrap_or(book_yes.best_ask), fy),
+        Some(Side::No)  => (edge_fill_no,  fill_no.unwrap_or(book_no.best_ask),  fn_),
         None            => (0.0, 0.0, 0.0),
     };
 
@@ -154,14 +191,22 @@ pub fn compute(
         secs_left,
         fair_yes:  fy,
         fair_no:   fn_,
-        book_yes,
-        book_no,
+        book_yes:  book_yes.best_ask,
+        book_no:   book_no.best_ask,
         edge_yes,
         edge_no,
         best_side,
         best_edge,
         best_book,
         best_fair,
+        fill_yes,
+        fill_no,
+        depth_yes,
+        depth_no,
+        bid_yes:   book_yes.best_bid,
+        bid_no:    book_no.best_bid,
+        edge_fill_yes,
+        edge_fill_no,
         ts,
     })
 }
@@ -191,13 +236,26 @@ mod tests {
         assert!(f < 0.5, "fair_yes when CL<open should be <0.5, got {}", f);
     }
 
+    use crate::feeds::PriceLevel;
+
+    fn make_book(ask: f64, bid: f64, size: f64) -> BookData {
+        BookData {
+            best_ask: ask,
+            best_bid: bid,
+            asks: vec![PriceLevel { price: ask, size }],
+            bids: vec![PriceLevel { price: bid, size }],
+        }
+    }
+
     #[test]
     fn edge_yes_positive_when_book_stale() {
         // CL up 0.5%, book still at 0.50 — YES should have edge
+        let by = make_book(0.50, 0.49, 1000.0);
+        let bn = make_book(0.49, 0.48, 1000.0);
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 100.5, 0.001, 300.0,
-            0.50, 0.49, 0.0,
+            &by, &bn, 5.0, 0.0,
         ).unwrap();
         assert!(sig.edge_yes > 0.0, "expected positive edge_yes, got {}", sig.edge_yes);
         assert_eq!(sig.best_side, Some(Side::Yes));
@@ -206,10 +264,12 @@ mod tests {
     #[test]
     fn edge_no_positive_when_cl_down() {
         // CL down 0.5%, book still at 0.50 — NO should have edge
+        let by = make_book(0.49, 0.48, 1000.0);
+        let bn = make_book(0.50, 0.49, 1000.0);
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 99.5, 0.001, 300.0,
-            0.49, 0.50, 0.0,
+            &by, &bn, 5.0, 0.0,
         ).unwrap();
         assert!(sig.edge_no > 0.0, "expected positive edge_no, got {}", sig.edge_no);
         assert_eq!(sig.best_side, Some(Side::No));
@@ -219,19 +279,21 @@ mod tests {
     fn no_edge_when_book_fair() {
         // Book perfectly priced — no edge
         let f = fair_yes(100.5, 100.0, 0.001, 300.0);
+        let by = make_book(f, f - 0.01, 1000.0);
+        let bn = make_book(1.0 - f, 1.0 - f - 0.01, 1000.0);
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 100.5, 0.001, 300.0,
-            f, 1.0 - f, 0.0,
+            &by, &bn, 5.0, 0.0,
         ).unwrap();
         assert!(sig.best_edge < 0.001, "expected ~0 edge, got {}", sig.best_edge);
     }
 
     #[test]
     fn sigma_estimation_basic() {
-        // Flat prices → near-zero sigma
+        // Flat prices → near-zero sigma (but above MIN_SIGMA floor)
         let prices: Vec<(f64, f64)> = (0..60).map(|i| (i as f64, 100.0)).collect();
         let s = estimate_sigma(&prices, 300.0, 59.0);
-        assert!(s < 0.01, "flat prices should give low sigma, got {}", s);
+        assert!(s <= MIN_SIGMA + 0.01, "flat prices should give min sigma, got {}", s);
     }
 }

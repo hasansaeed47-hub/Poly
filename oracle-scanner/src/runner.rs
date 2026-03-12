@@ -12,7 +12,7 @@ use std::fs::{File, OpenOptions};
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{debug, info};
+use tracing::info;
 
 use crate::signal::{Signal, Side};
 
@@ -175,11 +175,30 @@ impl ConfigRunner {
             return;
         }
 
-        // Edge gate
+        // Edge gate — uses VWAP fill edge (realistic)
         let side = match sig.best_side {
             Some(s) if sig.best_edge >= self.config.min_edge => s,
             _ => return,
         };
+
+        // Check fill price exists (enough liquidity to fill stake)
+        let fill_price = match side {
+            Side::Yes => sig.fill_yes,
+            Side::No  => sig.fill_no,
+        };
+        let fill_price = match fill_price {
+            Some(p) if p > 0.0 => p,
+            _ => return, // insufficient liquidity
+        };
+
+        // Check minimum depth (at least 2x stake available)
+        let depth = match side {
+            Side::Yes => sig.depth_yes,
+            Side::No  => sig.depth_no,
+        };
+        if depth < self.stake * 2.0 {
+            return; // too thin
+        }
 
         // Already in this slug? (one position per slug per config)
         let already_in = self.positions.keys().any(|k| k.starts_with(&sig.slug));
@@ -195,17 +214,18 @@ impl ConfigRunner {
             slug:          sig.slug.clone(),
             asset:         sig.asset.clone(),
             side,
-            entry_price:   sig.best_book,
+            entry_price:   fill_price,  // VWAP fill, not best ask
             fair_at_entry: sig.best_fair,
             stake:         self.stake,
             entry_ts:      now,
             window_end,
         };
 
-        debug!(
-            "[{}] ENTER {} {} @{:.3} fair={:.3} edge={:.3} secs={:.0}",
+        info!(
+            "[{}] ENTER {} {} @{:.3} (best={:.3}) fair={:.3} edge={:.3} depth=${:.0} secs={:.0}",
             self.config.name, sig.slug, side,
-            sig.best_book, sig.best_fair, sig.best_edge, sig.secs_left
+            fill_price, sig.best_book, sig.best_fair, sig.best_edge,
+            depth, sig.secs_left
         );
 
         self.positions.insert(trade_id, pos);
@@ -233,37 +253,38 @@ impl ConfigRunner {
                 Side::No  => sig.fair_no,
             };
 
-            // Get current book price for this side (as exit price)
-            let current_book = match pos.side {
-                Side::Yes => sig.book_yes,
-                Side::No  => sig.book_no,
+            // Exit price = best bid (selling back to market)
+            let exit_bid = match pos.side {
+                Side::Yes => sig.bid_yes,
+                Side::No  => sig.bid_no,
             };
 
             // Config 4: Stop-loss — exit when current_fair < entry_price
             if self.config.stop_loss
                 && sig.secs_left > 90.0  // not in final 90s (exit fee not worth it)
                 && current_fair < pos.entry_price
+                && exit_bid > 0.0        // need a bid to sell into
             {
                 let pos = self.positions.remove(&trade_id).unwrap();
-                // Exit at current book price (taker, pay fee again)
-                let exit_price = current_book.max(0.001);
+                let exit_price = exit_bid;  // sell at best bid
                 info!(
-                    "[{}] STOP_LOSS {} fair={:.3} < entry={:.3}",
-                    self.config.name, pos.slug, current_fair, pos.entry_price
+                    "[{}] STOP_LOSS {} fair={:.3} < entry={:.3} exit_bid={:.3}",
+                    self.config.name, pos.slug, current_fair, pos.entry_price, exit_price
                 );
                 self.close_position(pos, exit_price, "STOP_LOSS", sig.ts).await;
                 continue;
             }
 
-            // Config 5: Take-profit — exit when book_price >= fair_at_entry
+            // Config 5: Take-profit — exit when bid_price >= fair_at_entry
             if self.config.take_profit
-                && current_book >= pos.fair_at_entry
+                && exit_bid >= pos.fair_at_entry
+                && exit_bid > 0.0
             {
                 let pos = self.positions.remove(&trade_id).unwrap();
-                let exit_price = current_book;
+                let exit_price = exit_bid;  // sell at best bid
                 info!(
-                    "[{}] TAKE_PROFIT {} book={:.3} >= fair_at_entry={:.3}",
-                    self.config.name, pos.slug, current_book, pos.fair_at_entry
+                    "[{}] TAKE_PROFIT {} bid={:.3} >= fair_at_entry={:.3}",
+                    self.config.name, pos.slug, exit_price, pos.fair_at_entry
                 );
                 self.close_position(pos, exit_price, "TAKE_PROFIT", sig.ts).await;
                 continue;
@@ -378,8 +399,6 @@ impl ConfigRunner {
 mod tests {
     use super::*;
     use crate::signal::{Signal, Side};
-    use tempfile::tempdir;
-
     fn make_config(name: &str, min_edge: f64, max_secs: f64, sl: bool, tp: bool) -> RunnerConfig {
         RunnerConfig {
             name:          name.to_string(),
@@ -406,17 +425,28 @@ mod tests {
             open_price: 100.0, cl_price: 100.5, sigma: 0.001,
             secs_left: secs, fair_yes, fair_no,
             book_yes, book_no, edge_yes: ey, edge_no: en,
-            best_side, best_edge, best_book, best_fair, ts,
+            best_side, best_edge, best_book, best_fair,
+            fill_yes: Some(book_yes), fill_no: Some(book_no),
+            depth_yes: 100.0, depth_no: 100.0,
+            bid_yes: book_yes - 0.01, bid_no: book_no - 0.01,
+            edge_fill_yes: ey, edge_fill_no: en,
+            ts,
         }
+    }
+
+    fn make_tmp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("cl_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[tokio::test]
     async fn c1_enters_on_edge() {
-        let dir = tempdir().unwrap();
+        let dir = make_tmp_dir();
         let mut runner = ConfigRunner::new(
             make_config("C1_TEST", 0.12, 840.0, false, false),
             5.0, 0.015,
-            dir.path().to_str().unwrap(),
+            dir.to_str().unwrap(),
         );
         // fair_yes=0.80, book_yes=0.50 → edge=0.30 → should enter YES
         let sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
@@ -426,11 +456,11 @@ mod tests {
 
     #[tokio::test]
     async fn c2_rejects_outside_time_window() {
-        let dir = tempdir().unwrap();
+        let dir = make_tmp_dir();
         let mut runner = ConfigRunner::new(
             make_config("C2_TEST", 0.12, 180.0, false, false),
             5.0, 0.015,
-            dir.path().to_str().unwrap(),
+            dir.to_str().unwrap(),
         );
         // secs_left=300 → above max_secs_left=180 → should NOT enter
         let sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
@@ -440,11 +470,11 @@ mod tests {
 
     #[tokio::test]
     async fn c3_rejects_small_edge() {
-        let dir = tempdir().unwrap();
+        let dir = make_tmp_dir();
         let mut runner = ConfigRunner::new(
             make_config("C3_TEST", 0.25, 840.0, false, false),
             5.0, 0.015,
-            dir.path().to_str().unwrap(),
+            dir.to_str().unwrap(),
         );
         // edge=0.15 < min_edge=0.25 → should NOT enter
         let sig = make_signal("btc-updown-5m-test", 0.65, 0.50, 0.49, 300.0, 1000.0);
@@ -454,11 +484,11 @@ mod tests {
 
     #[tokio::test]
     async fn c4_stop_loss_exits_when_fair_below_entry() {
-        let dir = tempdir().unwrap();
+        let dir = make_tmp_dir();
         let mut runner = ConfigRunner::new(
             make_config("C4_TEST", 0.12, 840.0, true, false),
             5.0, 0.015,
-            dir.path().to_str().unwrap(),
+            dir.to_str().unwrap(),
         );
         // Enter: fair_yes=0.80, entry=0.50
         let enter_sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
@@ -474,11 +504,11 @@ mod tests {
 
     #[tokio::test]
     async fn c5_take_profit_exits_when_book_hits_fair() {
-        let dir = tempdir().unwrap();
+        let dir = make_tmp_dir();
         let mut runner = ConfigRunner::new(
             make_config("C5_TEST", 0.12, 840.0, false, true),
             5.0, 0.015,
-            dir.path().to_str().unwrap(),
+            dir.to_str().unwrap(),
         );
         // Enter: fair_yes=0.80, entry=0.50 → fair_at_entry=0.80
         let enter_sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
@@ -493,11 +523,11 @@ mod tests {
 
     #[tokio::test]
     async fn settlement_closes_position() {
-        let dir = tempdir().unwrap();
+        let dir = make_tmp_dir();
         let mut runner = ConfigRunner::new(
             make_config("SETTLE_TEST", 0.12, 840.0, false, false),
             5.0, 0.015,
-            dir.path().to_str().unwrap(),
+            dir.to_str().unwrap(),
         );
         let sig = make_signal("btc-updown-5m-test", 0.80, 0.50, 0.49, 300.0, 1000.0);
         runner.on_signal(&sig, 1000 + 300).await;

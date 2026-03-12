@@ -33,7 +33,7 @@ use feeds::{
     run_cl_feed,
 };
 use runner::{ConfigRunner, RunnerConfig};
-use signal::{compute, estimate_sigma};
+use signal::{compute, estimate_sigma, BookData};
 
 // ── Config file types ─────────────────────────────────────────────────────────
 
@@ -329,14 +329,32 @@ async fn main() -> Result<()> {
                 continue; // don't trade until open price is set
             }
 
-            // Get book prices for YES and NO tokens
-            let book_yes = match book_state.get(&meta.token_yes) {
-                Some(b) => b.best_ask,
-                None    => continue,
+            // Get full book data for YES and NO tokens
+            let book_yes_entry = match book_state.get(&meta.token_yes) {
+                Some(b) if b.best_ask > 0.0 => b.clone(),
+                _ => continue,
             };
-            let book_no = match book_state.get(&meta.token_no) {
-                Some(b) => b.best_ask,
-                None    => continue,
+            let book_no_entry = match book_state.get(&meta.token_no) {
+                Some(b) if b.best_ask > 0.0 => b.clone(),
+                _ => continue,
+            };
+
+            // Skip stale books (> 10s old)
+            if now - book_yes_entry.ts > 10.0 || now - book_no_entry.ts > 10.0 {
+                continue;
+            }
+
+            let bd_yes = BookData {
+                best_ask: book_yes_entry.best_ask,
+                best_bid: book_yes_entry.best_bid,
+                asks:     book_yes_entry.asks,
+                bids:     book_yes_entry.bids,
+            };
+            let bd_no = BookData {
+                best_ask: book_no_entry.best_ask,
+                best_bid: book_no_entry.best_bid,
+                asks:     book_no_entry.asks,
+                bids:     book_no_entry.bids,
             };
 
             // Estimate sigma from CL price history
@@ -344,7 +362,7 @@ async fn main() -> Result<()> {
                 let hist = price_history.get(&meta.asset);
                 match hist {
                     Some(h) => estimate_sigma(&h, cfg.scan.sigma_window_secs, now),
-                    None    => 0.001,
+                    None    => 0.50,
                 }
             };
 
@@ -352,7 +370,7 @@ async fn main() -> Result<()> {
             let sig = match compute(
                 slug, &meta.asset, meta.tf,
                 meta.open_price, cl, sigma, secs_left,
-                book_yes, book_no, now,
+                &bd_yes, &bd_no, cfg.paper.stake, now,
             ) {
                 Some(s) => s,
                 None    => continue,
@@ -360,8 +378,12 @@ async fn main() -> Result<()> {
 
             if sig.best_edge > 0.05 {
                 debug!(
-                    "[SCAN] {} cl={:.2} fair_y={:.3} bk_y={:.3} bk_n={:.3} dev={:+.3} secs={:.0}",
-                    slug, cl, sig.fair_yes, book_yes, book_no, sig.best_edge, secs_left
+                    "[SCAN] {} cl={:.2} fair_y={:.3} fill_y={} fill_n={} depth_y=${:.0} depth_n=${:.0} edge={:+.3} secs={:.0}",
+                    slug, cl, sig.fair_yes,
+                    sig.fill_yes.map(|f| format!("{:.3}", f)).unwrap_or("-".to_string()),
+                    sig.fill_no.map(|f| format!("{:.3}", f)).unwrap_or("-".to_string()),
+                    sig.depth_yes, sig.depth_no,
+                    sig.best_edge, secs_left
                 );
             }
 

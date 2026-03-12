@@ -42,11 +42,80 @@ pub type BookState = Arc<DashMap<String, BookEntry>>;
 pub type PriceHistory = Arc<DashMap<String, Vec<(f64, f64)>>>;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+pub struct PriceLevel {
+    pub price: f64,
+    pub size:  f64,
+}
+
+#[derive(Debug, Clone)]
 pub struct BookEntry {
+    pub asks:     Vec<PriceLevel>,  // sorted ascending by price
+    pub bids:     Vec<PriceLevel>,  // sorted descending by price
     pub best_ask: f64,
     pub best_bid: f64,
     pub ts:       f64,
+}
+
+/// Walk the book and compute VWAP fill price for a given USD stake.
+/// `levels` should be sorted: asks ascending, bids descending.
+/// Returns (avg_fill_price, shares_filled) or None if insufficient liquidity.
+pub fn vwap_fill(levels: &[PriceLevel], stake: f64) -> Option<(f64, f64)> {
+    if levels.is_empty() || stake <= 0.0 {
+        return None;
+    }
+    let mut budget = stake;
+    let mut total_shares = 0.0;
+    let mut total_cost   = 0.0;
+
+    for level in levels {
+        if budget <= 0.001 { break; }
+        if level.price <= 0.0 || level.size <= 0.0 { continue; }
+
+        // How many shares we can buy/sell at this level
+        let max_shares = level.size;
+        let shares_wanted = budget / level.price;
+        let shares = shares_wanted.min(max_shares);
+
+        let cost = shares * level.price;
+        total_shares += shares;
+        total_cost   += cost;
+        budget       -= cost;
+    }
+
+    if total_shares <= 0.0 || total_cost <= 0.0 {
+        return None;
+    }
+
+    Some((total_cost / total_shares, total_shares))
+}
+
+/// Compute VWAP sell price for a given number of shares on the bid side.
+/// `bids` should be sorted descending by price.
+/// Returns avg_fill_price or None if insufficient liquidity.
+#[allow(dead_code)]
+pub fn vwap_sell(bids: &[PriceLevel], shares_to_sell: f64) -> Option<f64> {
+    if bids.is_empty() || shares_to_sell <= 0.0 {
+        return None;
+    }
+    let mut remaining = shares_to_sell;
+    let mut total_proceeds = 0.0;
+    let mut total_sold     = 0.0;
+
+    for level in bids {
+        if remaining <= 0.001 { break; }
+        if level.price <= 0.0 || level.size <= 0.0 { continue; }
+
+        let shares = remaining.min(level.size);
+        total_proceeds += shares * level.price;
+        total_sold     += shares;
+        remaining      -= shares;
+    }
+
+    if total_sold <= 0.0 {
+        return None;
+    }
+
+    Some(total_proceeds / total_sold)
 }
 
 /// Market metadata fetched once at startup
@@ -296,24 +365,33 @@ pub async fn fetch_books_batch(
                 None => continue,
             };
 
-            let best_ask = item.get("asks")
+            // Parse full ask depth (sorted ascending by price)
+            let mut asks: Vec<PriceLevel> = item.get("asks")
                 .and_then(|a| a.as_array())
-                .map(|asks| asks.iter()
-                    .filter_map(|l| l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()))
-                    .reduce(f64::min)
-                    .unwrap_or(0.0))
-                .unwrap_or(0.0);
+                .map(|arr| arr.iter().filter_map(|l| {
+                    let price = l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok())?;
+                    let size  = l.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    Some(PriceLevel { price, size })
+                }).collect())
+                .unwrap_or_default();
+            asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
 
-            let best_bid = item.get("bids")
+            // Parse full bid depth (sorted descending by price)
+            let mut bids: Vec<PriceLevel> = item.get("bids")
                 .and_then(|b| b.as_array())
-                .map(|bids| bids.iter()
-                    .filter_map(|l| l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()))
-                    .reduce(f64::max)
-                    .unwrap_or(0.0))
-                .unwrap_or(0.0);
+                .map(|arr| arr.iter().filter_map(|l| {
+                    let price = l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok())?;
+                    let size  = l.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                    Some(PriceLevel { price, size })
+                }).collect())
+                .unwrap_or_default();
+            bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
+
+            let best_ask = asks.first().map(|l| l.price).unwrap_or(0.0);
+            let best_bid = bids.first().map(|l| l.price).unwrap_or(0.0);
 
             if best_ask > 0.0 {
-                result.insert(tid, BookEntry { best_ask, best_bid, ts: now });
+                result.insert(tid, BookEntry { asks, bids, best_ask, best_bid, ts: now });
             }
         }
 
