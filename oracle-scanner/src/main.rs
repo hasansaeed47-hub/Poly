@@ -206,6 +206,7 @@ async fn main() -> Result<()> {
     let mut tick_count:    u64 = 0;
     let mut last_stats_ts: f64 = now_secs();
     let mut last_discover: f64 = now_secs();
+    let mut last_dash_ts:  f64 = 0.0; // real-time dashboard timer
 
     // Track which markets have been settled (slug → settled)
     let mut settled: HashMap<String, bool> = HashMap::new();
@@ -376,20 +377,91 @@ async fn main() -> Result<()> {
                 None    => continue,
             };
 
-            if sig.best_edge > 0.05 {
-                debug!(
-                    "[SCAN] {} cl={:.2} fair_y={:.3} fill_y={} fill_n={} depth_y=${:.0} depth_n=${:.0} edge={:+.3} secs={:.0}",
-                    slug, cl, sig.fair_yes,
-                    sig.fill_yes.map(|f| format!("{:.3}", f)).unwrap_or("-".to_string()),
-                    sig.fill_no.map(|f| format!("{:.3}", f)).unwrap_or("-".to_string()),
-                    sig.depth_yes, sig.depth_no,
-                    sig.best_edge, secs_left
-                );
-            }
-
             // Dispatch to all 5 runners
             for runner in &mut runners {
                 runner.on_signal(&sig, meta.window_end).await;
+            }
+        }
+
+        // ── Real-time price dashboard (every 2s) ──────────────────────────────
+
+        if now - last_dash_ts >= 2.0 {
+            last_dash_ts = now;
+            let mut lines: Vec<String> = Vec::new();
+
+            for (slug, meta) in &markets {
+                if settled.get(slug.as_str()).copied().unwrap_or(false) {
+                    continue;
+                }
+
+                let secs_left = meta.window_end as f64 - now;
+                if secs_left < 0.0 { continue; }
+
+                // ── Window Open Price ──
+                let open_str = if meta.open_price > 0.0 {
+                    format!("{:.2}", meta.open_price)
+                } else {
+                    "WAIT".to_string()
+                };
+
+                // ── CL Price (real-time oracle) ──
+                let (cl_str, cl_val) = match cl_prices.get(&meta.asset) {
+                    Some(v) => (format!("{:.2}", v.1), v.1),
+                    None    => ("--".to_string(), 0.0),
+                };
+
+                // ── CL delta from open ──
+                let delta_str = if meta.open_price > 0.0 && cl_val > 0.0 {
+                    let delta_pct = (cl_val - meta.open_price) / meta.open_price * 100.0;
+                    format!("{:+.4}%", delta_pct)
+                } else {
+                    "--".to_string()
+                };
+
+                // ── Lag / Sigma (volatility from price history) ──
+                let (sigma_str, lag_count) = {
+                    let hist = price_history.get(&meta.asset);
+                    match hist {
+                        Some(h) => {
+                            let sig = estimate_sigma(&h, cfg.scan.sigma_window_secs, now);
+                            let cutoff = now - cfg.scan.sigma_window_secs;
+                            let cnt = h.iter().filter(|(ts, _)| *ts >= cutoff).count();
+                            (format!("{:.2}%", sig * 100.0), cnt)
+                        }
+                        None => ("--".to_string(), 0),
+                    }
+                };
+
+                // ── PM Prices (book bid/ask for YES and NO) ──
+                let (pm_yes_str, pm_no_str) = {
+                    let yes_book = book_state.get(&meta.token_yes);
+                    let no_book  = book_state.get(&meta.token_no);
+                    let yes = match &yes_book {
+                        Some(b) => format!("{:.2}/{:.2}", b.best_bid, b.best_ask),
+                        None    => "--/--".to_string(),
+                    };
+                    let no = match &no_book {
+                        Some(b) => format!("{:.2}/{:.2}", b.best_bid, b.best_ask),
+                        None    => "--/--".to_string(),
+                    };
+                    (yes, no)
+                };
+
+                lines.push(format!(
+                    "  {} | open={} cl={} d={} | sigma={} ticks={} | YES={} NO={} | T-{:.0}s",
+                    slug, open_str, cl_str, delta_str,
+                    sigma_str, lag_count,
+                    pm_yes_str, pm_no_str,
+                    secs_left
+                ));
+            }
+
+            if !lines.is_empty() {
+                lines.sort();
+                info!("─── LIVE PRICES ───────────────────────────────────────────────");
+                for line in &lines {
+                    info!("{}", line);
+                }
             }
         }
 

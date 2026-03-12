@@ -108,7 +108,8 @@ impl ConfigRunner {
         let log_path = format!("{}/{}.jsonl", log_dir, config.name.to_lowercase());
         let file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .open(&log_path)
             .unwrap_or_else(|e| panic!("Cannot open log {}: {}", log_path, e));
 
