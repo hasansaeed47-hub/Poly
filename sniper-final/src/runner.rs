@@ -288,7 +288,8 @@ impl Tracker {
         if left > self.cfg.entry_start || left < self.cfg.taker_deadline { return false; }
 
         if self.cfg.is_late_scalper {
-            self.evaluate_late_scalper(win, cl_prices, cl_opens, book_state, now)
+            self.evaluate_late_scalper(win, cl_prices, cl_snapshots, cl_opens, book_state,
+                                      bn_prices, bn_hist, hour_ranges, now)
         } else {
             self.evaluate_delta(win, cl_prices, cl_snapshots, cl_opens, book_state,
                                 bn_prices, bn_hist, hour_ranges, now)
@@ -299,11 +300,15 @@ impl Tracker {
 
     fn evaluate_late_scalper(
         &mut self,
-        win:        &MarketWindow<'_>,
-        cl_prices:  &ClPrices,
-        cl_opens:   &HashMap<String, f64>,
-        book_state: &BookState,
-        now:        f64,
+        win:          &MarketWindow<'_>,
+        cl_prices:    &ClPrices,
+        cl_snapshots: &ClSnapshots,
+        cl_opens:     &HashMap<String, f64>,
+        book_state:   &BookState,
+        bn_prices:    &BnPrices,
+        bn_hist:      &BnHistory,
+        hour_ranges:  &HashMap<String, f64>,
+        now:          f64,
     ) -> bool {
         // Min delta filter for Engine E too
         if let (Some(&co), Some(cn_ref)) = (cl_opens.get(win.slug), cl_prices.get(win.asset)) {
@@ -355,17 +360,34 @@ impl Tracker {
             win.end_ts, tid, win.tid_up, win.tid_dn, win.wmin, now,
         );
 
+        // Compute diagnostics for Engine E
+        let cl_open = cl_opens.get(win.slug).copied().unwrap_or(0.0);
+        let cl_now = cl_prices.get(win.asset).map(|e| e.1).unwrap_or(0.0);
+        let cl_delta = if cl_open > 0.0 && cl_now > 0.0 {
+            (cl_now - cl_open) / cl_open * 100.0
+        } else { 0.0 };
+        let bn_now = bn_prices.get(win.asset).map(|v| *v).unwrap_or(0.0);
+        let hr = hour_ranges.get(win.asset).copied().unwrap_or(0.0);
+        let bt = bn_trend(bn_hist, win.asset, self.exec.bn_contra_secs);
+        let ct = cl_trend(cl_snapshots, cl_prices, win.asset, self.exec.cl_fade_secs);
+
         info!("═══════════════════════════════════════════════════════");
         info!("  [E] SIGNAL: BUY {} {} {}m @{:.3} ({:.0}s left) [{}]",
             dir, win.asset.to_uppercase(), win.wmin, fp, win.secs_left, fill_method);
         info!("  book={:.3}  maker={:.3}  fee=${:.4}  SL<={:.3}",
             best_ask, mk, pos.entry_fee, pos.sl_px);
+        info!("  CL={:.2} open={:.2} d={:+.4}% BN={:.2} 1hRange={:.2}%",
+            cl_now, cl_open, cl_delta, bn_now, hr);
+        info!("  filters: bn={:+.4}(thr={:.4}) cl={:+.4}(thr={:.4}) range={:.2}%(thr={:.2}%)",
+            bt.unwrap_or(0.0), self.exec.bn_contra_thresh,
+            ct.unwrap_or(0.0), self.exec.cl_fade_thresh,
+            hr, self.exec.regime_thresh);
         info!("═══════════════════════════════════════════════════════");
 
-        // Store diagnostics for SL logging (no filter values for Engine E)
-        self.entry_bn_trend = None;
-        self.entry_cl_trend = None;
-        self.entry_hour_range = None;
+        // Store diagnostics for SL logging
+        self.entry_bn_trend = bt;
+        self.entry_cl_trend = ct;
+        self.entry_hour_range = Some(hr);
         self.entry_fill_method = Some(fill_method.to_string());
         self.sl_decline_ticks = 0;
 
