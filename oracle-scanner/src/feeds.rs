@@ -358,19 +358,18 @@ async fn connect_cl_feed(
     let url = Url::parse(live_ws).context("invalid live WS URL")?;
     let (mut ws, _) = connect_async(url).await.context("CL WS connect failed")?;
 
-    // Subscribe to chainlink topic for each asset
-    for asset in assets {
-        let symbol = format!("{}usd", asset.to_uppercase());
-        let sub = serde_json::json!({
-            "type": "subscribe",
-            "channel": "crypto_prices_chainlink",
-            "symbol": symbol
-        });
-        ws.send(Message::Text(sub.to_string())).await?;
-        debug!("[CL] Subscribed to {}", symbol);
-    }
+    // Subscribe to chainlink topic (wildcard — all assets in one subscription)
+    let sub = serde_json::json!({
+        "action": "subscribe",
+        "subscriptions": [{
+            "topic": "crypto_prices_chainlink",
+            "type": "*",
+            "filters": ""
+        }]
+    });
+    ws.send(Message::Text(sub.to_string())).await?;
 
-    info!("[CL] Feed connected, {} assets", assets.len());
+    info!("[CL] Feed connected, watching {} assets", assets.len());
 
     while let Some(msg) = ws.next().await {
         match msg {
@@ -393,35 +392,50 @@ fn process_cl_message(
     cl_prices:     &ClPrices,
     price_history: &PriceHistory,
 ) {
-    // Expected: {"channel":"crypto_prices_chainlink","symbol":"BTCUSD","price":"67321.5","ts":1234567890}
-    let channel = v.get("channel").and_then(|c| c.as_str()).unwrap_or("");
-    if channel != "crypto_prices_chainlink" {
+    // Format: {"topic":"crypto_prices_chainlink","payload":{"symbol":"BTC/USD","value":67321.5,"timestamp":1234567890000}}
+    let topic = v.get("topic").and_then(|t| t.as_str()).unwrap_or("");
+    if topic != "crypto_prices_chainlink" {
         return;
     }
 
-    let symbol = match v.get("symbol").and_then(|s| s.as_str()) {
+    let payload = match v.get("payload") {
+        Some(p) => p,
+        None    => return,
+    };
+
+    let symbol = match payload.get("symbol").and_then(|s| s.as_str()) {
         Some(s) => s.to_lowercase(),
         None    => return,
     };
 
-    // "BTCUSD" → "btc"
-    let asset = symbol.trim_end_matches("usd").to_string();
+    // Normalize: "btc/usd" → "btc", "btcusd" → "btc", "btc" → "btc"
+    let asset = symbol
+        .replace("/usd", "")
+        .trim_end_matches("usd")
+        .to_string();
 
-    let price_str = v.get("price").and_then(|p| p.as_str()).unwrap_or("0");
-    let price: f64 = match price_str.parse() {
-        Ok(p) if p > 0.0 => p,
-        _ => return,
+    // value can be f64 or string
+    let price: f64 = payload.get("value")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+        .unwrap_or(0.0);
+    if price <= 0.0 {
+        return;
+    }
+
+    // timestamp may be in milliseconds or seconds
+    let raw_ts = payload.get("timestamp")
+        .and_then(|t| t.as_f64().or_else(|| t.as_i64().map(|i| i as f64)))
+        .unwrap_or(0.0);
+    let ts = if raw_ts > 1e12 {
+        raw_ts / 1000.0  // milliseconds → seconds
+    } else if raw_ts > 1e9 {
+        raw_ts
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
     };
-
-    let ts = v
-        .get("ts")
-        .and_then(|t| t.as_f64())
-        .unwrap_or_else(|| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs_f64()
-        });
 
     cl_prices.insert(asset.clone(), (ts, price));
 
