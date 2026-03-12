@@ -261,25 +261,21 @@ pub async fn fetch_books_batch(
 
     limiter.wait().await;
 
-    // Build query: /books?token_id=X&token_id=Y
+    // POST /books with JSON body [{"token_id": "X"}, {"token_id": "Y"}]
     // Split into batches of BOOK_BATCH_SIZE
     let mut result = HashMap::new();
 
     for chunk in token_ids.chunks(BOOK_BATCH_SIZE) {
-        let mut url = Url::parse(&format!("{}/books", clob_rest))
-            .context("invalid CLOB REST URL")?;
-
-        {
-            let mut pairs = url.query_pairs_mut();
-            for tid in chunk {
-                pairs.append_pair("token_id", tid);
-            }
-        }
+        let url = format!("{}/books", clob_rest);
+        let body: Vec<serde_json::Value> = chunk.iter()
+            .map(|tid| serde_json::json!({"token_id": tid}))
+            .collect();
 
         debug!("Batch book fetch: {} tokens", chunk.len());
 
         let resp = client
-            .get(url.as_str())
+            .post(&url)
+            .json(&body)
             .timeout(Duration::from_secs(5))
             .send()
             .await
@@ -290,8 +286,8 @@ pub async fn fetch_books_batch(
             continue;
         }
 
-        // Response is array of books, one per token_id, same order as request
-        let books: Vec<Option<ClobBook>> = resp
+        // Response is array of book objects with asset_id, bids, asks
+        let books: Vec<serde_json::Value> = resp
             .json()
             .await
             .context("CLOB batch book JSON parse failed")?;
@@ -301,28 +297,30 @@ pub async fn fetch_books_batch(
             .unwrap_or_default()
             .as_secs_f64();
 
-        for (tid, book_opt) in chunk.iter().zip(books.iter()) {
-            if let Some(book) = book_opt {
-                let best_ask = book
-                    .asks
-                    .iter()
-                    .filter_map(|l| l.price.parse::<f64>().ok())
+        for item in &books {
+            let tid = match item.get("asset_id").and_then(|v| v.as_str()) {
+                Some(id) => id.to_string(),
+                None => continue,
+            };
+
+            let best_ask = item.get("asks")
+                .and_then(|a| a.as_array())
+                .map(|asks| asks.iter()
+                    .filter_map(|l| l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()))
                     .reduce(f64::min)
-                    .unwrap_or(0.0);
+                    .unwrap_or(0.0))
+                .unwrap_or(0.0);
 
-                let best_bid = book
-                    .bids
-                    .iter()
-                    .filter_map(|l| l.price.parse::<f64>().ok())
+            let best_bid = item.get("bids")
+                .and_then(|b| b.as_array())
+                .map(|bids| bids.iter()
+                    .filter_map(|l| l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()))
                     .reduce(f64::max)
-                    .unwrap_or(0.0);
+                    .unwrap_or(0.0))
+                .unwrap_or(0.0);
 
-                if best_ask > 0.0 {
-                    result.insert(
-                        tid.clone(),
-                        BookEntry { best_ask, best_bid, ts: now },
-                    );
-                }
+            if best_ask > 0.0 {
+                result.insert(tid, BookEntry { best_ask, best_bid, ts: now });
             }
         }
 
@@ -382,11 +380,15 @@ async fn connect_cl_feed(
     info!("[CL] Feed connected, {} assets", assets.len());
 
     while let Some(msg) = ws.next().await {
-        let msg = msg.context("CL WS message error")?;
-        if let Message::Text(text) = msg {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                process_cl_message(&v, cl_prices, price_history);
+        match msg {
+            Ok(Message::Text(text)) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    process_cl_message(&v, cl_prices, price_history);
+                }
             }
+            Ok(Message::Ping(data)) => { let _ = ws.send(Message::Pong(data)).await; }
+            Ok(_) => {}
+            Err(e) => { error!("[CL] WebSocket error: {}", e); break; }
         }
     }
 
@@ -493,11 +495,15 @@ async fn connect_book_feed(
     book_live.store(connect_ts, std::sync::atomic::Ordering::Relaxed);
 
     while let Some(msg) = ws.next().await {
-        let msg = msg.context("CLOB WS message error")?;
-        if let Message::Text(text) = msg {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                process_book_message(&v, book_state);
+        match msg {
+            Ok(Message::Text(text)) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    process_book_message(&v, book_state);
+                }
             }
+            Ok(Message::Ping(data)) => { let _ = ws.send(Message::Pong(data)).await; }
+            Ok(_) => {}
+            Err(e) => { error!("[BOOK] WebSocket error: {}", e); break; }
         }
     }
 
