@@ -55,6 +55,17 @@ pub struct TradeLog {
     pub entry_ts:    f64,
     pub exit_ts:     f64,
     pub hold_secs:   f64,
+    // Diagnostic fields
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bn_trend:    Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cl_trend:    Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hour_range:  Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fill_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sl_decline_ticks: Option<u32>,
 }
 
 // -- Stats --------------------------------------------------------------------
@@ -87,6 +98,12 @@ pub struct Tracker {
     maker_ticks:      HashMap<String, u32>,     // maker chase counter
     sl_skip_logged:   bool,
     log_file:         File,
+    // Diagnostic state
+    sl_decline_ticks: u32,                      // ticks bid declining before SL fires
+    entry_bn_trend:   Option<f64>,              // bn_trend at entry time
+    entry_cl_trend:   Option<f64>,              // cl_trend at entry time
+    entry_hour_range: Option<f64>,              // hour_range at entry time
+    entry_fill_method: Option<String>,          // MAKER_CROSS / MAKER_WAIT / TAKER
 }
 
 impl Tracker {
@@ -111,6 +128,11 @@ impl Tracker {
             maker_ticks: HashMap::new(),
             sl_skip_logged: false,
             log_file: file,
+            sl_decline_ticks: 0,
+            entry_bn_trend: None,
+            entry_cl_trend: None,
+            entry_hour_range: None,
+            entry_fill_method: None,
         }
     }
 
@@ -123,6 +145,11 @@ impl Tracker {
         let opp_tid = if pos.dir == "UP" { &pos.tid_dn } else { &pos.tid_up };
         let opp_bk = book_state.get(opp_tid)?;
 
+        // Track bid decline (bid below 90% of fill = distressed)
+        if our_bk.best_bid > 0.0 && our_bk.best_bid < pos.fill_px * 0.90 {
+            self.sl_decline_ticks += 1;
+        }
+
         let (fire, reason) = check_sl(
             our_bk.best_bid,
             our_bk.best_bid > 0.0,
@@ -133,6 +160,7 @@ impl Tracker {
         );
 
         if fire {
+            let decline_ticks = self.sl_decline_ticks;
             let pos = self.active.take().unwrap();
             let result = execute_sl(&pos, our_bk.best_bid, &self.exec, now);
 
@@ -140,6 +168,17 @@ impl Tracker {
             info!("  [{}] SL {} {} {}m", self.cfg.id, pos.dir, pos.asset.to_uppercase(), pos.wmin);
             info!("  bid={:.3} <= {:.3} (50% of {:.3})  opp_bid={:.3} <- CONFIRMED",
                 our_bk.best_bid, pos.sl_px, pos.fill_px, opp_bk.best_bid);
+            info!("  decline_ticks={} ({:.1}s distressed)  hold={:.1}s",
+                decline_ticks, decline_ticks as f64 * 0.5, now - pos.entry_ts);
+            if let (Some(bt), Some(ct)) = (self.entry_bn_trend, self.entry_cl_trend) {
+                info!("  entry_filters: bn={:+.4}(thr={:.4}) cl={:+.4}(thr={:.4}) range={:.2}%",
+                    bt, self.exec.bn_contra_thresh,
+                    ct, self.exec.cl_fade_thresh,
+                    self.entry_hour_range.unwrap_or(0.0));
+            }
+            if let Some(ref fm) = self.entry_fill_method {
+                info!("  fill_method={}", fm);
+            }
             info!("  P&L=${:+.2}", result.pnl);
             info!("═══════════════════════════════════════════════════════");
 
@@ -147,6 +186,11 @@ impl Tracker {
             self.stats.pnl += result.pnl;
             self.done.insert(pos.slug.clone());
             self.log_trade(&result);
+            self.sl_decline_ticks = 0;
+            self.entry_bn_trend = None;
+            self.entry_cl_trend = None;
+            self.entry_hour_range = None;
+            self.entry_fill_method = None;
             return Some(result);
         } else if reason == "THIN_BOOK" && !self.sl_skip_logged {
             info!("  [{}] SL skip: bid={:.3}<={:.3} but opp_bid={:.3} (thin book, holding)",
@@ -197,10 +241,20 @@ impl Tracker {
 
             self.stats.pnl += result.pnl;
             self.log_trade(&result);
+            self.entry_bn_trend = None;
+            self.entry_cl_trend = None;
+            self.entry_hour_range = None;
+            self.entry_fill_method = None;
+            self.sl_decline_ticks = 0;
             Some(result)
         } else {
             warn!("[{}] NO_SETTLE {} — returning stake", self.cfg.id, pos.slug);
             self.active = None;
+            self.entry_bn_trend = None;
+            self.entry_cl_trend = None;
+            self.entry_hour_range = None;
+            self.entry_fill_method = None;
+            self.sl_decline_ticks = 0;
             None
         }
     }
@@ -276,6 +330,17 @@ impl Tracker {
         let maker_elapsed = self.maker_ticks.entry(win.slug.to_string()).or_insert(0);
         *maker_elapsed += 1;
 
+        let mk = crate::execution::maker_price(best_ask, self.cfg.min_entry);
+        let fill_method = if mk >= best_ask {
+            "MAKER_CROSS"
+        } else if *maker_elapsed > self.exec.maker_chase_ticks || win.secs_left <= (self.cfg.taker_deadline + 1) {
+            "TAKER"
+        } else if *maker_elapsed >= 2 {
+            "MAKER_WAIT"
+        } else {
+            "MAKER_PENDING"
+        };
+
         let fp = match fill_price(
             best_ask, self.cfg.min_entry, self.cfg.max_entry, self.exec.slip,
             *maker_elapsed, self.exec.maker_chase_ticks,
@@ -291,12 +356,18 @@ impl Tracker {
         );
 
         info!("═══════════════════════════════════════════════════════");
-        info!("  [E] SIGNAL: BUY {} {} {}m @{:.3} ({:.0}s left)",
-            dir, win.asset.to_uppercase(), win.wmin, fp, win.secs_left);
+        info!("  [E] SIGNAL: BUY {} {} {}m @{:.3} ({:.0}s left) [{}]",
+            dir, win.asset.to_uppercase(), win.wmin, fp, win.secs_left, fill_method);
         info!("  book={:.3}  maker={:.3}  fee=${:.4}  SL<={:.3}",
-            best_ask, crate::execution::maker_price(best_ask, self.cfg.min_entry),
-            pos.entry_fee, pos.sl_px);
+            best_ask, mk, pos.entry_fee, pos.sl_px);
         info!("═══════════════════════════════════════════════════════");
+
+        // Store diagnostics for SL logging (no filter values for Engine E)
+        self.entry_bn_trend = None;
+        self.entry_cl_trend = None;
+        self.entry_hour_range = None;
+        self.entry_fill_method = Some(fill_method.to_string());
+        self.sl_decline_ticks = 0;
 
         self.active = Some(pos);
         self.sl_skip_logged = false;
@@ -389,6 +460,17 @@ impl Tracker {
         let maker_elapsed = self.maker_ticks.entry(win.slug.to_string()).or_insert(0);
         *maker_elapsed += 1;
 
+        let mk = crate::execution::maker_price(best_ask, self.cfg.min_entry);
+        let fill_method = if mk >= best_ask {
+            "MAKER_CROSS"
+        } else if *maker_elapsed > self.exec.maker_chase_ticks || win.secs_left <= (self.cfg.taker_deadline + 1) {
+            "TAKER"
+        } else if *maker_elapsed >= 2 {
+            "MAKER_WAIT"
+        } else {
+            "MAKER_PENDING"
+        };
+
         let fp = match fill_price(
             best_ask, self.cfg.min_entry, self.cfg.max_entry, self.exec.slip,
             *maker_elapsed, self.exec.maker_chase_ticks,
@@ -406,16 +488,31 @@ impl Tracker {
         let bn_now = bn_prices.get(win.asset).map(|v| *v).unwrap_or(0.0);
         let hr = hour_ranges.get(win.asset).copied().unwrap_or(0.0);
 
+        // Compute filter values for diagnostics
+        let bt = bn_trend(bn_hist, win.asset, self.exec.bn_contra_secs);
+        let ct = cl_trend(cl_snapshots, cl_prices, win.asset, self.exec.cl_fade_secs);
+
         info!("═══════════════════════════════════════════════════════");
-        info!("  [{}] SIGNAL: BUY {} {} {}m @{:.3} ({:.0}s left)",
-            self.cfg.id, dir, win.asset.to_uppercase(), win.wmin, fp, win.secs_left);
+        info!("  [{}] SIGNAL: BUY {} {} {}m @{:.3} ({:.0}s left) [{}]",
+            self.cfg.id, dir, win.asset.to_uppercase(), win.wmin, fp, win.secs_left, fill_method);
         let cont = self.delta_ticks.get(win.slug).copied().unwrap_or(0);
         info!("  d={:+.4}% thr={:.4}% cont={}/{} book={:.3}",
             delta, threshold, cont, self.cfg.continuity, best_ask);
         info!("  CL={:.2} open={:.2} BN={:.2} 1hRange={:.2}%", cl_now, cl_open, bn_now, hr);
+        info!("  filters: bn={:+.4}(thr={:.4}) cl={:+.4}(thr={:.4}) range={:.2}%(thr={:.2}%)",
+            bt.unwrap_or(0.0), self.exec.bn_contra_thresh,
+            ct.unwrap_or(0.0), self.exec.cl_fade_thresh,
+            hr, self.exec.regime_thresh);
         info!("  maker={:.3} fee=${:.4} SL<={:.3}",
-            crate::execution::maker_price(best_ask, self.cfg.min_entry), pos.entry_fee, pos.sl_px);
+            mk, pos.entry_fee, pos.sl_px);
         info!("═══════════════════════════════════════════════════════");
+
+        // Store diagnostics for SL logging
+        self.entry_bn_trend = bt;
+        self.entry_cl_trend = ct;
+        self.entry_hour_range = Some(hr);
+        self.entry_fill_method = Some(fill_method.to_string());
+        self.sl_decline_ticks = 0;
 
         self.active = Some(pos);
         self.sl_skip_logged = false;
@@ -444,6 +541,11 @@ impl Tracker {
             entry_ts:    result.entry_ts,
             exit_ts:     result.exit_ts,
             hold_secs:   result.exit_ts - result.entry_ts,
+            bn_trend:    self.entry_bn_trend,
+            cl_trend:    self.entry_cl_trend,
+            hour_range:  self.entry_hour_range,
+            fill_method: self.entry_fill_method.clone(),
+            sl_decline_ticks: if result.exit_reason == "SL" { Some(self.sl_decline_ticks) } else { None },
         };
         if let Ok(line) = serde_json::to_string(&log) {
             let _ = writeln!(self.log_file, "{}", line);

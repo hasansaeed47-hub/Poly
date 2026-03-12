@@ -196,7 +196,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let live_mode = clob_client.is_some();
+    let _live_mode = clob_client.is_some();
 
     // Pre-authenticate SDK so first order doesn't pay 1-2s auth latency
     if let Some(ref clob) = clob_client {
@@ -206,7 +206,7 @@ async fn main() -> Result<()> {
     }
 
     info!("═══════════════════════════════════════════════════════");
-    info!("  SNIPER FINAL v1.0 — {}", if live_mode { "LIVE (SDK)" } else { "PAPER MODE" });
+    info!("  SNIPER FINAL v1.0 — PAPER (diagnostic logging)");
     info!("═══════════════════════════════════════════════════════");
     info!("  Assets: {:?}", cfg.feed.assets);
     info!("  Timeframes: {:?}m", cfg.feed.timeframes);
