@@ -30,6 +30,7 @@ pub struct RunnerConfig {
 // ── Paper position ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PaperPosition {
     pub trade_id:      String,
     pub slug:          String,
@@ -365,6 +366,7 @@ impl ConfigRunner {
         );
     }
 
+    #[allow(dead_code)]
     pub fn open_position_count(&self) -> usize {
         self.positions.len()
     }

@@ -46,6 +46,7 @@ struct AppConfig {
 }
 
 #[derive(Deserialize, Debug)]
+#[allow(dead_code)]
 struct FeedConfig {
     assets:           Vec<String>,
     timeframes:       Vec<u32>,

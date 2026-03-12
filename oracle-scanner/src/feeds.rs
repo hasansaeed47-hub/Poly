@@ -42,6 +42,7 @@ pub type BookState = Arc<DashMap<String, BookEntry>>;
 pub type PriceHistory = Arc<DashMap<String, Vec<(f64, f64)>>>;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct BookEntry {
     pub best_ask: f64,
     pub best_bid: f64,
@@ -50,6 +51,7 @@ pub struct BookEntry {
 
 /// Market metadata fetched once at startup
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MarketMeta {
     pub slug:         String,
     pub asset:        String,
@@ -70,6 +72,7 @@ struct GammaEvent {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 struct GammaMarket {
     condition_id:   Option<String>,
     #[serde(default, deserialize_with = "deserialize_stringified_vec")]
@@ -106,19 +109,7 @@ where
     }
 }
 
-// ── CLOB REST book response ───────────────────────────────────────────────────
-
-#[derive(Deserialize, Debug)]
-struct ClobBook {
-    asks: Vec<ClobLevel>,
-    bids: Vec<ClobLevel>,
-}
-
-#[derive(Deserialize, Debug)]
-struct ClobLevel {
-    price: String,
-    size:  String,
-}
+// ── CLOB REST ────────────────────────────────────────────────────────────────
 
 // ── Rate limiter ──────────────────────────────────────────────────────────────
 
@@ -443,137 +434,6 @@ fn process_cl_message(
     }
 }
 
-// ── PM book WebSocket feed ────────────────────────────────────────────────────
-
-/// Spawn a task that maintains a PM CLOB book WebSocket subscription.
-/// Best-effort: REST polling is the primary source; WS provides faster updates when connected.
-pub async fn run_book_feed(
-    clob_ws:    String,
-    token_ids:  Arc<DashMap<String, ()>>,
-    book_state: BookState,
-) {
-    loop {
-        info!("[BOOK WS] Connecting...");
-
-        match connect_book_feed(&clob_ws, &token_ids, &book_state).await {
-            Ok(_)  => warn!("[BOOK WS] Closed, reconnecting..."),
-            Err(e) => warn!("[BOOK WS] Error: {}, retrying in {}s", e, WS_RECONNECT_SECS),
-        }
-
-        tokio::time::sleep(Duration::from_secs(WS_RECONNECT_SECS)).await;
-    }
-}
-
-async fn connect_book_feed(
-    clob_ws:    &str,
-    token_ids:  &DashMap<String, ()>,
-    book_state: &BookState,
-) -> Result<()> {
-    let url = Url::parse(clob_ws).context("invalid CLOB WS URL")?;
-    let (mut ws, _) = connect_async(url).await.context("CLOB WS connect failed")?;
-
-    // Subscribe all known token IDs — no auth field
-    let ids: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
-    if ids.is_empty() {
-        return Ok(());
-    }
-
-    // Subscribe in smaller batches to avoid server rejection
-    for chunk in ids.chunks(10) {
-        let sub = serde_json::json!({
-            "type": "subscribe",
-            "markets": chunk
-        });
-        ws.send(Message::Text(sub.to_string())).await?;
-    }
-    info!("[BOOK WS] Subscribed to {} token IDs", ids.len());
-
-    while let Some(msg) = ws.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    process_book_message(&v, book_state);
-                }
-            }
-            Ok(Message::Ping(data)) => { let _ = ws.send(Message::Pong(data)).await; }
-            Ok(_) => {}
-            Err(e) => { error!("[BOOK WS] {}", e); break; }
-        }
-    }
-
-    Ok(())
-}
-
-fn process_book_message(v: &serde_json::Value, book_state: &BookState) {
-    // Polymarket CLOB WS sends book snapshots and delta updates
-    // Format: {"event_type":"book","asset_id":"<token_id>","asks":[...],"bids":[...]}
-    // Or:     {"event_type":"price_change","asset_id":"...","changes":[...]}
-
-    let event_type = v.get("event_type").and_then(|e| e.as_str()).unwrap_or("");
-    let asset_id   = match v.get("asset_id").and_then(|a| a.as_str()) {
-        Some(id) => id.to_string(),
-        None     => return,
-    };
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
-
-    match event_type {
-        "book" => {
-            // Full book snapshot
-            let best_ask = extract_best_ask(v);
-            let best_bid = extract_best_bid(v);
-            if best_ask > 0.0 {
-                book_state.insert(asset_id, BookEntry { best_ask, best_bid, ts: now });
-            }
-        }
-        "price_change" => {
-            // Incremental update — recompute best from changes
-            // For simplicity: treat as full update if ask/bid present
-            let best_ask = extract_best_ask(v);
-            let best_bid = extract_best_bid(v);
-            if best_ask > 0.0 {
-                book_state.insert(asset_id, BookEntry { best_ask, best_bid, ts: now });
-            }
-        }
-        _ => {}
-    }
-}
-
-fn extract_best_ask(v: &serde_json::Value) -> f64 {
-    v.get("asks")
-        .and_then(|a| a.as_array())
-        .map(|asks| {
-            asks.iter()
-                .filter_map(|l| {
-                    l.get("price")
-                        .and_then(|p| p.as_str())
-                        .and_then(|s| s.parse::<f64>().ok())
-                })
-                .reduce(f64::min)
-                .unwrap_or(0.0)
-        })
-        .unwrap_or(0.0)
-}
-
-fn extract_best_bid(v: &serde_json::Value) -> f64 {
-    v.get("bids")
-        .and_then(|b| b.as_array())
-        .map(|bids| {
-            bids.iter()
-                .filter_map(|l| {
-                    l.get("price")
-                        .and_then(|p| p.as_str())
-                        .and_then(|s| s.parse::<f64>().ok())
-                })
-                .reduce(f64::max)
-                .unwrap_or(0.0)
-        })
-        .unwrap_or(0.0)
-}
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -594,39 +454,8 @@ mod tests {
 
     #[test]
     fn current_window_starts_5m() {
-        // 1772788230 = some ts that is 30s into a 5m window
-        // window start should be 1772788200 (rounded down to 300s boundary)
         let starts = current_window_starts(5, 1772788230);
         assert_eq!(starts[0], 1772788200);
         assert_eq!(starts[1], 1772788500);
-    }
-
-    #[test]
-    fn extract_best_ask_from_book() {
-        let v = serde_json::json!({
-            "event_type": "book",
-            "asset_id": "abc123",
-            "asks": [
-                {"price": "0.55", "size": "10"},
-                {"price": "0.60", "size": "5"},
-                {"price": "0.52", "size": "3"}
-            ],
-            "bids": []
-        });
-        assert_eq!(extract_best_ask(&v), 0.52);
-    }
-
-    #[test]
-    fn batch_book_url_construction() {
-        // Verify we can construct multi-token URLs without panic
-        let base = "https://clob.polymarket.com";
-        let mut url = Url::parse(&format!("{}/books", base)).unwrap();
-        {
-            let mut pairs = url.query_pairs_mut();
-            pairs.append_pair("token_id", "abc");
-            pairs.append_pair("token_id", "def");
-        }
-        assert!(url.as_str().contains("token_id=abc"));
-        assert!(url.as_str().contains("token_id=def"));
     }
 }

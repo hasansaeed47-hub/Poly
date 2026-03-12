@@ -29,6 +29,7 @@ impl std::fmt::Display for Side {
 
 /// Output of one signal computation — shared across all runners
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Signal {
     pub slug:        String,
     pub asset:       String,
