@@ -446,24 +446,20 @@ fn process_cl_message(
 // ── PM book WebSocket feed ────────────────────────────────────────────────────
 
 /// Spawn a task that maintains a PM CLOB book WebSocket subscription.
-/// Subscribes to all token IDs in `token_ids`.
-/// Updates book_state: token_id → BookEntry
+/// Best-effort: REST polling is the primary source; WS provides faster updates when connected.
 pub async fn run_book_feed(
     clob_ws:    String,
-    token_ids:  Arc<DashMap<String, ()>>, // set of token IDs to subscribe
+    token_ids:  Arc<DashMap<String, ()>>,
     book_state: BookState,
-    book_live:  Arc<std::sync::atomic::AtomicU64>,
 ) {
     loop {
-        info!("[BOOK] Connecting to {}", clob_ws);
+        info!("[BOOK WS] Connecting...");
 
-        match connect_book_feed(&clob_ws, &token_ids, &book_state, &book_live).await {
-            Ok(_)  => warn!("[BOOK] Feed closed cleanly, reconnecting..."),
-            Err(e) => error!("[BOOK] Feed error: {}, reconnecting in {}s", e, WS_RECONNECT_SECS),
+        match connect_book_feed(&clob_ws, &token_ids, &book_state).await {
+            Ok(_)  => warn!("[BOOK WS] Closed, reconnecting..."),
+            Err(e) => warn!("[BOOK WS] Error: {}, retrying in {}s", e, WS_RECONNECT_SECS),
         }
 
-        // Reset live timestamp on disconnect
-        book_live.store(0, std::sync::atomic::Ordering::Relaxed);
         tokio::time::sleep(Duration::from_secs(WS_RECONNECT_SECS)).await;
     }
 }
@@ -472,29 +468,25 @@ async fn connect_book_feed(
     clob_ws:    &str,
     token_ids:  &DashMap<String, ()>,
     book_state: &BookState,
-    book_live:  &Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
     let url = Url::parse(clob_ws).context("invalid CLOB WS URL")?;
     let (mut ws, _) = connect_async(url).await.context("CLOB WS connect failed")?;
 
-    // Subscribe all known token IDs
+    // Subscribe all known token IDs — no auth field
     let ids: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
-    if !ids.is_empty() {
-        let sub = serde_json::json!({
-            "auth": {},
-            "type": "subscribe",
-            "markets": ids
-        });
-        ws.send(Message::Text(sub.to_string())).await?;
-        info!("[BOOK] Subscribed to {} token IDs", ids.len());
+    if ids.is_empty() {
+        return Ok(());
     }
 
-    // Record connect time for warmup gate
-    let connect_ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    book_live.store(connect_ts, std::sync::atomic::Ordering::Relaxed);
+    // Subscribe in smaller batches to avoid server rejection
+    for chunk in ids.chunks(10) {
+        let sub = serde_json::json!({
+            "type": "subscribe",
+            "markets": chunk
+        });
+        ws.send(Message::Text(sub.to_string())).await?;
+    }
+    info!("[BOOK WS] Subscribed to {} token IDs", ids.len());
 
     while let Some(msg) = ws.next().await {
         match msg {
@@ -505,7 +497,7 @@ async fn connect_book_feed(
             }
             Ok(Message::Ping(data)) => { let _ = ws.send(Message::Pong(data)).await; }
             Ok(_) => {}
-            Err(e) => { error!("[BOOK] WebSocket error: {}", e); break; }
+            Err(e) => { error!("[BOOK WS] {}", e); break; }
         }
     }
 

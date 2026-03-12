@@ -30,7 +30,7 @@ use tracing_subscriber::EnvFilter;
 use feeds::{
     BookState, ClPrices, MarketMeta, PriceHistory, RateLimiter,
     build_slug, current_window_starts, fetch_books_batch, fetch_market_meta,
-    run_cl_feed,
+    run_book_feed, run_cl_feed,
 };
 use runner::{ConfigRunner, RunnerConfig};
 use signal::{compute, estimate_sigma};
@@ -183,7 +183,15 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Book data via REST polling only (WS book feed removed — unreliable)
+    // Book WS feed (best-effort, REST polling is primary fallback)
+    {
+        let bs = book_state.clone();
+        let ti = token_ids.clone();
+        let ws = cfg.feed.clob_ws.clone();
+        tokio::spawn(async move {
+            run_book_feed(ws, ti, bs).await;
+        });
+    }
 
     // ── Build runners ─────────────────────────────────────────────────────────
 
@@ -240,9 +248,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── Batch book refresh (every 2s via REST) ──────────────────────────
+        // ── Batch book refresh (every tick via REST) ─────────────────────────
 
-        if tick_count % 4 == 0 {
+        if tick_count % 2 == 0 {
             let all_tokens: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
             if !all_tokens.is_empty() {
                 match fetch_books_batch(&http, &cfg.feed.clob_rest, &all_tokens, &limiter).await {
