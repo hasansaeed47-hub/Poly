@@ -136,7 +136,9 @@ impl ConfigRunner {
 
     /// Called at window settlement with the final CL price.
     /// Settles all positions for this slug at the settlement price.
-    pub async fn on_settlement(&mut self, slug: &str, cl_settle: f64, settle_ts: f64) {
+    /// Called at window settlement.
+    /// `yes_outcome`: 1.0 if YES wins (CL > open), 0.0 if NO wins.
+    pub async fn on_settlement(&mut self, slug: &str, yes_outcome: f64, settle_ts: f64) {
         let trade_ids: Vec<String> = self
             .positions
             .keys()
@@ -146,20 +148,11 @@ impl ConfigRunner {
 
         for trade_id in trade_ids {
             if let Some(pos) = self.positions.remove(&trade_id) {
-                // Settlement: YES=1.0 if CL closed above open, NO=1.0 if below
-                // But since PM settles at CL price, the binary outcome is:
-                // YES wins if cl_settle > open_price
-                // We don't have open_price here — use the fair_at_entry as proxy
-                // Better: settlement price IS the token price at close (0 or 1)
-                // For paper trading we use: exit_price = 1.0 if we were on winning side
-                //
-                // Winning condition:
-                //   Side::Yes → cl_settle implicitly > open (would need open_price)
-                //   We log the actual settle price and compute pnl from 0/1 outcome
-                //
-                // For now: use fair_at_entry direction as proxy
-                // In production: settlement feed will give exact 0/1
-                let exit_price = cl_settle; // caller passes 1.0 or 0.0
+                // Binary settlement: token pays 1.0 if its side wins, 0.0 otherwise
+                let exit_price = match pos.side {
+                    Side::Yes => yes_outcome,        // YES token: 1.0 if YES wins, 0.0 if NO wins
+                    Side::No  => 1.0 - yes_outcome,  // NO token:  1.0 if NO wins,  0.0 if YES wins
+                };
                 self.close_position(pos, exit_price, "SETTLEMENT", settle_ts).await;
             }
         }
