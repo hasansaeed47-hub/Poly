@@ -1,8 +1,8 @@
-# Weather Bot Strategy — v4 Draft
+# Weather Bot Strategy — v4
 
 ## The 3 Plays
 
-### Play 1: END-OF-DAY LOCK (highest conviction)
+### Play 1: END-OF-DAY LOCK (highest conviction) → HOLD TO WIN
 
 The temperature is already recorded. Weather Underground shows today's high.
 The winning bucket is KNOWN or nearly known. But the market hasn't settled yet
@@ -13,7 +13,7 @@ instead of $1.00.
 - Late afternoon / evening: fetch ACTUAL high from Weather Underground
 - The high is already set — it's an observation, not a forecast
 - Find the matching bucket. If it's trading below 90¢, buy YES.
-- Wait for settlement. Collect the spread to $1.00.
+- HOLD TO SETTLEMENT. Collect the spread to $1.00.
 
 **Why this is the best play:**
 - Zero forecast risk. The temperature already happened.
@@ -25,12 +25,12 @@ Earlier if the weather pattern is simple (clear day, high hit by 2pm).
 
 **Edge:** 5-40¢ per dollar depending on how fast the market converges.
 
-**Exit:** Hold to settlement. This is one case where holding IS correct
-because the outcome is already determined.
+**Exit:** HOLD TO SETTLEMENT. The outcome is already determined. No reason
+to sell early — every cent below $1.00 is profit we'd leave on the table.
 
 ---
 
-### Play 2: FORECAST SHIFT SCALP (main active trading)
+### Play 2: FORECAST SHIFT SCALP (main active trading) → FAST SCALP
 
 GFS model updates 4x/day. When it shifts, market prices lag 10-30 min.
 Buy the shift, sell as soon as the market reprices. Fast in, fast out.
@@ -39,8 +39,8 @@ Buy the shift, sell as soon as the market reprices. Fast in, fast out.
 - Store previous ensemble probabilities
 - When new GFS data drops (every ~6h), compute new probabilities
 - Buy buckets that GAINED probability where market price is stale
-- Sell AS SOON AS market price approaches our new probability
-- Don't hold. Don't wait for settlement. Scalp the reprice.
+- Sell AS SOON AS market price moves toward our probability
+- NEVER hold to settlement. Scalp the reprice only.
 
 **Fresh run detection:**
 We can't directly see which GFS init time Open-Meteo is serving. But we CAN:
@@ -51,13 +51,14 @@ We can't directly see which GFS init time Open-Meteo is serving. But we CAN:
 3. Cross-reference: if our ensemble shifted AND our WU/NOAA point forecast
    also moved, it's a real model update, not API noise.
 
-**Sell aggressively:**
-- Don't wait for full convergence. If we bought at 15¢ and it's now 20¢,
-  sell. That's a 33% return in minutes.
+**Sell FAST:**
+- Don't wait for full convergence. If we bought at 15¢ and it's now 18¢,
+  sell. That's a 20% return in minutes. Take it.
 - Target: 3-5¢ profit per share, exit immediately.
-- Never hold a shift trade past the next model run (6h max).
-- If the market doesn't move within 30 min, the shift wasn't big enough
-  to matter — exit at breakeven or small loss.
+- Place limit sell at entry + 3-5¢ right after buy fills.
+- Hard timeout: exit at market after 30 min regardless of P&L.
+  If the market didn't move in 30 min, the shift wasn't tradeable.
+- NEVER hold past the next model run (6h max). Stale shift = no edge.
 
 **First boot:** NO shift trades until second ensemble fetch. Need history.
 
@@ -85,26 +86,26 @@ Win rate ~95%. Small profit per trade but extremely consistent.
 
 ---
 
-## Model Calibration (Play 2 improvement)
+## Model Calibration — SKIP
 
-Over the first 2-3 days, track which forecast source (GFS ensemble, NOAA,
-WU forecast) was closest to the actual WU settlement temperature.
+Decided against ongoing model calibration. Reasoning:
 
-Build a simple accuracy table:
+- **Play 1:** Uses actual observations, not forecasts. Calibration irrelevant.
+- **Play 2:** The edge is SPEED (trading the shift delta), not ACCURACY.
+  When GFS shifts 3°F, the market reprices regardless of which model is
+  "more accurate." We sell in minutes. We don't need to be right about
+  the final temperature.
+- **Play 3:** Dead buckets are dead. A 2°F model bias doesn't matter.
 
-```
-City     | GFS mean error | NOAA error | WU forecast error | Best source
----------|---------------|------------|-------------------|------------
-NYC      | 1.8°F         | 1.5°F      | 1.2°F             | WU
-Seoul    | 2.5°F         | N/A        | 2.1°F             | WU
-Chicago  | 2.0°F         | 1.7°F      | 1.3°F             | WU
-```
+Research backs this: profitable bots (suislanchez, solship, gopfan2) use
+simple threshold rules, not calibrated models. The $2M loss trader probably
+had the most sophisticated model.
 
-Then weight the ensemble probabilities toward the more accurate source.
-This is the "which model is closer to the settlement oracle" insight.
-
-But honestly — for Play 1 (end-of-day), we don't need forecast accuracy
-at all. We're using ACTUAL observations.
+**The one thing that matters (one-time, not ongoing):**
+Verify that Open-Meteo ensemble coordinates match the WU settlement station.
+If ensemble is for central Manhattan but PM settles on LaGuardia airport,
+there could be a systematic 1-2°F offset. Check once, adjust lat/lon if
+needed, done. Already handled — CITIES config uses airport coordinates.
 
 ---
 
@@ -116,18 +117,28 @@ at all. We're using ACTUAL observations.
 
 ---
 
+## Decisions Made
+
+- **Hold rules:** Play 1 (end-of-day lock) → hold to settlement.
+  Play 2 (shift scalp) → sell fast, 30 min hard timeout.
+  Play 3 (NO grind) → hold to settlement.
+- **Model calibration:** Skip. Edge is speed not accuracy.
+- **First boot:** NO shift trades. Only NO grind and end-of-day lock.
+
 ## Open Questions
 
-1. WU API: do we have a key? Without it, Play 1 is harder (need to scrape
-   or use NOAA hourly actuals as proxy, which may not match WU exactly).
+1. **WU API key:** Do we have one? Without it, Play 1 needs an alternative
+   for actual observations. NOAA hourly actuals are close but may not
+   match WU exactly (different station, different rounding).
 
-2. Bucket matching: WU shows "high: 72°F" — but is the bucket "72-73°F"
-   or "71-72°F"? Need to verify how PM rounds. The market rules say
-   "whole degrees" from the specific WU station page.
+2. **Bucket matching precision:** WU shows "high: 72°F" — is the winning
+   bucket "72-73°F" or "71-72°F"? Need to verify PM's rounding rules.
+   Market rules say "whole degrees" from the specific WU station page.
 
-3. Liquidity on winning bucket: if everyone knows the answer, will there
-   be any asks left below 95¢? Need to check how fast books thin out
-   near settlement. If the book is empty, Play 1 doesn't work.
+3. **End-of-day liquidity:** When the winning bucket is obvious, will there
+   be asks left below 95¢? If the book is empty, Play 1 doesn't work.
+   Need to observe actual book depth near settlement time.
 
-4. Sell speed for Play 2: can we place limit sells immediately after buying,
-   or do we need to wait for CLOB confirmation? Latency matters for scalps.
+4. **Sell mechanics for scalps:** Place limit sell at entry+3-5¢ immediately
+   after buy confirms? Or watch the book and sell into bids? Need to test
+   CLOB latency for round-trip speed.
