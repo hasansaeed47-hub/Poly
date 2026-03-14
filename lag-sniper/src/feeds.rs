@@ -249,7 +249,72 @@ pub async fn fetch_market_meta(
     }))
 }
 
-// ── Batch book fetcher ──────────────────────────────────────────────────────
+// ── Book fetcher (individual GET /book per token) ───────────────────────────
+
+async fn fetch_single_book(
+    client:   &Client,
+    clob_rest: &str,
+    token_id: &str,
+) -> Option<(String, BookEntry)> {
+    let url = format!("{}/book?token_id={}", clob_rest, token_id);
+    let resp = match client.get(&url)
+        .timeout(Duration::from_secs(5))
+        .send().await
+    {
+        Ok(r) => r,
+        Err(e) => { debug!("[BOOK] GET failed for {}: {}", &token_id[..8.min(token_id.len())], e); return None; }
+    };
+
+    if !resp.status().is_success() {
+        debug!("[BOOK] {} for token {}", resp.status(), &token_id[..8.min(token_id.len())]);
+        return None;
+    }
+
+    let item: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => { debug!("[BOOK] JSON parse failed: {}", e); return None; }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs_f64();
+
+    let tid = item.get("asset_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or(token_id)
+        .to_string();
+
+    let mut asks: Vec<PriceLevel> = item.get("asks")
+        .and_then(|a| a.as_array())
+        .map(|arr| arr.iter().filter_map(|l| {
+            let price = l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok())?;
+            let size  = l.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            Some(PriceLevel { price, size })
+        }).collect())
+        .unwrap_or_default();
+    asks.retain(|l| l.price.is_finite() && l.size.is_finite());
+    asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut bids: Vec<PriceLevel> = item.get("bids")
+        .and_then(|b| b.as_array())
+        .map(|arr| arr.iter().filter_map(|l| {
+            let price = l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok())?;
+            let size  = l.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+            Some(PriceLevel { price, size })
+        }).collect())
+        .unwrap_or_default();
+    bids.retain(|l| l.price.is_finite() && l.size.is_finite());
+    bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
+
+    let best_ask = asks.first().map(|l| l.price).unwrap_or(0.0);
+    let best_bid = bids.first().map(|l| l.price).unwrap_or(0.0);
+
+    if best_ask > 0.0 {
+        Some((tid, BookEntry { asks, bids, best_ask, best_bid, ts: now }))
+    } else {
+        None
+    }
+}
 
 pub async fn fetch_books_batch(
     client:    &Client,
@@ -258,73 +323,19 @@ pub async fn fetch_books_batch(
     limiter:   &RateLimiter,
 ) -> Result<HashMap<String, BookEntry>> {
     if token_ids.is_empty() { return Ok(HashMap::new()); }
-    limiter.wait().await;
 
     let mut result = HashMap::new();
 
+    // Fetch books concurrently in chunks to respect rate limits
     for chunk in token_ids.chunks(BOOK_BATCH_SIZE) {
-        let url = format!("{}/books", clob_rest);
-        let body: Vec<serde_json::Value> = chunk.iter()
-            .map(|tid| serde_json::json!({"token_id": tid}))
+        limiter.wait().await;
+        let futs: Vec<_> = chunk.iter()
+            .map(|tid| fetch_single_book(client, clob_rest, tid))
             .collect();
 
-        let resp = client.post(&url).json(&body)
-            .timeout(Duration::from_secs(5))
-            .send().await
-            .context("CLOB batch book request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body_text = resp.text().await.unwrap_or_default();
-            warn!("CLOB batch book returned {} body={}", status, &body_text[..body_text.len().min(200)]);
-            continue;
-        }
-
-        let books: Vec<serde_json::Value> = resp.json().await
-            .context("CLOB batch book JSON parse failed")?;
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default().as_secs_f64();
-
-        for item in &books {
-            let tid = match item.get("asset_id").and_then(|v| v.as_str()) {
-                Some(id) => id.to_string(),
-                None => continue,
-            };
-
-            let mut asks: Vec<PriceLevel> = item.get("asks")
-                .and_then(|a| a.as_array())
-                .map(|arr| arr.iter().filter_map(|l| {
-                    let price = l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok())?;
-                    let size  = l.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                    Some(PriceLevel { price, size })
-                }).collect())
-                .unwrap_or_default();
-            asks.retain(|l| l.price.is_finite() && l.size.is_finite());
-            asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
-
-            let mut bids: Vec<PriceLevel> = item.get("bids")
-                .and_then(|b| b.as_array())
-                .map(|arr| arr.iter().filter_map(|l| {
-                    let price = l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok())?;
-                    let size  = l.get("size").and_then(|s| s.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                    Some(PriceLevel { price, size })
-                }).collect())
-                .unwrap_or_default();
-            bids.retain(|l| l.price.is_finite() && l.size.is_finite());
-            bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
-
-            let best_ask = asks.first().map(|l| l.price).unwrap_or(0.0);
-            let best_bid = bids.first().map(|l| l.price).unwrap_or(0.0);
-
-            if best_ask > 0.0 {
-                result.insert(tid, BookEntry { asks, bids, best_ask, best_bid, ts: now });
-            }
-        }
-
-        if token_ids.len() > BOOK_BATCH_SIZE {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        let results = futures_util::future::join_all(futs).await;
+        for entry in results.into_iter().flatten() {
+            result.insert(entry.0, entry.1);
         }
     }
 
