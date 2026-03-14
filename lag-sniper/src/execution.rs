@@ -16,56 +16,24 @@
 
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::Signer;
-use alloy::sol;
-use alloy::sol_types::SolStruct;
 use anyhow::{Context, Result, anyhow};
-use base64::Engine;
-use hmac::{Hmac, Mac};
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::types::{
     AssetType, OrderType, OrderStatusType, Side as ClobSide, SignatureType,
     request::BalanceAllowanceRequest,
+    request::UpdateBalanceAllowanceRequest,
 };
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::types::{Decimal, U256};
 use polymarket_client_sdk::POLYGON;
-use reqwest::Client as HttpClient;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
-use serde::Deserialize;
-use sha2::Sha256;
 use tokio::sync::Mutex;
 use tracing::{info, warn, error};
-
-type HmacSha256 = Hmac<Sha256>;
-
-fn rand_nonce() -> u64 {
-    use rand::Rng;
-    rand::thread_rng().gen()
-}
-
-// EIP-712 domain and struct for ClobAuth
-sol! {
-    #[sol(all_derives)]
-    struct ClobAuth {
-        address address;
-        string timestamp;
-        uint256 nonce;
-        string message;
-    }
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct ApiCredentials {
-    api_key:    String,
-    secret:     String,
-    passphrase: String,
-}
 
 // ── Execution Layer ─────────────────────────────────────────────────────────
 
@@ -75,8 +43,6 @@ pub struct ExecutionLayer {
     clob_lock: Mutex<()>,
     consec_fails: Mutex<u32>,
     backoff_until: Mutex<f64>,
-    clob_url: String,
-    http: HttpClient,
 }
 
 /// Result of an order placement
@@ -148,19 +114,12 @@ impl ExecutionLayer {
         let ok = client.ok().await.context("CLOB health check failed")?;
         info!("[EXEC] CLOB health: {}", ok);
 
-        let http = HttpClient::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-            .context("HTTP client build failed")?;
-
         let layer = Self {
             client: Arc::new(client),
             signer: Arc::new(signer),
             clob_lock: Mutex::new(()),
             consec_fails: Mutex::new(0),
             backoff_until: Mutex::new(0.0),
-            clob_url: clob_url.to_string(),
-            http,
         };
 
         // Set conditional token allowance so we can sell positions
@@ -424,148 +383,26 @@ impl ExecutionLayer {
         Ok(())
     }
 
-    /// Check conditional token allowance and update if needed.
-    /// This ensures the exchange can move our conditional tokens when we sell.
+    /// Refresh the CLOB's cached view of on-chain token allowances.
+    /// This tells the exchange to re-read our ERC-1155 approval state so sells work.
     pub async fn update_conditional_allowance(&self) {
-        // First check if conditional allowance is already set
-        let req = BalanceAllowanceRequest::builder()
+        // Refresh conditional token allowance cache
+        let req = UpdateBalanceAllowanceRequest::builder()
             .asset_type(AssetType::Conditional)
             .build();
-        match self.client.balance_allowance(req).await {
-            Ok(resp) => {
-                let has_allowance = resp.allowances.values()
-                    .any(|v| v != "0" && !v.is_empty());
-                info!("[EXEC] Conditional token allowances: {:?}", resp.allowances);
-                if has_allowance {
-                    info!("[EXEC] Conditional allowance OK, sells enabled");
-                    return;
-                }
-                warn!("[EXEC] Conditional allowance is 0 — sells will fail! Setting approval...");
-            }
-            Err(e) => {
-                warn!("[EXEC] Conditional allowance check failed: {} — attempting to set", e);
-            }
+        match self.client.update_balance_allowance(req).await {
+            Ok(_) => info!("[EXEC] Conditional allowance refreshed — sells enabled"),
+            Err(e) => warn!("[EXEC] Conditional allowance refresh failed: {} — sells may fail if not approved on-chain", e),
         }
 
-        // Derive L2 API credentials from our private key
-        match self.derive_api_credentials().await {
-            Ok(creds) => {
-                // POST /balance-allowance with CONDITIONAL
-                match self.post_balance_allowance(&creds, "CONDITIONAL").await {
-                    Ok(_) => info!("[EXEC] Conditional token approval set successfully"),
-                    Err(e) => error!("[EXEC] Failed to set conditional approval: {}", e),
-                }
-                // Also ensure collateral (USDC) allowance
-                match self.post_balance_allowance(&creds, "COLLATERAL").await {
-                    Ok(_) => info!("[EXEC] Collateral approval confirmed"),
-                    Err(e) => warn!("[EXEC] Collateral approval call: {}", e),
-                }
-            }
-            Err(e) => {
-                error!(
-                    "[EXEC] Cannot derive API credentials for allowance update: {}. \
-                     Sells may fail! Set approval manually via Polymarket UI.",
-                    e
-                );
-            }
+        // Also refresh collateral (USDC) allowance cache
+        let req = UpdateBalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Collateral)
+            .build();
+        match self.client.update_balance_allowance(req).await {
+            Ok(_) => info!("[EXEC] Collateral allowance refreshed"),
+            Err(e) => warn!("[EXEC] Collateral allowance refresh failed: {}", e),
         }
-    }
-
-    /// Derive CLOB API credentials by signing ClobAuth EIP-712 message.
-    async fn derive_api_credentials(&self) -> Result<ApiCredentials> {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let nonce: u64 = rand_nonce();
-        let address = self.signer.address();
-
-        let domain = alloy::sol_types::eip712_domain! {
-            name: "ClobAuthDomain",
-            version: "1",
-            chain_id: POLYGON,
-        };
-
-        let auth = ClobAuth {
-            address,
-            timestamp: ts.to_string(),
-            nonce: U256::from(nonce),
-            message: "This message attests that I control the given wallet".to_string(),
-        };
-
-        let hash = auth.eip712_signing_hash(&domain);
-        let sig = self.signer.sign_hash(&hash).await
-            .map_err(|e| anyhow!("EIP-712 signing failed: {}", e))?;
-
-        let sig_hex = format!("0x{}", hex::encode(sig.as_bytes()));
-
-        let body = serde_json::json!({
-            "address": format!("{:?}", address),
-            "signature": sig_hex,
-            "timestamp": ts.to_string(),
-            "nonce": nonce.to_string(),
-        });
-
-        let resp = self.http
-            .post(format!("{}/auth/derive-api-key", self.clob_url))
-            .json(&body)
-            .send()
-            .await
-            .context("derive-api-key request failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("derive-api-key failed: {} {}", status, text));
-        }
-
-        resp.json::<ApiCredentials>().await
-            .context("derive-api-key parse failed")
-    }
-
-    /// POST /balance-allowance with L2 auth headers.
-    async fn post_balance_allowance(&self, creds: &ApiCredentials, asset_type: &str) -> Result<()> {
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_string();
-
-        let body = format!(r#"{{"asset_type":"{}"}}"#, asset_type);
-        let method = "POST";
-        let path = "/balance-allowance";
-
-        // L2 HMAC signature: HMAC-SHA256(secret, timestamp + "\n" + method + "\n" + path + "\n" + body)
-        let msg = format!("{}\n{}\n{}\n{}", ts, method, path, body);
-        let mut mac = HmacSha256::new_from_slice(
-            base64::engine::general_purpose::STANDARD
-                .decode(&creds.secret)
-                .context("invalid base64 secret")?
-                .as_slice()
-        ).context("HMAC init failed")?;
-        mac.update(msg.as_bytes());
-        let sig = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
-
-        let resp = self.http
-            .post(format!("{}{}", self.clob_url, path))
-            .header("Content-Type", "application/json")
-            .header("POLY_ADDRESS", format!("{:?}", self.signer.address()))
-            .header("POLY_API_KEY", &creds.api_key)
-            .header("POLY_PASSPHRASE", &creds.passphrase)
-            .header("POLY_SIGNATURE", &sig)
-            .header("POLY_TIMESTAMP", &ts)
-            .body(body)
-            .send()
-            .await
-            .context("balance-allowance POST failed")?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("balance-allowance {} failed: {} {}", asset_type, status, text));
-        }
-
-        Ok(())
     }
 
     /// Maker chase entry: try GTC, chase N ticks at interval, then FAK taker.
