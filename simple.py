@@ -16,9 +16,13 @@ KEY INSIGHTS FROM RESEARCH:
   - Only 7.6% of Polymarket wallets are profitable. Edge is real but thin.
 
 STRATEGIES:
-  1. CHEAP YES    — Buy YES < 15c on buckets where ensemble prob >> price
+  1. TIERED YES   — Buy YES with price-appropriate edge thresholds:
+       Tail (<15c):   need 5c edge. High risk, huge payout (7-100x)
+       Value (15-35c): need 8c edge. Best risk/reward sweet spot
+       Center (35-50c): need 12c edge. Only with strong ensemble signal
+       NEVER above 50c — that's where all big losses happen
   2. NO GRIND     — Buy NO > 85c on dead buckets (safe income)
-  3. REBALANCE    — Sell when edge evaporates (new model run shifts probs)
+  3. EDGE EXIT    — Sell when edge evaporates (new model run shifts probs)
   4. MISPRICE ARB — Both sides: YES underpriced OR NO overpriced
 
 RISK MANAGEMENT (not stop-losses):
@@ -77,17 +81,31 @@ MAX_DEPLOYED = 80.0       # max total $ out at once
 MAX_POSITIONS = 20        # max open positions
 NO_STAKE = 5.0            # $ per NO grind bet (separate from Kelly)
 
-# ── Strategy 1: Cheap YES (buy low, win big) ──
-MAX_YES_PRICE = 0.15      # ONLY buy YES below 15¢ (research: all winners do this)
-MIN_EDGE_YES = 0.05       # need 5¢+ edge (ensemble prob - market price)
-TOP_N_BUCKETS = 3         # target top 3 probability buckets
+# ── Strategy: Tiered YES Buying ──
+# Research shows: buy cheap, not expensive. But "cheap" is relative.
+# In a 15-20 bucket market, even the CENTER bucket is only 25-35¢.
+# The $2M loss trader bought at 51-67¢. We avoid that zone entirely.
+#
+# TIER 1 (tail sniping):  YES < 15¢, need 5¢ edge.  High risk, huge payout (7-100x)
+# TIER 2 (value buying):  YES 15-35¢, need 8¢ edge.  Moderate risk, good payout (3-7x)
+# TIER 3 (center bet):    YES 35-50¢, need 12¢ edge. Lower risk, fair payout (2-3x)
+# NEVER:                  YES > 50¢. Research: this is where all big losses happen.
+#
+YES_TIERS = [
+    # (max_price, min_edge, label)
+    (0.15, 0.05, "tail"),     # cheap tails: gopfan2/meropi strategy
+    (0.35, 0.08, "value"),    # adjacent buckets: best risk/reward
+    (0.50, 0.12, "center"),   # center bucket: only with strong ensemble signal
+]
+TOP_N_BUCKETS = 5         # scan top 5 probability buckets (was 3 — too restrictive)
 
-# ── Strategy 2: NO Grind (safe income) ──
-MIN_NO_PRICE = 0.85       # buy NO above 85¢ (lowered from 90¢ — more opportunities)
+# ── Strategy: NO Grind (safe income) ──
+MIN_NO_PRICE = 0.85       # buy NO above 85¢
 MAX_BUCKET_PROB = 0.05    # target buckets with <5% real chance
 
-# ── Strategy 3: Misprice Arbitrage (both sides) ──
-MIN_MISPRICE = 0.08       # need 8¢+ edge for misprice (research: suislanchez uses 8%)
+# ── Strategy: Misprice Arbitrage (both sides) ──
+MIN_MISPRICE = 0.08       # need 8¢+ edge (research: suislanchez bot uses 8%)
+MAX_MISPRICE_YES = 0.50   # cap YES misprice at 50¢ (never buy expensive)
 
 # ── Risk Management (NOT stop-losses) ──
 MAX_LOSS_PER_CITY = 10.0  # stop trading a city after $10 cumulative loss
@@ -202,7 +220,7 @@ class Position:
     shares: float
     cost: float
     bought_at: float
-    play: str              # "cheap_yes", "no_grind", "misprice_yes", "misprice_no"
+    play: str              # "yes_tail", "yes_value", "yes_center", "no_grind", "misprice_yes", "misprice_no"
     city: str
     entry_prob: float = 0.0  # ensemble probability at time of entry
     settled: bool = False
@@ -917,48 +935,73 @@ def is_model_run_window() -> bool:
 
 
 # =============================================================================
-# STRATEGIES — RESEARCH-BACKED
+# STRATEGIES — RESEARCH-BACKED, TIERED
 # =============================================================================
 #
-# Key research findings:
-#   - Buy cheap (< 15¢ YES). All profitable traders do this (gopfan2, meropi).
-#   - NO grind on dead buckets is safe income.
-#   - NO stop-losses on binary markets. Position sizing = risk management.
-#   - Exit only when EDGE evaporates (new model run changes probs).
-#   - Trade after GFS model runs for maximum edge window.
-#   - Kelly sizing ensures no single loss destroys you.
+# WHY TIERED (not just "buy cheap"):
+#   In a 15-20 bucket market, probability is spread thin. Even the most
+#   likely bucket is only 25-35¢. A flat 15¢ cap would SKIP the center.
+#
+#   Research shows the LOSING pattern is buying at 50-67¢ (upside capped,
+#   downside = total loss). Our tiers enforce DECREASING size as price
+#   increases, and NEVER go above 50¢.
+#
+#   Tier 1 (tail):   < 15¢, 5¢ edge.  Small bets, huge payout if hit.
+#   Tier 2 (value):  15-35¢, 8¢ edge. Normal bets, good risk/reward.
+#   Tier 3 (center): 35-50¢, 12¢ edge. Only with strong signal. Kelly caps size.
+#   NEVER:           > 50¢. This is where the $2M loss trader lost $2M.
+#
+#   Kelly naturally sizes this correctly: a 35¢ YES with 50% probability
+#   gets a smaller Kelly fraction than a 10¢ YES with 20% probability,
+#   because the risk/reward ratio is worse at higher prices.
 # =============================================================================
 
 
-def strategy_cheap_yes(buckets: List[Bucket], forecast: Forecast) -> List[dict]:
+def strategy_yes_tiered(buckets: List[Bucket], forecast: Forecast) -> List[dict]:
     """
-    Buy cheap YES (< 15¢) on buckets where ensemble probability >> market price.
+    Tiered YES buying across the probability spectrum.
 
-    This is how gopfan2 made $2M+ and meropi made $30K:
-    buy YES at 1-15¢ where your model says 10-40% probability.
-    Individual trades return 5-90x when they hit.
+    Scans top N buckets by ensemble probability. For each, finds the
+    appropriate tier (tail/value/center) and applies that tier's edge
+    threshold. Kelly sizes the bet — cheaper buckets naturally get
+    larger Kelly fractions due to better odds.
 
-    Kelly sizing ensures correct bet size for each bucket's edge.
+    Example market with 20 buckets, forecast high 65°F:
+      62-63°F  YES=0.12  prob=18%  → tier 1 (tail),  edge=+6¢  ✓
+      64-65°F  YES=0.28  prob=32%  → tier 2 (value), edge=+4¢  ✗ (need 8¢)
+      64-65°F  YES=0.22  prob=32%  → tier 2 (value), edge=+10¢ ✓ (after GFS shift)
+      66-67°F  YES=0.25  prob=30%  → tier 2 (value), edge=+5¢  ✗ (need 8¢)
+      68-69°F  YES=0.08  prob=12%  → tier 1 (tail),  edge=+4¢  ✗ (need 5¢)
     """
     ranked = sorted(buckets, key=lambda b: -b.our_prob)
     trades = []
 
     for b in ranked[:TOP_N_BUCKETS]:
-        edge = b.our_prob - b.yes_price
-        if edge < MIN_EDGE_YES:
-            continue
-        if b.yes_price > MAX_YES_PRICE:
-            continue  # CRITICAL: don't buy expensive YES (>15¢)
         if b.yes_price < 0.005:
             continue  # no liquidity
+        if b.yes_price > 0.50:
+            continue  # HARD CAP: never buy YES above 50¢
 
-        # Kelly-sized stake
+        edge = b.our_prob - b.yes_price
+
+        # Find which tier this price falls into
+        tier_label = None
+        for max_price, min_edge, label in YES_TIERS:
+            if b.yes_price <= max_price:
+                if edge >= min_edge:
+                    tier_label = label
+                break  # use first matching tier (tightest price constraint)
+
+        if not tier_label:
+            continue
+
+        # Kelly-sized stake (naturally smaller for expensive YES)
         stake = kelly_stake(b.our_prob, b.yes_price)
         if stake < MIN_POSITION:
             continue
 
         trades.append({
-            "play": "cheap_yes",
+            "play": f"yes_{tier_label}",
             "side": "YES",
             "token_id": b.token_yes,
             "label": b.label,
@@ -966,6 +1009,7 @@ def strategy_cheap_yes(buckets: List[Bucket], forecast: Forecast) -> List[dict]:
             "stake": stake,
             "our_prob": b.our_prob,
             "edge": edge,
+            "tier": tier_label,
         })
 
     return trades
@@ -1021,7 +1065,7 @@ def strategy_misprice(buckets: List[Bucket]) -> List[dict]:
         no_edge = (1 - b.our_prob) - b.no_price
 
         # YES side: market underprices this bucket
-        if yes_edge >= MIN_MISPRICE and 0.005 < b.yes_price <= MAX_YES_PRICE:
+        if yes_edge >= MIN_MISPRICE and 0.005 < b.yes_price <= MAX_MISPRICE_YES:
             stake = kelly_stake(b.our_prob, b.yes_price)
             if stake >= MIN_POSITION:
                 trades.append({
@@ -1275,10 +1319,16 @@ class WeatherBot:
             for b in sorted(buckets, key=lambda x: x.low_temp):
                 yes_edge = b.our_prob - b.yes_price
                 marker = " ★" if b.our_prob > 0.15 else (" ·" if b.our_prob < 0.02 else "")
-                cheap = " $" if 0 < b.yes_price <= MAX_YES_PRICE and yes_edge > MIN_EDGE_YES else ""
+                # Show tier eligibility
+                tier_tag = ""
+                if b.yes_price <= 0.50 and yes_edge > 0:
+                    for max_p, min_e, lbl in YES_TIERS:
+                        if b.yes_price <= max_p:
+                            tier_tag = f" [{lbl}✓]" if yes_edge >= min_e else f" [{lbl}✗]"
+                            break
                 log.info(
                     f"  {b.label:20s} YES={b.yes_price:.2f} NO={b.no_price:.2f} "
-                    f"prob={b.our_prob:.1%} edge={yes_edge:+.3f}{marker}{cheap}"
+                    f"prob={b.our_prob:.1%} edge={yes_edge:+.3f}{marker}{tier_tag}"
                 )
 
             # ── STEP 1: EDGE EXITS (sells — runs first) ──
@@ -1292,8 +1342,8 @@ class WeatherBot:
                 log.info(f"  [{city}] BLOCKED — skipping buys (city loss > ${MAX_LOSS_PER_CITY})")
                 continue
 
-            # ── STEP 2: CHEAP YES ──
-            cy = strategy_cheap_yes(buckets, fc)
+            # ── STEP 2: TIERED YES ──
+            cy = strategy_yes_tiered(buckets, fc)
             for t in cy:
                 t["city"] = city
             buy_trades.extend(cy)
@@ -1443,7 +1493,10 @@ class WeatherBot:
         print("    Fallback: normal distribution if ensemble unavailable")
         print()
         print("  STRATEGIES:")
-        print(f"    1. CHEAP YES   — Buy YES < {MAX_YES_PRICE:.0%} with Kelly sizing")
+        print("    1. TIERED YES  — Buy YES with price-appropriate edge thresholds:")
+        for max_p, min_e, lbl in YES_TIERS:
+            print(f"       {lbl:8s}  YES ≤ {max_p:.0%}, need {min_e:.0%} edge")
+        print("       NEVER    YES > 50% (this is where big losses happen)")
         print(f"    2. NO GRIND    — Buy NO > {MIN_NO_PRICE:.0%} on dead buckets")
         print(f"    3. MISPRICE    — Both-side arb (edge > {MIN_MISPRICE:.0%})")
         print()
@@ -1479,7 +1532,7 @@ class WeatherBot:
 
         print()
         print("  BY STRATEGY:")
-        for play in ["cheap_yes", "no_grind", "misprice_yes", "misprice_no"]:
+        for play in ["yes_tail", "yes_value", "yes_center", "no_grind", "misprice_yes", "misprice_no"]:
             pp = [p for p in self.positions if p.play == play]
             if not pp:
                 continue
