@@ -302,6 +302,14 @@ impl ExecutionLayer {
         match self.client.post_order(signed).await {
             Ok(resp) => {
                 self.record_success().await;
+
+                // Reject if the exchange did not accept the order
+                if !resp.success {
+                    let msg = resp.error_msg.clone().unwrap_or_default();
+                    warn!("[EXEC] Sell order rejected: {} status={:?}", msg, resp.status);
+                    return Err(anyhow!("Sell rejected: {}", msg));
+                }
+
                 let filled = resp.status == OrderStatusType::Matched;
                 let actual_price = self.fill_price_from_resp(&resp, price);
                 Ok(FillResult {
