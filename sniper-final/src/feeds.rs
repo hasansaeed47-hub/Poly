@@ -368,40 +368,46 @@ pub async fn fetch_books_batch(
         return Ok(HashMap::new());
     }
 
-    let body: Vec<serde_json::Value> = token_ids.iter()
-        .map(|t| serde_json::json!({"token_id": t}))
-        .collect();
-
+    const CHUNK_SIZE: usize = 15;
     let url = format!("{}/books", clob_rest);
+    let mut all_items: Vec<serde_json::Value> = Vec::new();
 
-    let resp = match client
-        .post(&url)
-        .json(&body)
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("CLOB books batch request failed: {}", e);
-            return Ok(HashMap::new());
+    for chunk in token_ids.chunks(CHUNK_SIZE) {
+        let body: Vec<serde_json::Value> = chunk.iter()
+            .map(|t| serde_json::json!({"token_id": t}))
+            .collect();
+
+        let resp = match client
+            .post(&url)
+            .json(&body)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!("CLOB books batch request failed: {}", e);
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            warn!("CLOB books batch returned {}: {}", status, &body[..body.len().min(200)]);
+            continue;
         }
-    };
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        warn!("CLOB books batch returned {}: {}", status, &body[..body.len().min(200)]);
-        return Ok(HashMap::new());
+        match resp.json::<Vec<serde_json::Value>>().await {
+            Ok(v) => all_items.extend(v),
+            Err(e) => {
+                warn!("CLOB books batch parse failed: {}", e);
+                continue;
+            }
+        }
     }
 
-    let items: Vec<serde_json::Value> = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            warn!("CLOB books batch parse failed: {}", e);
-            return Ok(HashMap::new());
-        }
-    };
+    let items = all_items;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
