@@ -1,48 +1,29 @@
 #!/usr/bin/env python3
 """
-WEATHER BOT v3 — FORECAST-SHIFT TRADING
-=========================================
-Trade the CHANGE in forecasts, not static probabilities.
+WEATHER BOT v4 — 4-PLAY SYSTEM
+================================
+See STRATEGY.md for full rationale.
 
-THE CORE INSIGHT:
-  The edge is NOT "our probability > market price" (static).
-  The edge IS "forecast just SHIFTED but market hasn't repriced yet" (dynamic).
+PLAY 1: END-OF-DAY LOCK (highest conviction) → HOLD TO WIN
+  Fetch actual temperature from WU. The winning bucket is KNOWN.
+  Buy YES on winning bucket below 90¢. Hold to settlement ($1.00).
+  Zero forecast risk — the temperature already happened.
 
-  When GFS updates every 6 hours, the forecast can move 2-5°F.
-  This shifts probability mass across buckets. The market takes 10-30
-  minutes to reprice. During that window, we have an information edge.
+PLAY 2: FORECAST SHIFT SCALP → FAST SCALP
+  GFS ensemble updates 4x/day. When forecast shifts, market lags.
+  Buy buckets that gained probability. Sell fast (3-5¢ target, 30 min max).
+  Never hold to settlement. Scalp the reprice only.
 
-  We buy the buckets that GAINED probability, sell the ones that LOST it.
-  This is how the profitable bots actually work (suislanchez, solship).
+PLAY 3: NO GRIND (safe income) → HOLD TO WIN
+  Buy NO on dead buckets (>85¢, <5% probability). Hold to settlement.
+  Win rate ~95%. Bread-and-butter income.
 
-HOW IT WORKS:
-  1. Fetch GFS ensemble → compute bucket probabilities
-  2. Compare to PREVIOUS ensemble → detect probability SHIFTS
-  3. If bucket gained 10%+ probability AND market price < new probability:
-     → BUY (market hasn't caught up to the forecast shift)
-  4. If we hold a position AND probability dropped significantly:
-     → SELL (forecast reversed, don't hold what the model abandoned)
-  5. If we hold a position AND market price caught up to our probability:
-     → SELL (take profit, edge is gone, market repriced)
+PLAY 4: WHALE FLOW (copy proven winners) → FAST SCALP
+  Poll weather leaderboard for top trader wallets.
+  Watch their trades on today's markets. Follow big moves.
+  Same exit as Play 2: fast scalp, don't hold.
 
-  NO GRIND is separate — safe income on dead buckets, always valid.
-
-WHY THIS IS BETTER:
-  - We only buy when we have FRESH INFORMATION (forecast shift)
-  - We don't buy static "mispricings" that might just be the market being right
-  - We always have an exit plan (sell when market catches up OR forecast reverses)
-  - Most positions are SHORT-LIVED (minutes to hours, not held to settlement)
-  - Win rate is higher because we're trading information, not probability
-
-RISK MANAGEMENT:
-  - Kelly sizing on each trade
-  - Max $5 per position
-  - Daily loss circuit breaker ($30)
-  - City-level loss limit ($10 per city)
-  - Dynamic exit: sell when edge gone (forecast reversed OR market caught up)
-
-Data: GFS Ensemble (Open-Meteo, free) → probability shift detection
-      WU station forecast → settlement truth source
+RISK: Kelly sizing. Max $5/position. $30/day circuit breaker. $10/city limit.
 """
 
 import os
@@ -81,45 +62,49 @@ S.mount("http://", _a)
 
 CLOB = "https://clob.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
+DATA_API = "https://data-api.polymarket.com"
 
-# ── Position Sizing (fractional Kelly) ──
-KELLY_FRACTION = 0.15     # use 15% of full Kelly (conservative)
+# ── Position Sizing ──
+KELLY_FRACTION = 0.15     # 15% of full Kelly
 MAX_POSITION = 5.0        # max $ per single position
-MIN_POSITION = 0.50       # don't bother with < 50¢
-MAX_DEPLOYED = 80.0       # max total $ out at once
-MAX_POSITIONS = 20        # max open positions
+MIN_POSITION = 0.50       # minimum trade size
+MAX_DEPLOYED = 80.0       # max total $ deployed
+MAX_POSITIONS = 20        # max concurrent positions
 NO_STAKE = 5.0            # $ per NO grind bet
 
-# ── Strategy: Forecast Shift (the main edge) ──
-# Buy when forecast SHIFTS probability toward a bucket but market hasn't repriced.
-# The signal is the DELTA between previous and current ensemble probabilities.
-MIN_PROB_SHIFT = 0.10     # bucket must have GAINED 10%+ probability in latest update
-MIN_SHIFT_EDGE = 0.05     # new_prob - market_price must be >= 5¢ (market is stale)
-MAX_YES_PRICE = 0.50      # NEVER buy YES above 50¢ (research: big losses happen here)
+# ── Play 1: End-of-Day Lock ──
+EOD_MAX_BUY_PRICE = 0.90  # only buy winning bucket below 90¢
+EOD_MIN_PROFIT = 0.05     # need at least 5¢ spread to $1.00
+EOD_CONFIDENCE_TEMP = 2.0 # buy if current WU high is within 2°F of likely final
 
-# ── Strategy: NO Grind (safe income) ──
+# ── Play 2: Forecast Shift Scalp ──
+MIN_PROB_SHIFT = 0.08     # bucket must have gained 8%+ probability
+MIN_SHIFT_EDGE = 0.05     # new_prob - market_price >= 5¢
+MAX_YES_PRICE = 0.50      # NEVER buy YES above 50¢
+SCALP_TARGET = 0.04       # take profit at 4¢ gain per share
+SCALP_TIMEOUT = 1800      # 30 min hard timeout — exit at market
+
+# ── Play 3: NO Grind ──
 MIN_NO_PRICE = 0.85       # buy NO above 85¢
 MAX_BUCKET_PROB = 0.05    # target buckets with <5% real chance
 
-# ── Dynamic Exit Thresholds ──
-# Sell when forecast reverses OR market catches up. Not stop-losses.
-PROB_DROP_EXIT = 0.08     # sell if prob dropped 8%+ from entry (forecast reversed)
-PRICE_CATCHUP_EXIT = 0.02 # sell if market_price >= our_prob - 2¢ (market caught up)
-MIN_PROFIT_TO_EXIT = 0.03 # only take-profit exit if we made at least 3¢/share
+# ── Play 4: Whale Flow ──
+WHALE_LEADERBOARD_SIZE = 50    # track top 50 weather traders
+WHALE_MIN_TRADE_SIZE = 50.0    # whale trade = $50+ on a single bucket
+WHALE_CONVERGENCE = 2          # 2+ whales on same bucket = strong signal
+WHALE_REFRESH_INTERVAL = 3600  # refresh leaderboard every hour
 
 # ── Risk Management ──
-MAX_LOSS_PER_CITY = 10.0  # stop trading a city after $10 cumulative loss
-DAILY_LOSS_LIMIT = 30.0   # circuit breaker: stop all trading after $30 daily loss
+MAX_LOSS_PER_CITY = 10.0
+DAILY_LOSS_LIMIT = 30.0
 
 # ── GFS Model Run Schedule (UTC) ──
-# GFS initializes at 00z, 06z, 12z, 18z — data available ~3.5h later
-# These are the OPTIMAL trade windows (market hasn't repriced yet)
-GFS_DATA_AVAIL_UTC = [3.5, 9.5, 15.5, 21.5]  # hours UTC when new data drops
-TRADE_WINDOW_MINUTES = 30  # how long the edge window lasts after model data
+GFS_DATA_AVAIL_UTC = [3.5, 9.5, 15.5, 21.5]
+TRADE_WINDOW_MINUTES = 30
 
 # ── Timing ──
-SCAN_INTERVAL = 120       # seconds between full scans
-ENSEMBLE_INTERVAL = 600   # seconds between ensemble fetches (10 min)
+SCAN_INTERVAL = 60        # seconds between scans (faster for scalping)
+ENSEMBLE_INTERVAL = 600   # seconds between ensemble fetches
 
 # ── Cities ──
 # Polymarket weather markets — city name, NOAA grid point, Open-Meteo coords
@@ -223,7 +208,7 @@ class Position:
     shares: float
     cost: float
     bought_at: float
-    play: str              # "shift_buy", "no_grind"
+    play: str              # "eod_lock", "shift_scalp", "no_grind", "whale_flow"
     city: str
     entry_prob: float = 0.0  # ensemble probability at time of entry
     settled: bool = False
@@ -979,81 +964,175 @@ def is_model_run_window() -> bool:
 
 
 # =============================================================================
-# STRATEGIES — FORECAST-SHIFT DRIVEN
+# PLAY 4 SUPPORT: WHALE TRACKING
 # =============================================================================
-#
-# THE KEY INSIGHT: Don't bet on static probabilities. Trade the CHANGE.
-#
-# When GFS updates, probability shifts across buckets. Example:
-#
-#   BEFORE model run:           AFTER model run:
-#   62-63°F  prob=5%            62-63°F  prob=8%     (+3%)
-#   64-65°F  prob=25%  ←center  64-65°F  prob=15%    (-10%)  ← forecast cooled
-#   66-67°F  prob=30%           66-67°F  prob=35%    (+5%)   ← new center
-#   68-69°F  prob=20%           68-69°F  prob=25%    (+5%)   ← gained
-#   70-71°F  prob=10%           70-71°F  prob=12%    (+2%)
-#
-#   Market prices still reflect the BEFORE probabilities.
-#   → BUY 66-67°F (gained 5%, market underpriced)
-#   → BUY 68-69°F (gained 5%, market underpriced)
-#   → SELL any 64-65°F position (lost 10%, forecast abandoned it)
-#
-# This is fundamentally different from "buy cheap and hope."
-# We buy because we have INFORMATION the market doesn't have yet.
+
+def fetch_weather_leaderboard() -> List[str]:
+    """
+    Fetch top weather trader wallet addresses from Polymarket leaderboard.
+    Returns list of proxy wallet addresses (strings).
+    """
+    try:
+        r = S.get(
+            f"{DATA_API}/v1/leaderboard",
+            params={
+                "category": "WEATHER",
+                "orderBy": "PNL",
+                "timePeriod": "ALL",
+                "limit": WHALE_LEADERBOARD_SIZE,
+            },
+            timeout=10,
+        )
+        if r.status_code != 200:
+            log.debug(f"[WHALE] Leaderboard HTTP {r.status_code}")
+            return []
+
+        data = r.json()
+        if not isinstance(data, list):
+            return []
+
+        wallets = []
+        for entry in data:
+            wallet = entry.get("proxyWallet", "")
+            name = entry.get("userName", "?")
+            pnl = entry.get("pnl", 0)
+            if wallet:
+                wallets.append(wallet)
+                if len(wallets) <= 5:
+                    log.info(f"[WHALE] #{len(wallets)} {name} pnl=${pnl:,.0f} {wallet[:10]}...")
+
+        log.info(f"[WHALE] Loaded {len(wallets)} weather whale wallets")
+        return wallets
+
+    except Exception as e:
+        log.debug(f"[WHALE] Leaderboard fetch failed: {e}")
+        return []
+
+
+def fetch_recent_trades(condition_id: str, limit: int = 100) -> List[dict]:
+    """
+    Fetch recent trades on a specific market from Data API.
+    Returns list of trade dicts with proxyWallet, side, size, price, timestamp.
+    """
+    try:
+        r = S.get(
+            f"{DATA_API}/trades",
+            params={"market": condition_id, "limit": limit},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+# =============================================================================
+# STRATEGIES — 4 PLAYS
 # =============================================================================
 
 
-def strategy_forecast_shift(
+def play1_eod_lock(
+    buckets: List[Bucket],
+    forecast: Forecast,
+) -> List[dict]:
+    """
+    PLAY 1: End-of-Day Lock — buy the KNOWN winner, hold to settlement.
+
+    Late in the day, the actual high temperature is already recorded on WU.
+    The winning bucket is known (or nearly known). Buy YES below 90¢,
+    hold to settlement at $1.00.
+
+    Only activates when we have WU data (the settlement source) and the
+    current observed high falls clearly within one bucket.
+    """
+    # Only use WU data — that's what PM settles on
+    if forecast.source != "wunderground":
+        return []
+
+    actual_high = forecast.high_f
+    trades = []
+
+    for b in buckets:
+        if b.low_temp == 0 and b.high_temp == 0:
+            continue
+
+        lo = b.low_temp if b.low_temp > -900 else -999
+        hi = b.high_temp if b.high_temp < 900 else 999
+
+        # Does the actual observed high fall in this bucket?
+        if lo - EOD_CONFIDENCE_TEMP <= actual_high <= hi + EOD_CONFIDENCE_TEMP:
+            # Is it clearly in this bucket (not on the edge)?
+            clearly_in = lo <= actual_high <= hi
+            # Is the price worth buying?
+            if b.yes_price >= EOD_MAX_BUY_PRICE:
+                continue  # already priced in
+            profit_per_share = 1.0 - b.yes_price
+            if profit_per_share < EOD_MIN_PROFIT:
+                continue
+
+            # Size based on confidence
+            if clearly_in:
+                stake = MAX_POSITION  # max confidence — temp is IN the bucket
+            else:
+                stake = MIN_POSITION  # edge of bucket — small bet
+
+            trades.append({
+                "play": "eod_lock",
+                "side": "YES",
+                "token_id": b.token_yes,
+                "label": b.label,
+                "price": b.yes_price,
+                "stake": stake,
+                "our_prob": 0.95 if clearly_in else 0.60,
+                "edge": profit_per_share,
+                "actual_high": actual_high,
+            })
+            if clearly_in:
+                log.info(
+                    f"  [EOD LOCK] {b.label} — actual high {actual_high:.0f}°F "
+                    f"IN bucket, YES={b.yes_price:.2f}, profit={profit_per_share:.2f}/sh"
+                )
+
+    return trades
+
+
+def play2_shift_scalp(
     buckets: List[Bucket],
     forecast: Forecast,
     prev_probs: Dict[str, float],
 ) -> List[dict]:
     """
-    Buy buckets that GAINED probability in the latest forecast update,
-    where the market hasn't repriced yet.
+    PLAY 2: Forecast Shift Scalp — buy the shift, sell fast.
 
-    This is the core strategy. The signal is:
-      1. Probability INCREASED (new_prob > old_prob + threshold)
-      2. Market is stale (market_price < new_prob - edge_threshold)
-      3. Price is reasonable (never buy YES > 50¢)
-
-    Example:
-      Before GFS update: 64-65°F had 15% prob, market=15¢
-      After GFS update:  64-65°F now 28% prob, market still=15¢
-      → shift=+13%, edge=13¢, BUY at 15¢ (market will reprice to ~28¢)
-
-    If no previous ensemble data exists, falls back to basic edge detection
-    (new_prob > market_price + threshold), but with conservative sizing.
+    Only trades when forecast SHIFTED (needs previous ensemble data).
+    No trades on first boot.
     """
-    trades = []
-    has_history = len(prev_probs) > 0
+    if not prev_probs:
+        return []  # no history = no shift signal = no trade
 
+    trades = []
     for b in buckets:
         if b.yes_price < 0.005 or b.yes_price > MAX_YES_PRICE:
             continue
 
         new_prob = b.our_prob
-        old_prob = prev_probs.get(b.token_yes, new_prob)  # if no history, no shift
+        old_prob = prev_probs.get(b.token_yes, new_prob)
         prob_shift = new_prob - old_prob
         market_edge = new_prob - b.yes_price
 
-        if has_history:
-            # ── WITH SHIFT DATA: only buy when forecast shifted in favor ──
-            if prob_shift < MIN_PROB_SHIFT:
-                continue  # this bucket didn't gain enough probability
-            if market_edge < MIN_SHIFT_EDGE:
-                continue  # market already repriced, no edge left
-        else:
-            # ── FIRST RUN (no history): conservative basic edge only ──
-            if market_edge < 0.12:  # require 12¢+ edge without shift data
-                continue
+        if prob_shift < MIN_PROB_SHIFT:
+            continue
+        if market_edge < MIN_SHIFT_EDGE:
+            continue
 
         stake = kelly_stake(new_prob, b.yes_price)
         if stake < MIN_POSITION:
             continue
 
         trades.append({
-            "play": "shift_buy",
+            "play": "shift_scalp",
             "side": "YES",
             "token_id": b.token_yes,
             "label": b.label,
@@ -1062,38 +1141,29 @@ def strategy_forecast_shift(
             "our_prob": new_prob,
             "edge": market_edge,
             "shift": prob_shift,
-            "old_prob": old_prob,
         })
         log.info(
             f"  [SHIFT] {b.label[:25]} prob {old_prob:.0%}→{new_prob:.0%} "
             f"(+{prob_shift:.0%}) market={b.yes_price:.2f} edge={market_edge:+.3f}"
         )
 
-    # Sort by shift magnitude (biggest moves first)
     trades.sort(key=lambda t: -t["shift"])
     return trades[:5]
 
 
-def strategy_no_grind(buckets: List[Bucket]) -> List[dict]:
+def play3_no_grind(buckets: List[Bucket]) -> List[dict]:
     """
-    Buy NO on dead/extreme buckets for safe income.
-
-    NO at 85¢+ on buckets with <5% real probability.
-    Win rate ~95%+. Small profit per trade but very consistent.
-    This is the bread-and-butter income stream.
-
-    This strategy is ALWAYS valid — it doesn't depend on forecast shifts.
-    Dead buckets stay dead. We're just collecting the premium.
+    PLAY 3: NO Grind — buy NO on dead buckets, hold to settlement.
+    Always valid. No timing dependency.
     """
     trades = []
-
     for b in buckets:
         if b.our_prob > MAX_BUCKET_PROB:
             continue
         if b.no_price < MIN_NO_PRICE:
             continue
-        profit_per_share = 1.0 - b.no_price
-        if profit_per_share < 0.01:
+        profit = 1.0 - b.no_price
+        if profit < 0.01:
             continue
 
         trades.append({
@@ -1105,86 +1175,149 @@ def strategy_no_grind(buckets: List[Bucket]) -> List[dict]:
             "stake": NO_STAKE,
             "our_prob": 1 - b.our_prob,
             "edge": (1 - b.our_prob) - b.no_price,
-            "profit_per_dollar": profit_per_share / b.no_price,
         })
-
     return trades
 
 
-def strategy_dynamic_exit(
-    positions: List[Position],
+def play4_whale_flow(
     buckets: List[Bucket],
-    prev_probs: Dict[str, float],
+    whale_wallets: set,
+    recent_trades: List[dict],
 ) -> List[dict]:
     """
-    Dynamic exit based on forecast changes and market convergence.
+    PLAY 4: Whale Flow — copy proven weather traders.
 
-    Two exit signals (both are GOOD reasons to sell):
+    Scans recent trades on this market for whale activity.
+    When whale(s) buy YES on a bucket, we follow.
+    """
+    if not whale_wallets or not recent_trades:
+        return []
 
-    1. FORECAST REVERSED: We bought because prob shifted UP, but now a new
-       model run shifted it back DOWN. The reason we entered is gone.
-       → Sell regardless of profit/loss.
+    # Count whale buys per bucket token in recent trades
+    whale_buys: Dict[str, list] = {}  # token_id → list of (wallet, size, price)
+    cutoff = time.time() - 3600  # last hour only
 
-    2. MARKET CAUGHT UP: We bought at 15¢ when prob was 28¢. Now market
-       repriced to 26¢. Our edge is gone — the market absorbed the info.
-       → Take profit and exit.
+    for trade in recent_trades:
+        wallet = trade.get("proxyWallet", "")
+        if wallet not in whale_wallets:
+            continue
+        side = trade.get("side", "")
+        if side != "BUY":
+            continue
+        size = float(trade.get("size", 0))
+        price = float(trade.get("price", 0))
+        usd = size * price
+        if usd < WHALE_MIN_TRADE_SIZE:
+            continue
+        # Parse timestamp
+        ts = trade.get("timestamp", "")
+        # Accept if we can't parse — better to include than miss
+        asset = trade.get("asset", "")
+        if asset:
+            whale_buys.setdefault(asset, []).append((wallet, usd, price))
 
-    NO grind positions ride to settlement — they don't need dynamic exits.
+    trades = []
+    for b in buckets:
+        hits = whale_buys.get(b.token_yes, [])
+        if not hits:
+            continue
+        if b.yes_price > MAX_YES_PRICE:
+            continue
+        if b.yes_price < 0.005:
+            continue
+
+        unique_whales = len(set(h[0] for h in hits))
+        total_usd = sum(h[1] for h in hits)
+        avg_price = sum(h[2] for h in hits) / len(hits)
+
+        # Need convergence threshold OR very large single trade
+        if unique_whales < WHALE_CONVERGENCE and total_usd < 200:
+            continue
+
+        stake = min(MAX_POSITION, total_usd * 0.05)  # 5% of whale volume
+        stake = max(MIN_POSITION, stake)
+
+        trades.append({
+            "play": "whale_flow",
+            "side": "YES",
+            "token_id": b.token_yes,
+            "label": b.label,
+            "price": b.yes_price,
+            "stake": stake,
+            "our_prob": 0.0,  # we don't know — following the money
+            "edge": 0.0,
+            "whales": unique_whales,
+            "whale_usd": total_usd,
+        })
+        log.info(
+            f"  [WHALE] {b.label[:25]} — {unique_whales} whales, "
+            f"${total_usd:.0f} volume, avg_price={avg_price:.2f}"
+        )
+
+    trades.sort(key=lambda t: -t["whale_usd"])
+    return trades[:3]
+
+
+def scalp_exit(
+    positions: List[Position],
+    buckets: List[Bucket],
+) -> List[dict]:
+    """
+    Exit logic for scalp plays (Play 2 shift, Play 4 whale).
+
+    Three exit signals:
+    1. TAKE PROFIT: price moved up 4¢+ from entry → sell immediately
+    2. TIMEOUT: position held > 30 min → exit at market regardless
+    3. FORECAST REVERSED: probability dropped 8%+ from entry → cut loss
+
+    EOD lock and NO grind positions are HELD to settlement — skip them.
     """
     trades = []
+    now = time.time()
 
     for pos in positions:
         if pos.settled or pos.sold:
             continue
-        if pos.play == "no_grind":
-            continue
+        if pos.play in ("eod_lock", "no_grind"):
+            continue  # these hold to settlement
 
         # Find matching bucket
-        if pos.side == "YES":
-            matching = [b for b in buckets if b.token_yes == pos.token_id]
-        else:
-            matching = [b for b in buckets if b.token_no == pos.token_id]
+        matching = [b for b in buckets if b.token_yes == pos.token_id]
         if not matching:
             continue
         b = matching[0]
 
-        current_price = b.yes_price if pos.side == "YES" else b.no_price
-        our_prob = b.our_prob if pos.side == "YES" else (1 - b.our_prob)
+        current_price = b.yes_price
+        profit_per_share = current_price - pos.buy_price
+        age_seconds = now - pos.bought_at
         sell_reason = None
 
-        # EXIT 1: Forecast reversed — probability dropped from entry
-        prob_drop = pos.entry_prob - our_prob
-        if prob_drop >= PROB_DROP_EXIT:
-            sell_reason = (
-                f"forecast reversed: prob {pos.entry_prob:.0%}→{our_prob:.0%} "
-                f"(-{prob_drop:.0%}), model abandoned this bucket"
-            )
+        # EXIT 1: Take profit — price moved up enough
+        if profit_per_share >= SCALP_TARGET:
+            sell_reason = f"take profit: +{profit_per_share:.2f}/sh ({profit_per_share/pos.buy_price:.0%})"
 
-        # EXIT 2: Market caught up — price converged to our probability
-        if not sell_reason and current_price >= our_prob - PRICE_CATCHUP_EXIT:
-            profit_per_share = current_price - pos.buy_price
-            if profit_per_share >= MIN_PROFIT_TO_EXIT:
-                sell_reason = (
-                    f"market caught up: bought={pos.buy_price:.2f} now={current_price:.2f} "
-                    f"prob={our_prob:.0%} (+{profit_per_share:.2f}/sh)"
-                )
+        # EXIT 2: Timeout — held too long, exit at market
+        if not sell_reason and age_seconds > SCALP_TIMEOUT:
+            sell_reason = f"timeout {age_seconds/60:.0f}min: price={current_price:.2f} pnl={profit_per_share:+.2f}/sh"
 
-        # EXIT 3: Edge completely gone (prob < market price)
-        if not sell_reason and our_prob < current_price - 0.03:
-            sell_reason = (
-                f"negative edge: prob={our_prob:.0%} < price={current_price:.2f}"
-            )
+        # EXIT 3: Forecast reversed — prob dropped from entry
+        if not sell_reason and pos.entry_prob > 0:
+            prob_drop = pos.entry_prob - b.our_prob
+            if prob_drop >= 0.08:
+                sell_reason = f"forecast reversed: prob {pos.entry_prob:.0%}→{b.our_prob:.0%}"
+
+        # EXIT 4: Negative edge — prob well below price
+        if not sell_reason and b.our_prob > 0 and b.our_prob < current_price - 0.05:
+            sell_reason = f"negative edge: prob={b.our_prob:.0%} < price={current_price:.2f}"
 
         if sell_reason:
-            token_id = b.token_yes if pos.side == "YES" else b.token_no
-            book = get_book(token_id)
+            book = get_book(b.token_yes)
             sell_price = book["best_bid"] if book and book["best_bid"] > 0.01 else current_price - 0.01
-
             if sell_price > 0.01:
                 trades.append({
-                    "play": "dynamic_exit",
+                    "play": "scalp_exit",
                     "side": "SELL",
-                    "token_id": token_id,
+                    "token_id": b.token_yes,
                     "label": pos.label,
                     "price": sell_price,
                     "shares": pos.shares,
@@ -1213,13 +1346,16 @@ class WeatherBot:
         self.exec = OrderManager(paper=paper)
         self.positions: List[Position] = []
         self.forecasts: Dict[str, Forecast] = {}
+        self.whale_wallets: set = set()
         self.pnl = 0.0
         self.trades_count = 0
-        self.daily_pnl = 0.0      # resets each day for circuit breaker
+        self.daily_pnl = 0.0
         self.daily_no_profit = 0.0
         self.city_pnl: Dict[str, float] = {}
         self._running = True
         self._last_day = ""
+        self._last_whale_refresh = 0.0
+        self._play_stats: Dict[str, dict] = {}  # play → {buys, sells, pnl}
 
     def run(self):
         self._banner()
@@ -1233,6 +1369,8 @@ class WeatherBot:
         signal.signal(signal.SIGINT, lambda s, f: setattr(self, '_running', False))
         signal.signal(signal.SIGTERM, lambda s, f: setattr(self, '_running', False))
 
+        # Initial data load
+        self._refresh_whales()
         self._update_forecasts()
 
         tick = 0
@@ -1240,7 +1378,7 @@ class WeatherBot:
             try:
                 tick += 1
 
-                # Reset daily PnL at midnight
+                # Daily reset
                 today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
                 if today != self._last_day:
                     self._last_day = today
@@ -1248,9 +1386,13 @@ class WeatherBot:
                     self.daily_no_profit = 0.0
                     log.info(f"[BOT] New day: {today}")
 
-                # Refresh forecasts + ensemble every ENSEMBLE_INTERVAL
+                # Refresh forecasts every ENSEMBLE_INTERVAL
                 if tick == 1 or tick % (ENSEMBLE_INTERVAL // SCAN_INTERVAL) == 0:
                     self._update_forecasts()
+
+                # Refresh whale list every hour
+                if time.time() - self._last_whale_refresh > WHALE_REFRESH_INTERVAL:
+                    self._refresh_whales()
 
                 self._tick()
                 self._status()
@@ -1269,6 +1411,12 @@ class WeatherBot:
 
         self._summary()
 
+    def _refresh_whales(self):
+        wallets = fetch_weather_leaderboard()
+        if wallets:
+            self.whale_wallets = set(wallets)
+        self._last_whale_refresh = time.time()
+
     def _update_forecasts(self):
         for city, info in CITIES.items():
             prev_fc = self.forecasts.get(city)
@@ -1279,20 +1427,17 @@ class WeatherBot:
 
     def _tick(self):
         """
-        One full scan + trade cycle.
-
-        Order:
-          1. Check circuit breaker
-          2. Fetch markets & prices
-          3. Compute probabilities (current + previous for shift detection)
-          4. DYNAMIC EXIT — sell positions where forecast reversed or market caught up
-          5. FORECAST SHIFT — buy buckets that gained probability (market stale)
-          6. NO GRIND — safe income on dead buckets
-          7. CHECK SETTLEMENTS
+        One scan + trade cycle. Order:
+          0. Circuit breaker check
+          1. SCALP EXITS — sell shift/whale positions (take profit or timeout)
+          2. PLAY 1: EOD LOCK — buy known winners (hold to settlement)
+          3. PLAY 2: SHIFT SCALP — buy forecast shifts (sell fast)
+          4. PLAY 3: NO GRIND — buy dead bucket NOs (hold to settlement)
+          5. PLAY 4: WHALE FLOW — copy whale trades (sell fast)
+          6. CHECK SETTLEMENTS
         """
-        # Daily circuit breaker
         if self.daily_pnl < -DAILY_LOSS_LIMIT:
-            log.warning(f"[CIRCUIT BREAKER] Daily loss ${self.daily_pnl:.2f} > limit ${DAILY_LOSS_LIMIT}. Halted.")
+            log.warning(f"[CIRCUIT BREAKER] Daily loss ${self.daily_pnl:.2f}. Halted.")
             return
 
         events = gamma_find_weather_events()
@@ -1300,10 +1445,9 @@ class WeatherBot:
             log.info("[TICK] No weather markets found")
             return
 
-        # Model run window indicator
         in_window = is_model_run_window()
         if in_window:
-            log.info("[TIMING] GFS model run window ACTIVE — optimal trading time")
+            log.info("[TIMING] GFS model run window — optimal for Play 2")
 
         sell_trades = []
         buy_trades = []
@@ -1311,19 +1455,15 @@ class WeatherBot:
         held_tids = {p.token_id for p in self.positions if not p.settled and not p.sold}
         blocked_cities = get_blocked_cities(self.city_pnl)
 
-        if blocked_cities:
-            log.warning(f"[RISK] Blocked cities (loss > ${MAX_LOSS_PER_CITY}): {blocked_cities}")
-
         for ev in events:
             city, buckets = extract_city_buckets(ev)
             if not buckets:
                 continue
 
-            # Get live prices
+            # Live prices
             all_tids = []
             for b in buckets:
-                all_tids.append(b.token_yes)
-                all_tids.append(b.token_no)
+                all_tids.extend([b.token_yes, b.token_no])
             live = get_live_prices(all_tids)
             for b in buckets:
                 if b.token_yes in live:
@@ -1335,53 +1475,64 @@ class WeatherBot:
             if not fc:
                 continue
 
-            # Compute current probabilities
             buckets = forecast_to_probs(fc, buckets)
-
-            # Compute previous probabilities for shift detection
             prev_probs = compute_prev_probs(fc, buckets)
 
+            # Log market state
             title = ev.get("title", "?")
-            ensemble_tag = f"ensemble={len(fc.ensemble_highs)}m" if fc.has_ensemble else "fallback"
-            has_shift = "shift" if fc.has_prev_ensemble else "no-history"
-            log.info(f"[{city}] {title} — {len(buckets)} buckets, high={fc.high_f:.0f}°F ({fc.source}, {ensemble_tag}, {has_shift})")
+            etag = f"ens={len(fc.ensemble_highs)}m" if fc.has_ensemble else "fallback"
+            stag = "shift" if fc.has_prev_ensemble else "first-run"
+            log.info(f"[{city}] {title} — {len(buckets)}b high={fc.high_f:.0f}°F ({fc.source},{etag},{stag})")
 
             for b in sorted(buckets, key=lambda x: x.low_temp):
                 old_p = prev_probs.get(b.token_yes, b.our_prob)
                 shift = b.our_prob - old_p
-                marker = " ★" if b.our_prob > 0.15 else (" ·" if b.our_prob < 0.02 else "")
-                shift_tag = ""
-                if abs(shift) >= 0.03:
-                    shift_tag = f" [{shift:+.0%}]"
-                log.info(
-                    f"  {b.label:20s} YES={b.yes_price:.2f} NO={b.no_price:.2f} "
-                    f"prob={b.our_prob:.1%} prev={old_p:.1%}{marker}{shift_tag}"
-                )
+                m = " ★" if b.our_prob > 0.15 else (" ·" if b.our_prob < 0.02 else "")
+                st = f" [{shift:+.0%}]" if abs(shift) >= 0.03 else ""
+                log.info(f"  {b.label:20s} Y={b.yes_price:.2f} N={b.no_price:.2f} p={b.our_prob:.1%}{m}{st}")
 
-            # ── STEP 1: DYNAMIC EXITS (sells — runs first) ──
-            de = strategy_dynamic_exit(self.positions, buckets, prev_probs)
-            for t in de:
+            # ── SCALP EXITS (first — free up capital) ──
+            se = scalp_exit(self.positions, buckets)
+            for t in se:
                 t["city"] = city
-            sell_trades.extend(de)
+            sell_trades.extend(se)
 
-            # Skip new buys for blocked cities
             if city in blocked_cities:
-                log.info(f"  [{city}] BLOCKED — skipping buys (city loss > ${MAX_LOSS_PER_CITY})")
                 continue
 
-            # ── STEP 2: FORECAST SHIFT BUYS ──
-            fs = strategy_forecast_shift(buckets, fc, prev_probs)
-            for t in fs:
+            # ── PLAY 1: EOD LOCK ──
+            p1 = play1_eod_lock(buckets, fc)
+            for t in p1:
                 t["city"] = city
-            buy_trades.extend(fs)
+            buy_trades.extend(p1)
 
-            # ── STEP 3: NO GRIND ──
-            ng = strategy_no_grind(buckets)
-            for t in ng:
+            # ── PLAY 2: SHIFT SCALP ──
+            p2 = play2_shift_scalp(buckets, fc, prev_probs)
+            for t in p2:
                 t["city"] = city
-            buy_trades.extend(ng)
+            buy_trades.extend(p2)
 
-        # ── EXECUTE SELLS FIRST ──
+            # ── PLAY 3: NO GRIND ──
+            p3 = play3_no_grind(buckets)
+            for t in p3:
+                t["city"] = city
+            buy_trades.extend(p3)
+
+            # ── PLAY 4: WHALE FLOW ──
+            if self.whale_wallets:
+                # Fetch recent trades for this market
+                cids = list(set(b.condition_id for b in buckets if b.condition_id))
+                recent = []
+                for cid in cids[:3]:
+                    recent.extend(fetch_recent_trades(cid))
+                    time.sleep(0.2)
+
+                p4 = play4_whale_flow(buckets, self.whale_wallets, recent)
+                for t in p4:
+                    t["city"] = city
+                buy_trades.extend(p4)
+
+        # ── EXECUTE SELLS ──
         for t in sell_trades:
             tid = t["token_id"]
             shares = t.get("shares", 0)
@@ -1390,7 +1541,7 @@ class WeatherBot:
             play = t["play"]
             city = t.get("city", "?")
 
-            log.info(f"  → [{play}] SELL {t['label'][:35]} @ {price:.2f} ({shares:.0f}sh) — {reason}")
+            log.info(f"  → SELL {t['label'][:35]} @ {price:.2f} ({shares:.0f}sh) — {reason}")
             oid = self.exec.sell(tid, price, shares)
             if oid:
                 for pos in self.positions:
@@ -1404,10 +1555,11 @@ class WeatherBot:
                         self.city_pnl[city] = self.city_pnl.get(city, 0) + profit
                         deployed -= pos.cost
                         held_tids.discard(tid)
+                        self._track_play(pos.play, profit)
                         log.info(f"    SOLD: cost=${pos.cost:.2f} rev=${revenue:.2f} pnl=${profit:+.2f}")
                         break
 
-        # ── EXECUTE BUYS (after sells free up capital) ──
+        # ── EXECUTE BUYS ──
         for t in buy_trades:
             tid = t["token_id"]
             if tid in held_tids:
@@ -1420,15 +1572,11 @@ class WeatherBot:
             price = t["price"]
             stake = t.get("stake", MIN_POSITION)
             side = t["side"]
-            edge = t.get("edge", 0)
             prob = t.get("our_prob", 0)
             play = t["play"]
             city = t.get("city", "?")
 
-            log.info(
-                f"  → [{play}] BUY {side} {t['label'][:35]} "
-                f"@ {price:.2f} ${stake:.2f} (prob={prob:.0%} edge={edge:+.3f})"
-            )
+            log.info(f"  → [{play}] BUY {side} {t['label'][:35]} @ {price:.2f} ${stake:.2f}")
 
             oid = self.exec.buy(tid, price, stake, side)
             if oid:
@@ -1446,11 +1594,20 @@ class WeatherBot:
 
         self._check_settlements()
 
+    def _track_play(self, play: str, profit: float):
+        if play not in self._play_stats:
+            self._play_stats[play] = {"trades": 0, "pnl": 0.0, "wins": 0, "losses": 0}
+        self._play_stats[play]["trades"] += 1
+        self._play_stats[play]["pnl"] += profit
+        if profit >= 0:
+            self._play_stats[play]["wins"] += 1
+        else:
+            self._play_stats[play]["losses"] += 1
+
     def _check_settlements(self):
         open_pos = [p for p in self.positions if not p.settled and not p.sold]
         if not open_pos:
             return
-
         tids = [p.token_id for p in open_pos]
         prices = get_live_prices(tids)
 
@@ -1458,7 +1615,6 @@ class WeatherBot:
             price = prices.get(pos.token_id)
             if price is None:
                 continue
-
             if price >= 0.95:
                 pos.settled = True
                 pos.payout = pos.shares * 1.0
@@ -1466,64 +1622,53 @@ class WeatherBot:
                 self.pnl += profit
                 self.daily_pnl += profit
                 self.city_pnl[pos.city] = self.city_pnl.get(pos.city, 0) + profit
+                self._track_play(pos.play, profit)
                 if pos.play == "no_grind":
                     self.daily_no_profit += profit
-                log.info(f"[WIN] {pos.label[:35]} ({pos.play}) cost=${pos.cost:.2f} payout=${pos.payout:.2f} profit=${profit:+.2f}")
-
+                log.info(f"[WIN] {pos.label[:35]} ({pos.play}) +${profit:.2f}")
             elif price <= 0.05:
                 pos.settled = True
                 pos.payout = 0
-                loss = pos.cost
-                self.pnl -= loss
-                self.daily_pnl -= loss
-                self.city_pnl[pos.city] = self.city_pnl.get(pos.city, 0) - loss
-                log.info(f"[LOSS] {pos.label[:35]} ({pos.play}) cost=${pos.cost:.2f}")
+                self.pnl -= pos.cost
+                self.daily_pnl -= pos.cost
+                self.city_pnl[pos.city] = self.city_pnl.get(pos.city, 0) - pos.cost
+                self._track_play(pos.play, -pos.cost)
+                log.info(f"[LOSS] {pos.label[:35]} ({pos.play}) -${pos.cost:.2f}")
 
     def _status(self):
-        open_pos = [p for p in self.positions if not p.settled and not p.sold]
-        settled = [p for p in self.positions if p.settled]
-        wins = sum(1 for p in settled if p.payout > 0)
-        losses = sum(1 for p in settled if p.payout == 0)
-        deployed = sum(p.cost for p in open_pos)
+        op = [p for p in self.positions if not p.settled and not p.sold]
+        st = [p for p in self.positions if p.settled]
+        w = sum(1 for p in st if p.payout > 0)
+        l = sum(1 for p in st if p.payout == 0)
+        dep = sum(p.cost for p in op)
 
-        by_play = {}
-        for p in open_pos:
-            by_play.setdefault(p.play, 0)
-            by_play[p.play] += 1
-        play_str = " ".join(f"{k}={v}" for k, v in sorted(by_play.items()))
-        city_str = " ".join(f"{c}=${v:+.1f}" for c, v in sorted(self.city_pnl.items()))
+        plays = {}
+        for p in op:
+            plays[p.play] = plays.get(p.play, 0) + 1
+        ps = " ".join(f"{k}={v}" for k, v in sorted(plays.items()))
 
         log.info(
-            f"[STATUS] open={len(open_pos)} deployed=${deployed:.0f} | "
-            f"{wins}W/{losses}L pnl=${self.pnl:+.2f} daily=${self.daily_pnl:+.2f} | "
-            f"NO grind=${self.daily_no_profit:+.2f} | trades={self.trades_count} | {play_str}"
+            f"[STATUS] open={len(op)} ${dep:.0f} | {w}W/{l}L pnl=${self.pnl:+.2f} "
+            f"daily=${self.daily_pnl:+.2f} | whales={len(self.whale_wallets)} | {ps}"
         )
-        if city_str:
-            log.info(f"[CITIES] {city_str}")
 
     def _banner(self):
         print("=" * 70)
-        print("  WEATHER BOT v3 — FORECAST-SHIFT TRADING")
+        print("  WEATHER BOT v4 — 4-PLAY SYSTEM")
         print("=" * 70)
         print(f"  Mode: {'PAPER' if self.paper else 'LIVE'}")
         print(f"  Cities: {', '.join(CITIES.keys())}")
         print()
-        print("  HOW IT WORKS:")
-        print("    1. Fetch GFS ensemble → compute bucket probabilities")
-        print("    2. Compare to PREVIOUS ensemble → detect probability SHIFTS")
-        print("    3. Buy buckets that GAINED probability (market stale)")
-        print("    4. Sell when market catches up OR forecast reverses")
+        print("  PLAYS:")
+        print("    1. EOD LOCK     — Buy known winner, hold to settlement")
+        print("    2. SHIFT SCALP  — Buy forecast shift, sell fast (30min max)")
+        print("    3. NO GRIND     — Buy NO on dead buckets, hold to settlement")
+        print("    4. WHALE FLOW   — Copy top weather traders, sell fast")
         print()
-        print("  STRATEGIES:")
-        print(f"    SHIFT BUY   — Buy when prob shifted +{MIN_PROB_SHIFT:.0%} AND market stale")
-        print(f"    NO GRIND    — Buy NO > {MIN_NO_PRICE:.0%} on dead buckets (safe income)")
-        print(f"    DYNAMIC EXIT — Sell on reversal (prob drop >{PROB_DROP_EXIT:.0%}) or convergence")
-        print()
-        print(f"  Max YES price: {MAX_YES_PRICE:.0%} (never buy expensive)")
-        print(f"  Kelly fraction: {KELLY_FRACTION:.0%} | Max position: ${MAX_POSITION}")
+        print(f"  Scalp target: {SCALP_TARGET:.0%}/sh | Timeout: {SCALP_TIMEOUT//60}min")
+        print(f"  Max YES: {MAX_YES_PRICE:.0%} | Kelly: {KELLY_FRACTION:.0%} | Max pos: ${MAX_POSITION}")
         print(f"  Daily limit: ${DAILY_LOSS_LIMIT} | City limit: ${MAX_LOSS_PER_CITY}")
-        print(f"  Max deployed: ${MAX_DEPLOYED} | Max positions: {MAX_POSITIONS}")
-        wu = "YES" if os.environ.get("WU_API_KEY") else "NO (set WU_API_KEY)"
+        wu = "YES" if os.environ.get("WU_API_KEY") else "NO (set WU_API_KEY for Play 1)"
         print(f"  WU API key: {wu}")
         print("=" * 70)
 
@@ -1531,50 +1676,36 @@ class WeatherBot:
         settled = [p for p in self.positions if p.settled]
         open_pos = [p for p in self.positions if not p.settled and not p.sold]
         sold = [p for p in self.positions if p.sold]
-        wins = [p for p in settled if p.payout > 0]
-        losses = [p for p in settled if p.payout == 0]
 
         print()
         print("=" * 70)
         print("  SESSION SUMMARY")
         print("=" * 70)
-        print(f"  Total trades: {self.trades_count}")
-        print(f"  Settled: {len(settled)} ({len(wins)}W / {len(losses)}L)")
-        print(f"  Dynamic exits: {len(sold)}")
-        print(f"  Open: {len(open_pos)}")
-        print(f"  PnL: ${self.pnl:+.2f}")
-        print(f"  NO grind profit: ${self.daily_no_profit:+.2f}")
+        print(f"  Trades: {self.trades_count} | Scalp exits: {len(sold)}")
+        print(f"  PnL: ${self.pnl:+.2f} | NO grind: ${self.daily_no_profit:+.2f}")
+        print(f"  Whale wallets tracked: {len(self.whale_wallets)}")
 
-        print()
-        print("  BY STRATEGY:")
-        for play in ["shift_buy", "no_grind"]:
-            pp = [p for p in self.positions if p.play == play]
-            if not pp:
-                continue
-            w = sum(1 for p in pp if p.settled and p.payout > 0)
-            l = sum(1 for p in pp if p.settled and p.payout == 0)
-            cost = sum(p.cost for p in pp)
-            rev = sum(p.payout for p in pp if p.settled)
-            rev += sum(p.sell_price * p.shares for p in pp if p.sold)
-            print(f"    {play:15s} {len(pp)} trades, {w}W/{l}L, cost=${cost:.2f}, rev=${rev:.2f}")
+        if self._play_stats:
+            print()
+            print("  BY PLAY:")
+            for play in ["eod_lock", "shift_scalp", "no_grind", "whale_flow"]:
+                s = self._play_stats.get(play)
+                if not s:
+                    continue
+                print(f"    {play:15s} {s['trades']}t {s['wins']}W/{s['losses']}L pnl=${s['pnl']:+.2f}")
 
         if self.city_pnl:
             print()
             print("  BY CITY:")
             for city, pnl in sorted(self.city_pnl.items()):
-                status = "BLOCKED" if pnl < -MAX_LOSS_PER_CITY else "active"
-                print(f"    {city:15s} ${pnl:+.2f} ({status})")
+                print(f"    {city:15s} ${pnl:+.2f}")
 
         if open_pos:
             print()
-            print("  OPEN POSITIONS:")
+            print(f"  OPEN ({len(open_pos)}):")
             for p in open_pos:
-                age = (time.time() - p.bought_at) / 3600
-                print(
-                    f"    [{p.play:15s}] {p.side:3s} {p.label[:25]:25s} "
-                    f"@ {p.buy_price:.2f} ({p.shares:.0f}sh ${p.cost:.2f}) "
-                    f"prob@entry={p.entry_prob:.0%} age={age:.1f}h"
-                )
+                age = (time.time() - p.bought_at) / 60
+                print(f"    [{p.play:12s}] {p.side} {p.label[:25]} @{p.buy_price:.2f} ${p.cost:.2f} {age:.0f}min")
         print("=" * 70)
 
 

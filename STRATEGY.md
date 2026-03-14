@@ -111,20 +111,22 @@ needed, done. Already handled — CITIES config uses airport coordinates.
 
 ## Priority Order
 
-1. **End-of-day lock** — highest conviction, implement first
+1. **End-of-day lock** — highest conviction, zero forecast risk
 2. **NO grind** — always running, no timing dependency
-3. **Forecast shift scalp** — most complex, implement after 1 & 2 prove out
+3. **Forecast shift scalp** — main active trading, needs ensemble history
+4. **Whale flow** — copy proven winners, needs leaderboard + trade polling
 
 ---
 
 ---
 
-### Signal Layer: WHALE FLOW (confirms other plays)
+### Play 4: WHALE FLOW (copy the best weather traders) → FAST SCALP
 
-Not a standalone play — a signal that strengthens or weakens our other plays.
+Follow the money. Polymarket has a weather-specific leaderboard that tells
+us exactly who the profitable weather traders are and what they're buying.
 
 **How we know they're weather whales:**
-Polymarket has a weather-specific leaderboard. We don't guess.
+Polymarket categorizes them for us. One API call:
 
 ```
 GET https://data-api.polymarket.com/v1/leaderboard?category=WEATHER&orderBy=PNL&limit=100
@@ -141,20 +143,28 @@ GET https://data-api.polymarket.com/trades?market={condition_id}
 Returns all trades on a weather market: wallet, side, size, price, timestamp.
 Filter for wallets from the leaderboard. Poll every 30-60 seconds.
 
-**Two signals:**
+**How it works:**
+- On startup: fetch weather leaderboard, store top 50 wallet addresses
+- Every tick: poll recent trades on today's weather markets
+- When a whale buys YES on a bucket → that's a BUY signal
+- When multiple whales converge on the same bucket → strong signal
+- Buy the same bucket, scalp fast (same as Play 2 — don't hold)
 
-1. **Volume spike on a bucket.** If $500 flows into "66-67°F NYC" in 5 min
-   when normal flow is $20/hr, someone with information is moving.
-   We don't need to know who — the flow itself is the signal.
+**Two independent signals:**
 
-2. **Whale convergence.** If 3+ leaderboard wallets buy the same bucket
-   within an hour, they probably all got the same model update.
-   Strong confirmation for Play 2 shift trades.
+1. **Volume spike on a bucket.** $500+ flows into one bucket in 5 min
+   when normal flow is $20/hr. Someone with information is moving.
+   Don't need to know who — the flow is the signal.
 
-**How it fits each play:**
-- Play 1 (end-of-day lock): irrelevant — we already know the answer
-- Play 2 (shift scalp): whale flow CONFIRMS the shift is real
-- Play 3 (NO grind): if a whale buys YES on a bucket we hold NO on, warning
+2. **Whale convergence.** 3+ leaderboard wallets buy the same bucket
+   within an hour. They probably all got the same model update.
+
+**Interaction with other plays:**
+- Strengthens Play 2: if our shift signal AND whale flow agree, higher confidence
+- Warns Play 3: if a whale buys YES on a bucket we hold NO on, consider exiting
+- Independent of Play 1: end-of-day lock doesn't need whale confirmation
+
+**Exit:** Same as Play 2 — fast scalp. Don't hold to settlement.
 
 **Key endpoints (all public, no auth):**
 
@@ -168,9 +178,7 @@ Filter for wallets from the leaderboard. Poll every 30-60 seconds.
 **Known whale wallets (from research):**
 - gopfan2: `0xf2f6af4f27ec2dcf4072095ab804016e14cd5817` ($700K+ weather profits)
 - Hans323: `0x0f37cb80dee49d55b5f6d9e595d52591d6371410` ($1.1M single weather trade)
-- (more discovered automatically from leaderboard)
-
-**Implementation priority:** After Play 1, 2, 3 are working. This is enhancement.
+- (rest discovered automatically from leaderboard on each startup)
 
 ---
 
