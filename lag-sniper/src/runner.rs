@@ -233,10 +233,13 @@ impl LagRunner {
                 );
                 self.exit_position(&trade_id, exit_bid, "REVERSAL_SL", now).await;
                 continue;
-            } else if !reversed {
-                // Momentum recovered — clear the reversal timer
-                if let Some(p) = self.positions.get_mut(&trade_id) {
-                    p.reversal_ts = None;
+            } else {
+                // Momentum recovered OR bid is above entry — clear the reversal timer
+                // so stale timers don't cause instant SL when conditions change
+                if pos.reversal_ts.is_some() {
+                    if let Some(p) = self.positions.get_mut(&trade_id) {
+                        p.reversal_ts = None;
+                    }
                 }
             }
 
