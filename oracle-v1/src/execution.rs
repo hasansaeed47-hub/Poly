@@ -7,6 +7,12 @@
 /// - Order cancellation
 /// - Maker chase logic (chase N ticks, then taker)
 /// - Heartbeat is auto-managed by SDK "heartbeats" feature
+///
+/// V6 live fixes applied:
+/// - Double-fill prevention: verify cancel before reposting (V6 #7)
+/// - Taker zero-fill cleanup: cancel order on zero fill (V6 #9)
+/// - Chase order ID tracking: track last_oid through chase loop
+/// - Actual fill price from response making_amount/taking_amount
 
 use std::str::FromStr;
 use std::sync::Arc;
@@ -22,6 +28,7 @@ use polymarket_client_sdk::clob::types::{
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::types::{Decimal, U256};
 use polymarket_client_sdk::POLYGON;
+use rust_decimal::prelude::FromPrimitive;
 use tokio::sync::Mutex;
 use tracing::{info, warn, error};
 
@@ -42,6 +49,20 @@ pub struct FillResult {
     pub filled:   bool,
     pub price:    f64,
     pub status:   String,
+}
+
+/// Convert f64 to Decimal without restricting decimal places.
+/// SDK will validate against tick_size internally.
+fn dec(val: f64) -> Result<Decimal> {
+    Decimal::from_f64(val)
+        .ok_or_else(|| anyhow!("Cannot convert {} to Decimal", val))
+}
+
+/// Convert f64 to Decimal, truncated to N decimal places for size (SDK requires <= 2dp).
+fn dec_size(val: f64) -> Result<Decimal> {
+    let truncated = (val * 100.0).floor() / 100.0;
+    Decimal::from_f64(truncated)
+        .ok_or_else(|| anyhow!("Cannot convert {} to Decimal", truncated))
 }
 
 impl ExecutionLayer {
@@ -104,13 +125,11 @@ impl ExecutionLayer {
         let tid = U256::from_str(token_id)
             .map_err(|e| anyhow!("Invalid token_id: {}", e))?;
 
-        let dec_price = Decimal::from_str(&format!("{:.2}", price))
-            .map_err(|e| anyhow!("Invalid price decimal: {}", e))?;
-        let shares = (stake / price * 100.0).floor() / 100.0; // round down to 2 dp
-        let dec_size = Decimal::from_str(&format!("{:.2}", shares))
-            .map_err(|e| anyhow!("Invalid size decimal: {}", e))?;
+        let dec_price = dec(price)?;
+        let shares = stake / price;
+        let dec_sz = dec_size(shares)?;
 
-        if dec_size <= Decimal::ZERO {
+        if dec_sz <= Decimal::ZERO {
             return Err(anyhow!("Size too small: {}", shares));
         }
 
@@ -118,14 +137,12 @@ impl ExecutionLayer {
             .token_id(tid)
             .side(ClobSide::Buy)
             .price(dec_price)
-            .size(dec_size)
+            .size(dec_sz)
             .order_type(OrderType::GTC)
             .post_only(true)
             .build()
             .await
-            .map_err(|e| {
-                anyhow!("Order build failed: {}", e)
-            })?;
+            .map_err(|e| anyhow!("Order build failed: {}", e))?;
 
         let signed = self.client.sign(&*self.signer, order).await
             .map_err(|e| anyhow!("Order sign failed: {}", e))?;
@@ -171,6 +188,7 @@ impl ExecutionLayer {
     }
 
     /// Place a FAK (taker) market order. Fills immediately, partial OK.
+    /// V6 FIX #9: Cancels order on zero fill to prevent orphaned orders.
     pub async fn buy_fak(
         &self,
         token_id: &str,
@@ -190,8 +208,7 @@ impl ExecutionLayer {
         let tid = U256::from_str(token_id)
             .map_err(|e| anyhow!("Invalid token_id: {}", e))?;
 
-        let dec_amount = Decimal::from_str(&format!("{:.6}", stake))
-            .map_err(|e| anyhow!("Invalid stake decimal: {}", e))?;
+        let dec_amount = dec(stake)?;
         let amount = Amount::usdc(dec_amount)
             .map_err(|e| anyhow!("Invalid USDC amount: {}", e))?;
 
@@ -211,6 +228,16 @@ impl ExecutionLayer {
             Ok(resp) => {
                 self.record_success().await;
                 let filled = resp.status == OrderStatusType::Matched;
+
+                // V6 FIX #9: Zero-fill cleanup — cancel order if not successfully filled
+                if !resp.success || !filled {
+                    warn!("[EXEC] FAK zero/partial fill: {:?} status={:?}", resp.error_msg, resp.status);
+                    // Attempt to cancel the unfilled/partial order
+                    let oid = resp.order_id.clone();
+                    drop(_lock);
+                    let _ = self.client.cancel_order(&oid).await;
+                    return Err(anyhow!("FAK zero fill"));
+                }
 
                 // Compute actual fill price from response amounts
                 let actual_price = self.fill_price_from_resp(&resp, price);
@@ -245,16 +272,14 @@ impl ExecutionLayer {
         let tid = U256::from_str(token_id)
             .map_err(|e| anyhow!("Invalid token_id: {}", e))?;
 
-        let dec_price = Decimal::from_str(&format!("{:.2}", price))
-            .map_err(|e| anyhow!("Invalid price decimal: {}", e))?;
-        let dec_size = Decimal::from_str(&format!("{:.2}", shares))
-            .map_err(|e| anyhow!("Invalid size decimal: {}", e))?;
+        let dec_price = dec(price)?;
+        let dec_sz = dec_size(shares)?;
 
         let order = self.client.limit_order()
             .token_id(tid)
             .side(ClobSide::Sell)
             .price(dec_price)
-            .size(dec_size)
+            .size(dec_sz)
             .order_type(OrderType::GTC)
             .build()
             .await
@@ -301,6 +326,8 @@ impl ExecutionLayer {
 
     /// Maker chase entry: try GTC, chase N ticks at interval, then FAK taker.
     /// Returns the fill result from whichever method succeeds.
+    ///
+    /// V6 FIX #7: Verify cancel before reposting to prevent double-fills.
     pub async fn maker_chase_entry(
         &self,
         token_id: &str,
@@ -327,9 +354,16 @@ impl ExecutionLayer {
                 for tick_num in 1..=max_chase_ticks {
                     tokio::time::sleep(tokio::time::Duration::from_millis(chase_interval_ms)).await;
 
-                    // Cancel previous order
-                    if let Err(e) = self.cancel_order(&last_oid).await {
-                        warn!("[EXEC] Cancel chase order failed: {}", e);
+                    // V6 FIX #7: Verify cancel succeeded before reposting
+                    match self.cancel_order(&last_oid).await {
+                        Ok(_) => {
+                            // Cancel confirmed — safe to repost at new price
+                        }
+                        Err(e) => {
+                            // Cancel failed — do NOT repost, could double-fill
+                            warn!("[EXEC] Cancel failed for {}: {} — keeping old order", last_oid, e);
+                            break;
+                        }
                     }
 
                     // Chase up by one tick (but stay below best ask to remain maker)
@@ -384,8 +418,7 @@ impl ExecutionLayer {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// Extract actual fill price from PostOrderResponse amounts.
-    /// making_amount = USDC spent (6 decimals), taking_amount = shares received.
-    /// For sells: making_amount = shares given, taking_amount = USDC received.
+    /// making_amount = USDC spent, taking_amount = shares received (for buys).
     /// Falls back to `fallback` if amounts are zero.
     fn fill_price_from_resp(
         &self,
@@ -395,9 +428,6 @@ impl ExecutionLayer {
         let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
         let taking = resp.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
         if making > 0.0 && taking > 0.0 {
-            // For buy: price = USDC / shares = making / taking
-            // For sell: price = USDC / shares = taking / making
-            // We use the smaller/larger ratio to get a price in (0, 1)
             let ratio = making / taking;
             if ratio > 0.0 && ratio < 1.0 {
                 ratio

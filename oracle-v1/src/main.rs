@@ -65,6 +65,7 @@ struct FeedConfig {
     book_batch_size:  usize,
     rest_throttle_ms: u64,
     book_warmup_secs: u64,
+    book_stale_secs:  f64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -238,9 +239,25 @@ async fn main() -> Result<()> {
     let mut last_discover: f64 = now_secs();
     let mut last_dash_ts:  f64 = 0.0;
     let mut settled: HashMap<String, bool> = HashMap::new();
+    let mut cl_close_snap: HashMap<String, f64> = HashMap::new(); // V6 FIX #3
 
     info!("Starting scan loop ({}ms tick, {}s warmup)...",
         cfg.scan.tick_ms, cfg.feed.book_warmup_secs);
+
+    // ── CL feed warmup: wait for at least one price per asset ─────────────
+    info!("Waiting for CL feed...");
+    for _ in 0..40u32 { // 20s max
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let all_have = cfg.feed.assets.iter().all(|a| cl_prices.contains_key(a.as_str()));
+        if all_have {
+            for asset in &cfg.feed.assets {
+                if let Some(v) = cl_prices.get(asset.as_str()) {
+                    info!("[CL] {} = {:.2}", asset.to_uppercase(), v.1);
+                }
+            }
+            break;
+        }
+    }
 
     loop {
         tokio::time::sleep(tick).await;
@@ -288,17 +305,34 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── Check settlements ───────────────────────────────────────────────
+        // ── V6 FIX #3: Record CL close snap — first CL after window end ──
+
+        for (slug, meta) in &markets {
+            if settled.get(slug.as_str()).copied().unwrap_or(false) { continue; }
+            if cl_close_snap.contains_key(slug.as_str()) { continue; }
+            if now_u > meta.window_end {
+                let cl_now = cl_prices.get(&meta.asset).map(|v| v.1).unwrap_or(0.0);
+                if cl_now > 0.0 {
+                    cl_close_snap.insert(slug.clone(), cl_now);
+                    info!("[CL_CLOSE] {} snap={:.2}", slug, cl_now);
+                }
+            }
+        }
+
+        // ── Check settlements (use CL close snap, not live CL) ───────────
 
         for (slug, meta) in &markets {
             if settled.get(slug.as_str()).copied().unwrap_or(false) { continue; }
             if now_u >= meta.window_end + 5 {
-                let cl_settle = cl_prices.get(&meta.asset).map(|v| v.1).unwrap_or(0.0);
+                let cl_settle = match cl_close_snap.get(slug.as_str()) {
+                    Some(&p) => p,
+                    None => continue, // Wait for close snap
+                };
                 if cl_settle <= 0.0 { continue; }
                 if meta.open_price <= 0.0 { continue; }
 
                 let outcome = if cl_settle > meta.open_price { 1.0 } else { 0.0 };
-                info!("[SETTLE] {} cl={:.2} open={:.2} outcome={}",
+                info!("[SETTLE] {} cl_close={:.2} open={:.2} outcome={}",
                     slug, cl_settle, meta.open_price, if outcome == 1.0 { "YES" } else { "NO" });
 
                 runner.on_settlement(slug, outcome, now).await;
@@ -344,8 +378,9 @@ async fn main() -> Result<()> {
                 _ => continue,
             };
 
-            // Skip stale books
-            if now - book_yes_entry.ts > 10.0 || now - book_no_entry.ts > 10.0 {
+            // Skip stale books (V6 used 1s, configurable via book_stale_secs)
+            if now - book_yes_entry.ts > cfg.feed.book_stale_secs
+                || now - book_no_entry.ts > cfg.feed.book_stale_secs {
                 continue;
             }
 
