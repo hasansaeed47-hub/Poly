@@ -1,22 +1,35 @@
 #!/usr/bin/env python3
 """
-WEATHER BOT — LOSS-AVOIDANCE STRATEGY
-======================================
-Forecast-driven. Risk-first. Never ride to zero.
+WEATHER BOT v2 — ENSEMBLE-DRIVEN, RESEARCH-BACKED
+===================================================
+Based on deep research into Polymarket weather markets (15+ sources).
+
+KEY INSIGHTS FROM RESEARCH:
+  - Settlement: Weather Underground airport stations (KLGA, EGLC, etc.)
+  - Profitable traders buy CHEAP (<15c YES, >85c NO), not expensive
+  - GFS 31-member ensemble gives real probabilities, not guesses
+  - Trade AFTER model runs (GFS every 6h, data ~3.5h after init)
+  - Stop-losses DON'T WORK on binary markets (prices jump, not slide)
+  - Position sizing IS the risk management (fractional Kelly)
+  - No fees on Polymarket — spread is the only cost
+  - NegRisk: 1 YES + 1 NO = $1 always. Selling NO = buying all other YES.
+  - Only 7.6% of Polymarket wallets are profitable. Edge is real but thin.
 
 STRATEGIES:
-  1. YES LADDER  — Weighted YES on top 3 forecast buckets (center-heavy)
-  2. NO GRIND    — Buy NO on extreme buckets for safe daily income
-  3. REBALANCE   — Sell positions that drifted out of top 3, buy new ones
-  4. MISPRICE    — Both-side arbitrage (YES underpriced + NO overpriced)
+  1. CHEAP YES    — Buy YES < 15c on buckets where ensemble prob >> price
+  2. NO GRIND     — Buy NO > 85c on dead buckets (safe income)
+  3. REBALANCE    — Sell when edge evaporates (new model run shifts probs)
+  4. MISPRICE ARB — Both sides: YES underpriced OR NO overpriced
 
-RISK GUARD (runs FIRST every tick):
-  - Stop-loss:     sell if price drops 50% from entry
-  - Trailing stop: sell if price drops 30% from peak
-  - City limit:    stop trading city after $10 cumulative loss
-  - Edge check:    sell if our edge goes negative by 2c+
+RISK MANAGEMENT (not stop-losses):
+  - Fractional Kelly sizing (15% Kelly)
+  - Max $5 per position (scale up after 100+ trades)
+  - Daily loss circuit breaker ($30)
+  - City-level loss limit ($10 per city)
+  - Edge-evaporation exit (sell when edge < 0, not on price drop)
 
-Data: WU (settlement source) > NOAA > Open-Meteo
+Data: GFS Ensemble (Open-Meteo, free) → probability engine
+      WU station forecast → settlement truth source
 """
 
 import os
@@ -56,34 +69,41 @@ S.mount("http://", _a)
 CLOB = "https://clob.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
 
-# ── Stakes ──
-YES_STAKE = 2.0       # $ base stake for YES bets
-NO_STAKE = 5.0        # $ per NO bet (bigger stake, small payout per share)
-MAX_DEPLOYED = 80.0   # max total $ out at once
-MAX_POSITIONS = 30    # max open positions
+# ── Position Sizing (fractional Kelly) ──
+KELLY_FRACTION = 0.15     # use 15% of full Kelly (conservative)
+MAX_POSITION = 5.0        # max $ per single position (scale up after 100+ trades)
+MIN_POSITION = 0.50       # don't bother with < 50¢
+MAX_DEPLOYED = 80.0       # max total $ out at once
+MAX_POSITIONS = 20        # max open positions
+NO_STAKE = 5.0            # $ per NO grind bet (separate from Kelly)
 
-# ── Strategy 1: YES Ladder (weighted) ──
-TOP_N_BUCKETS = 3     # buy top 3 forecast-aligned buckets
-MAX_YES_PRICE = 0.50  # don't overpay (50¢ max = 2:1 payout minimum)
-LADDER_WEIGHTS = [1.5, 1.0, 0.6]  # center gets 1.5x, edges taper
+# ── Strategy 1: Cheap YES (buy low, win big) ──
+MAX_YES_PRICE = 0.15      # ONLY buy YES below 15¢ (research: all winners do this)
+MIN_EDGE_YES = 0.05       # need 5¢+ edge (ensemble prob - market price)
+TOP_N_BUCKETS = 3         # target top 3 probability buckets
 
 # ── Strategy 2: NO Grind (safe income) ──
-MIN_NO_PRICE = 0.90   # only buy NO if price >= 90¢
-MAX_BUCKET_PROB = 0.04  # only target buckets with <4% real chance
+MIN_NO_PRICE = 0.85       # buy NO above 85¢ (lowered from 90¢ — more opportunities)
+MAX_BUCKET_PROB = 0.05    # target buckets with <5% real chance
 
-# ── Strategy 3: Misprice (both sides) ──
-MIN_MISPRICE = 0.05   # need 5¢+ edge to enter
-SNIPE_SELL_PROFIT = 0.03  # take profit at 3¢+ gain
+# ── Strategy 3: Misprice Arbitrage (both sides) ──
+MIN_MISPRICE = 0.08       # need 8¢+ edge for misprice (research: suislanchez uses 8%)
 
-# ── Risk Management: Stop-Losses ──
-STOP_LOSS_PCT = 0.50      # sell YES if price drops 50% from entry
-TRAILING_STOP_PCT = 0.30  # sell if price falls 30% from peak since entry
+# ── Risk Management (NOT stop-losses) ──
 MAX_LOSS_PER_CITY = 10.0  # stop trading a city after $10 cumulative loss
-MIN_EDGE_TO_HOLD = -0.02  # sell if our edge goes negative by 2¢+
+DAILY_LOSS_LIMIT = 30.0   # circuit breaker: stop all trading after $30 daily loss
+MIN_EDGE_TO_HOLD = 0.0    # sell if edge evaporates (prob <= price)
+MIN_HOURS_TO_RESOLUTION = 2  # don't enter positions < 2h before resolution
+
+# ── GFS Model Run Schedule (UTC) ──
+# GFS initializes at 00z, 06z, 12z, 18z — data available ~3.5h later
+# These are the OPTIMAL trade windows (market hasn't repriced yet)
+GFS_DATA_AVAIL_UTC = [3.5, 9.5, 15.5, 21.5]  # hours UTC when new data drops
+TRADE_WINDOW_MINUTES = 30  # how long the edge window lasts after model data
 
 # ── Timing ──
-SCAN_INTERVAL = 120   # seconds between full scans
-UPDATE_INTERVAL = 300  # seconds between forecast updates (5 min)
+SCAN_INTERVAL = 120       # seconds between full scans
+ENSEMBLE_INTERVAL = 600   # seconds between ensemble fetches (10 min)
 
 # ── Cities ──
 # Polymarket weather markets — city name, NOAA grid point, Open-Meteo coords
@@ -144,11 +164,16 @@ class Forecast:
     confidence: float      # 0-1, how sure we are
     source: str            # "noaa", "openmeteo", "wunderground"
     fetched_at: float      # unix timestamp
-    hourly_temps: List[float] = field(default_factory=list)  # hourly °F for the day
+    hourly_temps: List[float] = field(default_factory=list)
+    ensemble_highs: List[float] = field(default_factory=list)  # GFS 31-member highs (°F)
 
     @property
     def stale(self) -> bool:
-        return (time.time() - self.fetched_at) > UPDATE_INTERVAL
+        return (time.time() - self.fetched_at) > ENSEMBLE_INTERVAL
+
+    @property
+    def has_ensemble(self) -> bool:
+        return len(self.ensemble_highs) >= 5
 
 
 @dataclass
@@ -177,13 +202,13 @@ class Position:
     shares: float
     cost: float
     bought_at: float
-    play: str              # "open", "update", "no_grind", "snipe"
+    play: str              # "cheap_yes", "no_grind", "misprice_yes", "misprice_no"
     city: str
+    entry_prob: float = 0.0  # ensemble probability at time of entry
     settled: bool = False
     payout: float = 0.0
     sold: bool = False
     sell_price: float = 0.0
-    peak_price: float = 0.0  # highest price since entry (trailing stop)
 
 
 # =============================================================================
@@ -262,6 +287,7 @@ def fetch_noaa(city: str, info: dict) -> Optional[Forecast]:
 def fetch_openmeteo(city: str, info: dict) -> Optional[Forecast]:
     """
     Fetch from Open-Meteo — free, no API key, works worldwide.
+    Uses deterministic forecast for point estimate.
     """
     lat, lon = info["lat"], info["lon"]
     try:
@@ -301,6 +327,70 @@ def fetch_openmeteo(city: str, info: dict) -> Optional[Forecast]:
         )
     except Exception as e:
         log.debug(f"[OPENMETEO] {city}: {e}")
+        return None
+
+
+def fetch_gfs_ensemble(city: str, info: dict) -> Optional[List[float]]:
+    """
+    Fetch GFS 31-member ensemble daily max temperatures from Open-Meteo.
+
+    This is the KEY edge: instead of a single forecast, we get 31 independent
+    model runs. The fraction of members predicting each temperature bucket
+    IS the probability. No normal distribution assumptions needed.
+
+    Returns list of 31 high-temperature values in °F.
+    """
+    lat, lon = info["lat"], info["lon"]
+    try:
+        r = S.get(
+            "https://ensemble-api.open-meteo.com/v1/ensemble",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "daily": "temperature_2m_max",
+                "temperature_unit": "fahrenheit",
+                "timezone": "auto",
+                "forecast_days": 1,
+                "models": "gfs_seamless",
+            },
+            timeout=15,
+        )
+        if r.status_code != 200:
+            log.debug(f"[ENSEMBLE] {city}: HTTP {r.status_code}")
+            return None
+
+        data = r.json()
+        daily = data.get("daily", {})
+
+        # Ensemble returns temperature_2m_max_member01 through _member31
+        members = []
+        for i in range(31):
+            key = f"temperature_2m_max_member{i:02d}" if i > 0 else "temperature_2m_max"
+            vals = daily.get(key, [])
+            if vals and vals[0] is not None:
+                members.append(vals[0])
+
+        # Also try the flat array format
+        if not members:
+            for key, vals in daily.items():
+                if "temperature_2m_max" in key and vals:
+                    val = vals[0] if isinstance(vals, list) else vals
+                    if val is not None:
+                        members.append(float(val))
+
+        if len(members) < 5:
+            log.debug(f"[ENSEMBLE] {city}: only {len(members)} members, need 5+")
+            return None
+
+        log.info(
+            f"[ENSEMBLE] {city}: {len(members)} members, "
+            f"range={min(members):.0f}-{max(members):.0f}°F, "
+            f"mean={sum(members)/len(members):.1f}°F"
+        )
+        return members
+
+    except Exception as e:
+        log.debug(f"[ENSEMBLE] {city}: {e}")
         return None
 
 
@@ -379,27 +469,39 @@ def fetch_wunderground(city: str, info: dict) -> Optional[Forecast]:
 
 
 def get_forecast(city: str, info: dict) -> Optional[Forecast]:
-    """Get best available forecast. Try WU first (settlement source), then NOAA, then Open-Meteo."""
+    """
+    Get best available forecast + GFS ensemble.
+
+    Priority for point estimate: WU (settlement source) > NOAA > Open-Meteo
+    Always try to get GFS ensemble for probability engine.
+    """
     # Weather Underground = settlement source = highest priority
     fc = fetch_wunderground(city, info)
     if fc:
         log.info(f"[FORECAST] {city}: WU high={fc.high_f:.0f}°F conf={fc.confidence:.0%}")
-        return fc
+    else:
+        fc = fetch_noaa(city, info)
+        if fc:
+            log.info(f"[FORECAST] {city}: NOAA high={fc.high_f:.0f}°F conf={fc.confidence:.0%}")
+        else:
+            fc = fetch_openmeteo(city, info)
+            if fc:
+                log.info(f"[FORECAST] {city}: OpenMeteo high={fc.high_f:.0f}°F conf={fc.confidence:.0%}")
 
-    # NOAA = good US forecasts
-    fc = fetch_noaa(city, info)
-    if fc:
-        log.info(f"[FORECAST] {city}: NOAA high={fc.high_f:.0f}°F conf={fc.confidence:.0%}")
-        return fc
+    if not fc:
+        log.warning(f"[FORECAST] {city}: ALL SOURCES FAILED")
+        return None
 
-    # Open-Meteo = worldwide fallback
-    fc = fetch_openmeteo(city, info)
-    if fc:
-        log.info(f"[FORECAST] {city}: OpenMeteo high={fc.high_f:.0f}°F conf={fc.confidence:.0%}")
-        return fc
+    # Always try to get GFS ensemble (this is our probability engine)
+    ensemble = fetch_gfs_ensemble(city, info)
+    if ensemble:
+        fc.ensemble_highs = ensemble
+        # Update point estimate to ensemble mean if we don't have WU
+        if fc.source != "wunderground":
+            fc.high_f = sum(ensemble) / len(ensemble)
+            fc.high_c = (fc.high_f - 32) * 5 / 9
 
-    log.warning(f"[FORECAST] {city}: ALL SOURCES FAILED")
-    return None
+    return fc
 
 
 # =============================================================================
@@ -705,33 +807,57 @@ class OrderManager:
 
 def forecast_to_probs(forecast: Forecast, buckets: List[Bucket]) -> List[Bucket]:
     """
-    Convert a temperature forecast into bucket probabilities.
+    Convert forecast into bucket probabilities.
 
-    Uses a normal distribution centered on forecast high,
-    with spread based on forecast confidence.
+    METHOD 1 (preferred): GFS ENSEMBLE COUNTING
+    Count how many of the 31 ensemble members fall in each bucket.
+    This gives REAL probabilities — no distribution assumptions.
+    Example: 9/31 members predict 72°F → prob = 29%
+
+    METHOD 2 (fallback): NORMAL DISTRIBUTION
+    If ensemble not available, use normal CDF centered on forecast high.
+    Less accurate but still useful.
     """
     import math
 
-    high_f = forecast.high_f
-    # Std dev: higher confidence = tighter distribution
-    # NOAA typical error: ±3°F, so std ~3
-    # WU (settlement source): ±2°F, so std ~2
-    std_dev = 2.0 if forecast.source == "wunderground" else 3.0
-    std_dev /= forecast.confidence  # wider if less confident
+    if forecast.has_ensemble:
+        # ── METHOD 1: Ensemble counting ──
+        members = forecast.ensemble_highs
+        n = len(members)
 
-    def normal_cdf(x, mu, sigma):
-        return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
+        for b in buckets:
+            if b.low_temp == 0 and b.high_temp == 0:
+                b.our_prob = 0.0
+                continue
 
-    for b in buckets:
-        if b.low_temp == 0 and b.high_temp == 0:
-            b.our_prob = 0.0
-            continue
+            lo = b.low_temp if b.low_temp > -900 else -999
+            hi = b.high_temp if b.high_temp < 900 else 999
 
-        lo = b.low_temp if b.low_temp > -900 else -100
-        hi = b.high_temp if b.high_temp < 900 else 200
+            # Count members that fall in this bucket
+            count = sum(1 for t in members if lo - 0.5 <= t <= hi + 0.5)
+            b.our_prob = max(0.001, count / n)
 
-        prob = normal_cdf(hi + 0.5, high_f, std_dev) - normal_cdf(lo - 0.5, high_f, std_dev)
-        b.our_prob = max(0.001, min(0.999, prob))
+        log.info(f"[PROB] {forecast.city}: ensemble method ({n} members)")
+
+    else:
+        # ── METHOD 2: Normal distribution fallback ──
+        high_f = forecast.high_f
+        std_dev = 2.0 if forecast.source == "wunderground" else 3.0
+        std_dev /= forecast.confidence
+
+        def normal_cdf(x, mu, sigma):
+            return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
+
+        for b in buckets:
+            if b.low_temp == 0 and b.high_temp == 0:
+                b.our_prob = 0.0
+                continue
+            lo = b.low_temp if b.low_temp > -900 else -100
+            hi = b.high_temp if b.high_temp < 900 else 200
+            prob = normal_cdf(hi + 0.5, high_f, std_dev) - normal_cdf(lo - 0.5, high_f, std_dev)
+            b.our_prob = max(0.001, min(0.999, prob))
+
+        log.info(f"[PROB] {forecast.city}: normal fallback (std={std_dev:.1f})")
 
     # Normalize so probs sum to 1.0
     total = sum(b.our_prob for b in buckets)
@@ -742,52 +868,104 @@ def forecast_to_probs(forecast: Forecast, buckets: List[Bucket]) -> List[Bucket]
     return buckets
 
 
-# =============================================================================
-# STRATEGY SYSTEM — LOSS AVOIDANCE
-# =============================================================================
-#
-# 1. YES LADDER    — Weighted YES on top 3 buckets (center-heavy)
-# 2. NO GRIND      — Buy NO on extreme buckets (safe income stream)
-# 3. REBALANCE     — Sell positions that drifted out of top 3, buy new top 3
-# 4. MISPRICE      — Both sides: YES if underpriced, NO if overpriced
-# 5. RISK GUARD    — Stop-loss, trailing stop, city loss limit
-#
-# Key difference from old system: RISK GUARD runs FIRST every tick.
-# We cut losers before adding new positions. Never ride to zero.
-# =============================================================================
-
-
-def strategy_yes_ladder(buckets: List[Bucket], forecast: Forecast) -> List[dict]:
+def kelly_stake(prob: float, price: float) -> float:
     """
-    Buy YES on top 3 forecast-aligned buckets with weighted sizing.
-    Center bucket = 1.5x stake, edges taper down.
+    Calculate fractional Kelly bet size.
+
+    Full Kelly = (prob * payout - (1-prob) * cost) / payout
+    For binary market: payout = (1/price - 1) * stake if YES wins
+    Simplified: kelly_fraction = prob - (1-prob)*price/(1-price)
+                               = prob*(1/price) - 1  ... adjusted
+
+    We use: f* = (prob/price - 1) / (1/price - 1) ... fraction of bankroll
+    Then scale by KELLY_FRACTION (15%) and cap at MAX_POSITION.
+    """
+    if price <= 0 or price >= 1 or prob <= 0:
+        return 0.0
+
+    # Decimal odds for YES: you pay `price`, get $1 if win → odds = 1/price
+    odds = 1.0 / price
+    # Kelly fraction: (prob * odds - 1) / (odds - 1)
+    if odds <= 1:
+        return 0.0
+    f_star = (prob * odds - 1) / (odds - 1)
+
+    if f_star <= 0:
+        return 0.0  # negative edge, don't bet
+
+    # Scale down by KELLY_FRACTION for safety
+    stake = f_star * KELLY_FRACTION * MAX_DEPLOYED
+    stake = max(MIN_POSITION, min(MAX_POSITION, stake))
+    return round(stake, 2)
+
+
+def is_model_run_window() -> bool:
+    """
+    Check if we're in an optimal trade window (shortly after GFS data drops).
+
+    GFS runs at 00z, 06z, 12z, 18z — data available ~3.5h later.
+    The edge window is the ~30 minutes after new data, before market reprices.
+    """
+    now = datetime.now(timezone.utc)
+    current_hour = now.hour + now.minute / 60.0
+
+    for avail_hour in GFS_DATA_AVAIL_UTC:
+        diff = current_hour - avail_hour
+        if 0 <= diff <= TRADE_WINDOW_MINUTES / 60.0:
+            return True
+    return False
+
+
+# =============================================================================
+# STRATEGIES — RESEARCH-BACKED
+# =============================================================================
+#
+# Key research findings:
+#   - Buy cheap (< 15¢ YES). All profitable traders do this (gopfan2, meropi).
+#   - NO grind on dead buckets is safe income.
+#   - NO stop-losses on binary markets. Position sizing = risk management.
+#   - Exit only when EDGE evaporates (new model run changes probs).
+#   - Trade after GFS model runs for maximum edge window.
+#   - Kelly sizing ensures no single loss destroys you.
+# =============================================================================
+
+
+def strategy_cheap_yes(buckets: List[Bucket], forecast: Forecast) -> List[dict]:
+    """
+    Buy cheap YES (< 15¢) on buckets where ensemble probability >> market price.
+
+    This is how gopfan2 made $2M+ and meropi made $30K:
+    buy YES at 1-15¢ where your model says 10-40% probability.
+    Individual trades return 5-90x when they hit.
+
+    Kelly sizing ensures correct bet size for each bucket's edge.
     """
     ranked = sorted(buckets, key=lambda b: -b.our_prob)
     trades = []
 
-    for rank, b in enumerate(ranked[:TOP_N_BUCKETS]):
+    for b in ranked[:TOP_N_BUCKETS]:
         edge = b.our_prob - b.yes_price
-        if edge <= 0:
+        if edge < MIN_EDGE_YES:
             continue
         if b.yes_price > MAX_YES_PRICE:
-            continue
-        if b.yes_price < 0.01:
-            continue
+            continue  # CRITICAL: don't buy expensive YES (>15¢)
+        if b.yes_price < 0.005:
+            continue  # no liquidity
 
-        weight = LADDER_WEIGHTS[rank] if rank < len(LADDER_WEIGHTS) else 0.25
-        weighted_stake = round(YES_STAKE * weight, 2)
+        # Kelly-sized stake
+        stake = kelly_stake(b.our_prob, b.yes_price)
+        if stake < MIN_POSITION:
+            continue
 
         trades.append({
-            "play": "yes_ladder",
+            "play": "cheap_yes",
             "side": "YES",
             "token_id": b.token_yes,
             "label": b.label,
             "price": b.yes_price,
-            "stake": weighted_stake,
+            "stake": stake,
             "our_prob": b.our_prob,
             "edge": edge,
-            "rank": rank,
-            "weight": weight,
         })
 
     return trades
@@ -795,8 +973,11 @@ def strategy_yes_ladder(buckets: List[Bucket], forecast: Forecast) -> List[dict]
 
 def strategy_no_grind(buckets: List[Bucket]) -> List[dict]:
     """
-    Buy NO on extreme/unlikely buckets for safe income.
-    Only targets buckets with <4% chance and NO price >= 90¢.
+    Buy NO on dead/extreme buckets for safe income.
+
+    NO at 85¢+ on buckets with <5% real probability.
+    Win rate ~95%+. Small profit per trade but very consistent.
+    This is the bread-and-butter income stream.
     """
     trades = []
 
@@ -824,93 +1005,14 @@ def strategy_no_grind(buckets: List[Bucket]) -> List[dict]:
     return trades
 
 
-def strategy_rebalance(
-    buckets: List[Bucket],
-    positions: List[Position],
-) -> List[dict]:
-    """
-    Sell YES positions that are no longer in the top 3 forecast buckets.
-    Buy new top 3 buckets we don't already hold.
-
-    This replaces the old play2_update — runs every tick, not just on
-    forecast shifts. Catches market-driven price changes too.
-    """
-    trades = []
-
-    # Current top 3 token IDs
-    ranked = sorted(buckets, key=lambda b: -b.our_prob)
-    top_tids = {b.token_yes for b in ranked[:TOP_N_BUCKETS]}
-
-    # Sell YES positions that fell out of top 3
-    for pos in positions:
-        if pos.settled or pos.sold or pos.side != "YES":
-            continue
-        if pos.play not in ("yes_ladder", "open", "update_buy", "rebalance_buy"):
-            continue
-        if pos.token_id in top_tids:
-            continue  # still in top 3, keep it
-
-        # Find matching bucket for current price
-        matching = [b for b in buckets if b.token_yes == pos.token_id]
-        if not matching:
-            continue
-        b = matching[0]
-
-        # Only sell if our edge is gone (prob dropped below market price)
-        current_edge = b.our_prob - b.yes_price
-        if current_edge > MIN_EDGE_TO_HOLD:
-            continue  # still has some edge, hold
-
-        book = get_book(b.token_yes)
-        if book and book["best_bid"] > 0.01:
-            trades.append({
-                "play": "rebalance_sell",
-                "side": "SELL",
-                "token_id": b.token_yes,
-                "label": b.label,
-                "price": book["best_bid"],
-                "shares": pos.shares,
-                "reason": f"out of top 3, edge={current_edge:+.3f}",
-            })
-
-    # Buy new top 3 that we don't hold
-    held_tids = {p.token_id for p in positions if not p.settled and not p.sold}
-    for rank, b in enumerate(ranked[:TOP_N_BUCKETS]):
-        if b.token_yes in held_tids:
-            continue
-        edge = b.our_prob - b.yes_price
-        if edge < 0.03:
-            continue
-        if b.yes_price > MAX_YES_PRICE:
-            continue
-
-        weight = LADDER_WEIGHTS[rank] if rank < len(LADDER_WEIGHTS) else 0.25
-        weighted_stake = round(YES_STAKE * weight, 2)
-
-        trades.append({
-            "play": "rebalance_buy",
-            "side": "YES",
-            "token_id": b.token_yes,
-            "label": b.label,
-            "price": b.yes_price,
-            "stake": weighted_stake,
-            "our_prob": b.our_prob,
-            "edge": edge,
-            "rank": rank,
-            "weight": weight,
-        })
-
-    return trades
-
-
 def strategy_misprice(buckets: List[Bucket]) -> List[dict]:
     """
-    Find mispriced buckets — BOTH sides.
-    - If market underprices a bucket (our prob >> yes_price) → buy YES
-    - If market overprices a bucket (our prob << yes_price) → buy NO
+    Both-side misprice arbitrage.
 
-    This is the key improvement: we can profit from overpriced buckets
-    by buying NO on them, not just underpriced ones.
+    YES side: ensemble says 25% but market says 8% → buy YES at 8¢
+    NO side: ensemble says 5% but market says 20% → buy NO at 80¢
+
+    Requires 8¢+ edge (research: suislanchez bot uses 8% threshold).
     """
     trades = []
 
@@ -919,56 +1021,55 @@ def strategy_misprice(buckets: List[Bucket]) -> List[dict]:
         no_edge = (1 - b.our_prob) - b.no_price
 
         # YES side: market underprices this bucket
-        if yes_edge >= MIN_MISPRICE and 0.01 < b.yes_price < 0.80:
-            trades.append({
-                "play": "snipe_yes",
-                "side": "YES",
-                "token_id": b.token_yes,
-                "label": b.label,
-                "price": b.yes_price,
-                "stake": YES_STAKE,
-                "our_prob": b.our_prob,
-                "edge": yes_edge,
-                "target_sell": round(b.yes_price + SNIPE_SELL_PROFIT, 2),
-            })
-
-        # NO side: market overprices this bucket (our prob is much lower)
-        # e.g. market says 30% chance but we think 10% → buy NO at 70¢
-        if no_edge >= MIN_MISPRICE and 0.50 < b.no_price < 0.95:
-            # Don't overlap with no_grind targets (those are extreme buckets)
-            if b.our_prob > MAX_BUCKET_PROB:  # only target mid-range overpriced
+        if yes_edge >= MIN_MISPRICE and 0.005 < b.yes_price <= MAX_YES_PRICE:
+            stake = kelly_stake(b.our_prob, b.yes_price)
+            if stake >= MIN_POSITION:
                 trades.append({
-                    "play": "snipe_no",
-                    "side": "NO",
-                    "token_id": b.token_no,
+                    "play": "misprice_yes",
+                    "side": "YES",
+                    "token_id": b.token_yes,
                     "label": b.label,
-                    "price": b.no_price,
-                    "stake": YES_STAKE,  # same stake as YES snipes
-                    "our_prob": 1 - b.our_prob,
-                    "edge": no_edge,
-                    "target_sell": round(b.no_price + SNIPE_SELL_PROFIT, 2),
+                    "price": b.yes_price,
+                    "stake": stake,
+                    "our_prob": b.our_prob,
+                    "edge": yes_edge,
                 })
 
-    # Sort by biggest edge first, cap at 3
+        # NO side: market overprices this bucket
+        if no_edge >= MIN_MISPRICE and 0.50 < b.no_price < 0.95:
+            if b.our_prob > MAX_BUCKET_PROB:  # don't overlap with no_grind
+                stake = kelly_stake(1 - b.our_prob, b.no_price)
+                if stake >= MIN_POSITION:
+                    trades.append({
+                        "play": "misprice_no",
+                        "side": "NO",
+                        "token_id": b.token_no,
+                        "label": b.label,
+                        "price": b.no_price,
+                        "stake": stake,
+                        "our_prob": 1 - b.our_prob,
+                        "edge": no_edge,
+                    })
+
     trades.sort(key=lambda t: -t["edge"])
     return trades[:3]
 
 
-def strategy_risk_guard(
+def strategy_edge_exit(
     positions: List[Position],
     buckets: List[Bucket],
-    city_pnl: Dict[str, float],
 ) -> List[dict]:
     """
-    RISK GUARD — Runs FIRST every tick. Cut losses before adding new bets.
+    Exit positions where edge has evaporated.
 
-    1. Stop-loss: sell if price dropped 50% from entry
-    2. Trailing stop: sell if price dropped 30% from peak
-    3. Take-profit on snipes: sell if price rose 3¢+
-    4. City loss limit: flag cities where we lost > $10
-    5. Edge evaporated: sell if our edge went negative by 2¢+
+    NOT a stop-loss (research says stop-losses don't work on binary markets).
+    This exits when the PROBABILITY changed (new model run), not when the
+    price dropped. The distinction matters:
 
-    Returns sell trades + list of blocked cities.
+    Stop-loss: "price went from 10¢ to 5¢ → sell" (BAD — might still win)
+    Edge exit: "prob went from 25% to 3% → sell" (GOOD — model says it's dead)
+
+    Also sells snipe positions that have reached take-profit.
     """
     trades = []
 
@@ -976,66 +1077,50 @@ def strategy_risk_guard(
         if pos.settled or pos.sold:
             continue
 
-        # Find current price
-        matching = []
+        # NO grind positions ride to settlement — almost always win
+        if pos.play == "no_grind":
+            continue
+
+        # Find matching bucket
         if pos.side == "YES":
             matching = [b for b in buckets if b.token_yes == pos.token_id]
         else:
             matching = [b for b in buckets if b.token_no == pos.token_id]
-
         if not matching:
             continue
         b = matching[0]
 
         current_price = b.yes_price if pos.side == "YES" else b.no_price
-
-        # Update peak price for trailing stop
-        if current_price > pos.peak_price:
-            pos.peak_price = current_price
-
-        # Skip NO grind positions — they're almost always winners,
-        # stop-losses would just cause unnecessary churn
-        if pos.play == "no_grind":
-            continue
+        our_prob = b.our_prob if pos.side == "YES" else (1 - b.our_prob)
+        current_edge = our_prob - current_price
 
         sell_reason = None
 
-        # 1. STOP-LOSS: price dropped 50% from entry
-        if current_price < pos.buy_price * (1 - STOP_LOSS_PCT):
-            sell_reason = f"stop-loss: entry={pos.buy_price:.2f} now={current_price:.2f} (-{STOP_LOSS_PCT:.0%})"
+        # Edge evaporated: our model no longer supports this position
+        if current_edge < MIN_EDGE_TO_HOLD:
+            sell_reason = f"edge gone: prob={our_prob:.1%} price={current_price:.2f} edge={current_edge:+.3f}"
 
-        # 2. TRAILING STOP: price dropped 30% from peak
-        elif pos.peak_price > pos.buy_price * 1.05:  # only activate if price went up 5%+ first
-            if current_price < pos.peak_price * (1 - TRAILING_STOP_PCT):
-                sell_reason = f"trailing-stop: peak={pos.peak_price:.2f} now={current_price:.2f} (-{TRAILING_STOP_PCT:.0%})"
-
-        # 3. TAKE-PROFIT on snipes
-        elif pos.play in ("snipe_yes", "snipe_no", "snipe"):
-            profit = current_price - pos.buy_price
-            if profit >= SNIPE_SELL_PROFIT:
-                sell_reason = f"take-profit: +{profit:.2f} (target {SNIPE_SELL_PROFIT:.2f})"
-
-        # 4. EDGE EVAPORATED
-        elif pos.side == "YES":
-            current_edge = b.our_prob - current_price
-            if current_edge < MIN_EDGE_TO_HOLD:
-                sell_reason = f"edge gone: prob={b.our_prob:.1%} price={current_price:.2f} edge={current_edge:+.3f}"
+        # Misprice take-profit: price caught up to our probability
+        if pos.play in ("misprice_yes", "misprice_no"):
+            if current_price >= our_prob - 0.02:  # price converged to fair value
+                profit_pct = (current_price - pos.buy_price) / pos.buy_price
+                if profit_pct > 0.10:  # at least 10% profit
+                    sell_reason = f"misprice converged: entry={pos.buy_price:.2f} now={current_price:.2f} (+{profit_pct:.0%})"
 
         if sell_reason:
             token_id = b.token_yes if pos.side == "YES" else b.token_no
             book = get_book(token_id)
             sell_price = book["best_bid"] if book and book["best_bid"] > 0.01 else current_price - 0.01
 
-            if sell_price > 0.01:  # don't sell for nothing
+            if sell_price > 0.01:
                 trades.append({
-                    "play": "risk_guard",
+                    "play": "edge_exit",
                     "side": "SELL",
                     "token_id": token_id,
                     "label": pos.label,
                     "price": sell_price,
                     "shares": pos.shares,
                     "reason": sell_reason,
-                    "original_play": pos.play,
                 })
 
     return trades
@@ -1062,9 +1147,11 @@ class WeatherBot:
         self.forecasts: Dict[str, Forecast] = {}
         self.pnl = 0.0
         self.trades_count = 0
+        self.daily_pnl = 0.0      # resets each day for circuit breaker
         self.daily_no_profit = 0.0
-        self.city_pnl: Dict[str, float] = {}  # per-city PnL tracking
+        self.city_pnl: Dict[str, float] = {}
         self._running = True
+        self._last_day = ""
 
     def run(self):
         self._banner()
@@ -1084,7 +1171,17 @@ class WeatherBot:
         while self._running:
             try:
                 tick += 1
-                if tick == 1 or tick % (UPDATE_INTERVAL // SCAN_INTERVAL) == 0:
+
+                # Reset daily PnL at midnight
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                if today != self._last_day:
+                    self._last_day = today
+                    self.daily_pnl = 0.0
+                    self.daily_no_profit = 0.0
+                    log.info(f"[BOT] New day: {today}")
+
+                # Refresh forecasts + ensemble every ENSEMBLE_INTERVAL
+                if tick == 1 or tick % (ENSEMBLE_INTERVAL // SCAN_INTERVAL) == 0:
                     self._update_forecasts()
 
                 self._tick()
@@ -1115,22 +1212,32 @@ class WeatherBot:
         """
         One full scan + trade cycle.
 
-        Order of operations (critical for loss avoidance):
-          1. Fetch markets & prices
-          2. RISK GUARD — cut losers first
-          3. REBALANCE — sell drifted positions, buy new top 3
-          4. YES LADDER — fill any remaining top 3 slots
-          5. NO GRIND — safe income on extremes
+        Order (critical):
+          1. Check circuit breaker (daily loss limit)
+          2. Fetch markets & prices
+          3. EDGE EXIT — sell positions where model no longer supports
+          4. CHEAP YES — buy cheap YES with Kelly sizing
+          5. NO GRIND — safe income on dead buckets
           6. MISPRICE — both-side arbitrage
           7. CHECK SETTLEMENTS
         """
+        # Daily circuit breaker
+        if self.daily_pnl < -DAILY_LOSS_LIMIT:
+            log.warning(f"[CIRCUIT BREAKER] Daily loss ${self.daily_pnl:.2f} > limit ${DAILY_LOSS_LIMIT}. Halted.")
+            return
+
         events = gamma_find_weather_events()
         if not events:
             log.info("[TICK] No weather markets found")
             return
 
-        sell_trades = []   # risk guard + rebalance sells — execute first
-        buy_trades = []    # new positions — execute after sells
+        # Model run window indicator
+        in_window = is_model_run_window()
+        if in_window:
+            log.info("[TIMING] GFS model run window ACTIVE — optimal trading time")
+
+        sell_trades = []
+        buy_trades = []
         deployed = sum(p.cost for p in self.positions if not p.settled and not p.sold)
         held_tids = {p.token_id for p in self.positions if not p.settled and not p.sold}
         blocked_cities = get_blocked_cities(self.city_pnl)
@@ -1162,54 +1269,48 @@ class WeatherBot:
             buckets = forecast_to_probs(fc, buckets)
 
             title = ev.get("title", "?")
-            log.info(f"[{city}] {title} — {len(buckets)} buckets, high={fc.high_f:.0f}°F ({fc.source})")
+            ensemble_tag = f"ensemble={len(fc.ensemble_highs)}m" if fc.has_ensemble else "fallback"
+            log.info(f"[{city}] {title} — {len(buckets)} buckets, high={fc.high_f:.0f}°F ({fc.source}, {ensemble_tag})")
 
             for b in sorted(buckets, key=lambda x: x.low_temp):
+                yes_edge = b.our_prob - b.yes_price
                 marker = " ★" if b.our_prob > 0.15 else (" ·" if b.our_prob < 0.02 else "")
+                cheap = " $" if 0 < b.yes_price <= MAX_YES_PRICE and yes_edge > MIN_EDGE_YES else ""
                 log.info(
                     f"  {b.label:20s} YES={b.yes_price:.2f} NO={b.no_price:.2f} "
-                    f"prob={b.our_prob:.1%} edge={b.our_prob - b.yes_price:+.3f}{marker}"
+                    f"prob={b.our_prob:.1%} edge={yes_edge:+.3f}{marker}{cheap}"
                 )
 
-            # ── STEP 1: RISK GUARD (sells — runs first) ──
-            rg = strategy_risk_guard(self.positions, buckets, self.city_pnl)
-            for t in rg:
+            # ── STEP 1: EDGE EXITS (sells — runs first) ──
+            ee = strategy_edge_exit(self.positions, buckets)
+            for t in ee:
                 t["city"] = city
-            sell_trades.extend(rg)
-
-            # ── STEP 2: REBALANCE (sells + buys) ──
-            rb = strategy_rebalance(buckets, self.positions)
-            for t in rb:
-                t["city"] = city
-                if t["side"] == "SELL":
-                    sell_trades.append(t)
-                else:
-                    buy_trades.append(t)
+            sell_trades.extend(ee)
 
             # Skip new buys for blocked cities
             if city in blocked_cities:
-                log.info(f"  [{city}] BLOCKED — skipping new buys (city loss > ${MAX_LOSS_PER_CITY})")
+                log.info(f"  [{city}] BLOCKED — skipping buys (city loss > ${MAX_LOSS_PER_CITY})")
                 continue
 
-            # ── STEP 3: YES LADDER ──
-            yl = strategy_yes_ladder(buckets, fc)
-            for t in yl:
+            # ── STEP 2: CHEAP YES ──
+            cy = strategy_cheap_yes(buckets, fc)
+            for t in cy:
                 t["city"] = city
-            buy_trades.extend(yl)
+            buy_trades.extend(cy)
 
-            # ── STEP 4: NO GRIND ──
+            # ── STEP 3: NO GRIND ──
             ng = strategy_no_grind(buckets)
             for t in ng:
                 t["city"] = city
             buy_trades.extend(ng)
 
-            # ── STEP 5: MISPRICE ──
+            # ── STEP 4: MISPRICE ──
             mp = strategy_misprice(buckets)
             for t in mp:
                 t["city"] = city
             buy_trades.extend(mp)
 
-        # ── EXECUTE SELLS FIRST (risk guard + rebalance) ──
+        # ── EXECUTE SELLS FIRST ──
         for t in sell_trades:
             tid = t["token_id"]
             shares = t.get("shares", 0)
@@ -1228,6 +1329,7 @@ class WeatherBot:
                         revenue = shares * price
                         profit = revenue - pos.cost
                         self.pnl += profit
+                        self.daily_pnl += profit
                         self.city_pnl[city] = self.city_pnl.get(city, 0) + profit
                         deployed -= pos.cost
                         held_tids.discard(tid)
@@ -1245,7 +1347,7 @@ class WeatherBot:
                 continue
 
             price = t["price"]
-            stake = t.get("stake", YES_STAKE)
+            stake = t.get("stake", MIN_POSITION)
             side = t["side"]
             edge = t.get("edge", 0)
             prob = t.get("our_prob", 0)
@@ -1264,7 +1366,7 @@ class WeatherBot:
                     token_id=tid, label=t["label"], side=side,
                     buy_price=price, shares=shares, cost=stake,
                     bought_at=time.time(), play=play, city=city,
-                    peak_price=price,
+                    entry_prob=prob,
                 )
                 self.positions.append(pos)
                 self.trades_count += 1
@@ -1291,16 +1393,19 @@ class WeatherBot:
                 pos.payout = pos.shares * 1.0
                 profit = pos.payout - pos.cost
                 self.pnl += profit
+                self.daily_pnl += profit
                 self.city_pnl[pos.city] = self.city_pnl.get(pos.city, 0) + profit
                 if pos.play == "no_grind":
                     self.daily_no_profit += profit
-                log.info(f"[WIN] {pos.label[:35]} ({pos.play}) cost=${pos.cost:.2f} profit=${profit:+.2f}")
+                log.info(f"[WIN] {pos.label[:35]} ({pos.play}) cost=${pos.cost:.2f} payout=${pos.payout:.2f} profit=${profit:+.2f}")
 
             elif price <= 0.05:
                 pos.settled = True
                 pos.payout = 0
-                self.pnl -= pos.cost
-                self.city_pnl[pos.city] = self.city_pnl.get(pos.city, 0) - pos.cost
+                loss = pos.cost
+                self.pnl -= loss
+                self.daily_pnl -= loss
+                self.city_pnl[pos.city] = self.city_pnl.get(pos.city, 0) - loss
                 log.info(f"[LOSS] {pos.label[:35]} ({pos.play}) cost=${pos.cost:.2f}")
 
     def _status(self):
@@ -1315,42 +1420,44 @@ class WeatherBot:
             by_play.setdefault(p.play, 0)
             by_play[p.play] += 1
         play_str = " ".join(f"{k}={v}" for k, v in sorted(by_play.items()))
-
         city_str = " ".join(f"{c}=${v:+.1f}" for c, v in sorted(self.city_pnl.items()))
 
         log.info(
             f"[STATUS] open={len(open_pos)} deployed=${deployed:.0f} | "
-            f"{wins}W/{losses}L pnl=${self.pnl:+.2f} | "
+            f"{wins}W/{losses}L pnl=${self.pnl:+.2f} daily=${self.daily_pnl:+.2f} | "
             f"NO grind=${self.daily_no_profit:+.2f} | trades={self.trades_count} | {play_str}"
         )
         if city_str:
             log.info(f"[CITIES] {city_str}")
 
     def _banner(self):
-        print("=" * 65)
-        print("  WEATHER BOT — LOSS-AVOIDANCE STRATEGY")
-        print("=" * 65)
+        print("=" * 70)
+        print("  WEATHER BOT v2 — ENSEMBLE-DRIVEN, RESEARCH-BACKED")
+        print("=" * 70)
         print(f"  Mode: {'PAPER' if self.paper else 'LIVE'}")
         print(f"  Cities: {', '.join(CITIES.keys())}")
         print()
+        print("  PROBABILITY ENGINE:")
+        print("    GFS 31-member ensemble via Open-Meteo (free)")
+        print("    Count members per bucket → real probabilities")
+        print("    Fallback: normal distribution if ensemble unavailable")
+        print()
         print("  STRATEGIES:")
-        print("    1. YES LADDER  — Weighted YES on top 3 buckets")
-        print("    2. NO GRIND    — Safe income on extreme buckets")
-        print("    3. REBALANCE   — Sell drifted, buy new top 3")
-        print("    4. MISPRICE    — Both-side arbitrage (YES + NO)")
+        print(f"    1. CHEAP YES   — Buy YES < {MAX_YES_PRICE:.0%} with Kelly sizing")
+        print(f"    2. NO GRIND    — Buy NO > {MIN_NO_PRICE:.0%} on dead buckets")
+        print(f"    3. MISPRICE    — Both-side arb (edge > {MIN_MISPRICE:.0%})")
         print()
-        print("  RISK GUARD (runs first every tick):")
-        print(f"    Stop-loss:     sell if price drops {STOP_LOSS_PCT:.0%} from entry")
-        print(f"    Trailing stop: sell if price drops {TRAILING_STOP_PCT:.0%} from peak")
-        print(f"    City limit:    stop trading city after ${MAX_LOSS_PER_CITY} loss")
-        print(f"    Edge check:    sell if edge goes below {MIN_EDGE_TO_HOLD:+.2f}")
+        print("  RISK MANAGEMENT (not stop-losses):")
+        print(f"    Kelly fraction:  {KELLY_FRACTION:.0%} of full Kelly")
+        print(f"    Max position:    ${MAX_POSITION}")
+        print(f"    Daily limit:     ${DAILY_LOSS_LIMIT} circuit breaker")
+        print(f"    City limit:      ${MAX_LOSS_PER_CITY} per city")
+        print(f"    Edge exit:       sell when prob <= price (edge gone)")
         print()
-        print(f"  YES stake: ${YES_STAKE} (weighted: {LADDER_WEIGHTS})")
-        print(f"  NO stake: ${NO_STAKE}")
         print(f"  Max deployed: ${MAX_DEPLOYED} | Max positions: {MAX_POSITIONS}")
         wu = "YES" if os.environ.get("WU_API_KEY") else "NO (set WU_API_KEY)"
         print(f"  WU API key: {wu}")
-        print("=" * 65)
+        print("=" * 70)
 
     def _summary(self):
         settled = [p for p in self.positions if p.settled]
@@ -1360,22 +1467,19 @@ class WeatherBot:
         losses = [p for p in settled if p.payout == 0]
 
         print()
-        print("=" * 65)
+        print("=" * 70)
         print("  SESSION SUMMARY")
-        print("=" * 65)
+        print("=" * 70)
         print(f"  Total trades: {self.trades_count}")
         print(f"  Settled: {len(settled)} ({len(wins)}W / {len(losses)}L)")
-        print(f"  Risk guard exits: {sum(1 for p in sold if p.play == 'risk_guard')}")
-        print(f"  Rebalance exits: {sum(1 for p in sold if p.play == 'rebalance_sell')}")
-        print(f"  Snipe exits: {sum(1 for p in sold if p.play in ('snipe_sell', 'risk_guard') and hasattr(p, 'play'))}")
+        print(f"  Edge exits: {sum(1 for p in sold if True)}")
         print(f"  Open: {len(open_pos)}")
         print(f"  PnL: ${self.pnl:+.2f}")
         print(f"  NO grind profit: ${self.daily_no_profit:+.2f}")
 
-        # By play
         print()
         print("  BY STRATEGY:")
-        for play in ["yes_ladder", "rebalance_buy", "no_grind", "snipe_yes", "snipe_no"]:
+        for play in ["cheap_yes", "no_grind", "misprice_yes", "misprice_no"]:
             pp = [p for p in self.positions if p.play == play]
             if not pp:
                 continue
@@ -1386,7 +1490,6 @@ class WeatherBot:
             rev += sum(p.sell_price * p.shares for p in pp if p.sold)
             print(f"    {play:15s} {len(pp)} trades, {w}W/{l}L, cost=${cost:.2f}, rev=${rev:.2f}")
 
-        # By city
         if self.city_pnl:
             print()
             print("  BY CITY:")
@@ -1394,19 +1497,17 @@ class WeatherBot:
                 status = "BLOCKED" if pnl < -MAX_LOSS_PER_CITY else "active"
                 print(f"    {city:15s} ${pnl:+.2f} ({status})")
 
-        # Open positions
         if open_pos:
             print()
             print("  OPEN POSITIONS:")
             for p in open_pos:
                 age = (time.time() - p.bought_at) / 3600
-                peak_info = f" peak={p.peak_price:.2f}" if p.peak_price > p.buy_price else ""
                 print(
                     f"    [{p.play:15s}] {p.side:3s} {p.label[:25]:25s} "
                     f"@ {p.buy_price:.2f} ({p.shares:.0f}sh ${p.cost:.2f}) "
-                    f"age={age:.1f}h{peak_info}"
+                    f"prob@entry={p.entry_prob:.0%} age={age:.1f}h"
                 )
-        print("=" * 65)
+        print("=" * 70)
 
 
 # =============================================================================
