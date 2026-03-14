@@ -43,6 +43,12 @@ pub struct PaperPosition {
     pub secs_left:     f64,  // seconds left at entry
     pub entry_ts:      f64,
     pub window_end:    u64,  // unix timestamp when window closes
+    // What-if filter data captured at entry
+    pub cl_momentum:          f64,
+    pub book_imbal:           f64,
+    pub blocked_by_momentum:  bool,
+    pub blocked_by_bookimbal: bool,
+    pub blocked_by_both:      bool,
 }
 
 // ── Trade log entry ───────────────────────────────────────────────────────────
@@ -68,6 +74,12 @@ pub struct TradeLog {
     pub entry_ts:      f64,
     pub exit_ts:       f64,
     pub hold_secs:     f64,
+    // What-if filter fields: would this trade have been blocked?
+    pub cl_momentum:          f64,    // CL momentum at entry (raw value)
+    pub book_imbal:           f64,    // book imbalance at entry (raw value)
+    pub blocked_by_momentum:  bool,   // would momentum filter have blocked this?
+    pub blocked_by_bookimbal: bool,   // would book imbalance filter have blocked this?
+    pub blocked_by_both:      bool,   // would BOTH filters together have blocked this?
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -205,6 +217,19 @@ impl ConfigRunner {
         let now = sig.ts;
         let trade_id = format!("{}-{}-{:.0}", sig.slug, self.config.name, now * 1000.0);
 
+        // What-if filters: would momentum/book_imbal have blocked this entry?
+        let momentum_confirms = match side {
+            Side::Yes => sig.cl_momentum >= 0.0,   // YES needs CL going UP
+            Side::No  => sig.cl_momentum <= 0.0,   // NO needs CL going DOWN
+        };
+        let book_confirms = match side {
+            Side::Yes => sig.book_imbal >= 0.7,     // YES: don't enter if heavily bearish book
+            Side::No  => sig.book_imbal <= 1.5,     // NO: don't enter if heavily bullish book
+        };
+        let blocked_by_momentum  = !momentum_confirms;
+        let blocked_by_bookimbal = !book_confirms;
+        let blocked_by_both      = blocked_by_momentum || blocked_by_bookimbal;
+
         let pos = PaperPosition {
             trade_id:      trade_id.clone(),
             slug:          sig.slug.clone(),
@@ -217,6 +242,11 @@ impl ConfigRunner {
             secs_left:     sig.secs_left,
             entry_ts:      now,
             window_end,
+            cl_momentum:   sig.cl_momentum,
+            book_imbal:    sig.book_imbal,
+            blocked_by_momentum,
+            blocked_by_bookimbal,
+            blocked_by_both,
         };
 
         info!(
@@ -353,6 +383,11 @@ impl ConfigRunner {
             entry_ts:      pos.entry_ts,
             exit_ts,
             hold_secs:     exit_ts - pos.entry_ts,
+            cl_momentum:          pos.cl_momentum,
+            book_imbal:           pos.book_imbal,
+            blocked_by_momentum:  pos.blocked_by_momentum,
+            blocked_by_bookimbal: pos.blocked_by_bookimbal,
+            blocked_by_both:      pos.blocked_by_both,
         };
 
         // Write to JSONL log
@@ -432,6 +467,7 @@ mod tests {
             depth_yes: 100.0, depth_no: 100.0,
             bid_yes: book_yes - 0.01, bid_no: book_no - 0.01,
             edge_fill_yes: ey, edge_fill_no: en,
+            cl_momentum: 0.0, book_imbal: 1.0,
             ts,
         }
     }

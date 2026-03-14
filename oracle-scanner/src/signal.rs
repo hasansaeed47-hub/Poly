@@ -58,6 +58,8 @@ pub struct Signal {
     pub bid_no:      f64,         // best bid for NO  (exit price)
     pub edge_fill_yes: f64,       // fair_yes - fill_yes (realistic edge)
     pub edge_fill_no:  f64,       // fair_no  - fill_no  (realistic edge)
+    pub cl_momentum:   f64,       // CL price change over last 30s (positive = UP)
+    pub book_imbal:    f64,       // bid_depth / ask_depth ratio (>1 = bullish)
     pub ts:          f64,         // unix timestamp of this signal
 }
 
@@ -134,6 +136,7 @@ pub fn compute(
     book_yes:   &BookData,
     book_no:    &BookData,
     stake:      f64,   // USD stake for VWAP fill calculation
+    cl_momentum: f64,
     ts:         f64,
 ) -> Option<Signal> {
     // Guard: need valid inputs
@@ -165,6 +168,11 @@ pub fn compute(
     // Total depth (USD) available
     let depth_yes: f64 = book_yes.asks.iter().map(|l| l.price * l.size).sum();
     let depth_no:  f64 = book_no.asks.iter().map(|l| l.price * l.size).sum();
+
+    // Book imbalance: YES bid depth / YES ask depth (>1 = market is bullish)
+    let bid_depth_yes: f64 = book_yes.bids.iter().map(|l| l.price * l.size).sum();
+    let ask_depth_yes: f64 = depth_yes.max(0.01);
+    let book_imbal = bid_depth_yes / ask_depth_yes;
 
     // Determine best side using REALISTIC fill edge
     let best_side = if edge_fill_yes > edge_fill_no && edge_fill_yes > 0.0 {
@@ -207,6 +215,8 @@ pub fn compute(
         bid_no:    book_no.best_bid,
         edge_fill_yes,
         edge_fill_no,
+        cl_momentum,
+        book_imbal,
         ts,
     })
 }
@@ -255,7 +265,7 @@ mod tests {
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 100.5, 0.001, 300.0,
-            &by, &bn, 5.0, 0.0,
+            &by, &bn, 5.0, 0.0, 0.0,
         ).unwrap();
         assert!(sig.edge_yes > 0.0, "expected positive edge_yes, got {}", sig.edge_yes);
         assert_eq!(sig.best_side, Some(Side::Yes));
@@ -269,7 +279,7 @@ mod tests {
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 99.5, 0.001, 300.0,
-            &by, &bn, 5.0, 0.0,
+            &by, &bn, 5.0, 0.0, 0.0,
         ).unwrap();
         assert!(sig.edge_no > 0.0, "expected positive edge_no, got {}", sig.edge_no);
         assert_eq!(sig.best_side, Some(Side::No));
@@ -284,7 +294,7 @@ mod tests {
         let sig = compute(
             "btc-updown-5m-test", "btc", 5,
             100.0, 100.5, 0.001, 300.0,
-            &by, &bn, 5.0, 0.0,
+            &by, &bn, 5.0, 0.0, 0.0,
         ).unwrap();
         assert!(sig.best_edge < 0.001, "expected ~0 edge, got {}", sig.best_edge);
     }

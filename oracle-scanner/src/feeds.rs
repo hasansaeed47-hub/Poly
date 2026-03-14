@@ -217,8 +217,8 @@ pub fn build_slug(asset: &str, tf_mins: u32, window_start: u64) -> String {
 pub fn current_window_starts(tf_mins: u32, now_secs: u64) -> Vec<u64> {
     let interval = (tf_mins as u64) * 60;
     let current  = (now_secs / interval) * interval;
-    // Return current and next window (next may not have markets yet but safe to try)
-    vec![current, current + interval]
+    // Only return current window — entering the NEXT window early caused duplicate positions
+    vec![current]
 }
 
 /// Fetch market metadata for one slug from Gamma API
@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn current_window_starts_5m() {
         let starts = current_window_starts(5, 1772788230);
+        assert_eq!(starts.len(), 1);
         assert_eq!(starts[0], 1772788200);
-        assert_eq!(starts[1], 1772788500);
     }
 }

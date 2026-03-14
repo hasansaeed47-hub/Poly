@@ -367,11 +367,30 @@ async fn main() -> Result<()> {
                 }
             };
 
+            // CL momentum: price change over last 30s
+            let cl_momentum = {
+                let hist = price_history.get(&meta.asset);
+                match hist {
+                    Some(h) => {
+                        let cutoff = now - 30.0;
+                        let old_price = h.iter()
+                            .filter(|(ts, _)| *ts <= cutoff)
+                            .last()
+                            .map(|(_, p)| *p);
+                        match old_price {
+                            Some(old) if old > 0.0 => (cl - old) / old,
+                            _ => 0.0,
+                        }
+                    }
+                    None => 0.0,
+                }
+            };
+
             // Compute signal ONCE — shared across all runners
             let sig = match compute(
                 slug, &meta.asset, meta.tf,
                 meta.open_price, cl, sigma, secs_left,
-                &bd_yes, &bd_no, cfg.paper.stake, now,
+                &bd_yes, &bd_no, cfg.paper.stake, cl_momentum, now,
             ) {
                 Some(s) => s,
                 None    => continue,
