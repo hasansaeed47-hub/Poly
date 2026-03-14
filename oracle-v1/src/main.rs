@@ -157,6 +157,7 @@ async fn main() -> Result<()> {
     let exec = execution::ExecutionLayer::new(
         &private_key,
         &funder_address,
+        &cfg.feed.clob_rest,
     ).await.context("Execution layer init failed")?;
     let exec = Arc::new(exec);
 
@@ -266,14 +267,26 @@ async fn main() -> Result<()> {
     let mut settled: HashMap<String, bool> = HashMap::new();
     let mut cl_close_snap: HashMap<String, f64> = HashMap::new(); // V6 FIX #3
 
-    // ── Graceful shutdown handler ──────────────────────────────────────────
+    // ── Graceful shutdown handler (SIGINT + SIGTERM) ────────────────────────
     let shutdown = Arc::new(AtomicBool::new(false));
     {
         let shutdown = shutdown.clone();
         let exec = exec.clone();
         tokio::spawn(async move {
-            let _ = tokio::signal::ctrl_c().await;
-            warn!("SIGINT/SIGTERM received — cancelling all orders and shutting down...");
+            // Listen for both SIGINT (Ctrl+C) and SIGTERM (systemctl stop)
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate()
+            ).expect("failed to register SIGTERM handler");
+
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    warn!("SIGINT received — cancelling all orders...");
+                }
+                _ = sigterm.recv() => {
+                    warn!("SIGTERM received — cancelling all orders...");
+                }
+            }
+
             shutdown.store(true, Ordering::SeqCst);
             match exec.cancel_all().await {
                 Ok(_)  => info!("[SHUTDOWN] All orders cancelled"),

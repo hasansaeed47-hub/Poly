@@ -210,8 +210,12 @@ pub async fn fetch_market_meta(
     let no_idx = outcomes.iter().position(|o| o.eq_ignore_ascii_case("down"))
         .ok_or_else(|| anyhow!("no Down outcome"))?;
 
-    let token_yes = tokens[yes_idx].clone();
-    let token_no  = tokens[no_idx].clone();
+    let token_yes = tokens.get(yes_idx)
+        .ok_or_else(|| anyhow!("yes_idx {} out of bounds (tokens len={})", yes_idx, tokens.len()))?
+        .clone();
+    let token_no = tokens.get(no_idx)
+        .ok_or_else(|| anyhow!("no_idx {} out of bounds (tokens len={})", no_idx, tokens.len()))?
+        .clone();
 
     let condition_id = market.condition_id.clone().unwrap_or_default();
 

@@ -68,14 +68,14 @@ fn dec_size(val: f64) -> Result<Decimal> {
 
 impl ExecutionLayer {
     /// Initialize the execution layer with private key and optional funder address.
-    pub async fn new(private_key: &str, funder_address: &str) -> Result<Self> {
+    pub async fn new(private_key: &str, funder_address: &str, clob_url: &str) -> Result<Self> {
         let signer = private_key.parse::<PrivateKeySigner>()
             .map_err(|e| anyhow!("Invalid private key: {}", e))?
             .with_chain_id(Some(POLYGON));
 
         info!("[EXEC] Wallet address: {:?}", signer.address());
 
-        let mut auth_builder = ClobClient::new("https://clob.polymarket.com", ClobConfig::default())?
+        let mut auth_builder = ClobClient::new(clob_url, ClobConfig::default())?
             .authentication_builder(&signer);
 
         // If funder address is provided, use Poly proxy signature type
@@ -157,6 +157,13 @@ impl ExecutionLayer {
                         warn!("[EXEC] Cross detected, will retry lower");
                         return Err(anyhow!("CROSS:{}", err_msg));
                     }
+                }
+
+                // Reject if the exchange did not accept the order
+                if !resp.success {
+                    let msg = resp.error_msg.clone().unwrap_or_default();
+                    warn!("[EXEC] GTC order rejected: {} status={:?}", msg, resp.status);
+                    return Err(anyhow!("GTC rejected: {}", msg));
                 }
 
                 // Matched = immediately filled; Live = posted on book (maker)
@@ -371,6 +378,7 @@ impl ExecutionLayer {
                 }
                 // Order is live but not filled — need to chase
                 let mut last_oid = result.order_id.clone();
+                let mut cancel_failed = false;
 
                 // Step 2: Chase N ticks
                 for tick_num in 1..=max_chase_ticks {
@@ -382,8 +390,10 @@ impl ExecutionLayer {
                             // Cancel confirmed — safe to repost at new price
                         }
                         Err(e) => {
-                            // Cancel failed — do NOT repost, could double-fill
-                            warn!("[EXEC] Cancel failed for {}: {} — keeping old order", last_oid, e);
+                            // Cancel failed — order may have been filled already.
+                            // Do NOT repost and do NOT fall through to taker.
+                            warn!("[EXEC] Cancel failed for {}: {} — order may be filled", last_oid, e);
+                            cancel_failed = true;
                             break;
                         }
                     }
@@ -417,8 +427,21 @@ impl ExecutionLayer {
                     }
                 }
 
+                // If cancel failed, the order may already be filled — do NOT place taker
+                if cancel_failed {
+                    return Err(anyhow!("Chase aborted: cancel failed, order may be filled"));
+                }
+
                 // Cancel the last outstanding maker order before taker attempt
-                let _ = self.cancel_order(&last_oid).await;
+                match self.cancel_order(&last_oid).await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // Last cancel failed — order may have filled during chase.
+                        // Do NOT proceed to taker to avoid double position.
+                        warn!("[EXEC] Final chase cancel failed: {} — aborting taker", e);
+                        return Err(anyhow!("Chase aborted: final cancel failed, order may be filled"));
+                    }
+                }
 
                 // Step 3: Fall through to taker
                 info!("[EXEC] Maker chase exhausted, taker fill at ask={:.2}", best_ask);
