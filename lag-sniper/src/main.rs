@@ -104,6 +104,7 @@ struct StrategyConfigFile {
     min_profit:         f64,
     partial_tp_pct:     f64,
     taker_fee_rate:     f64,
+    max_drawdown:       f64,
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -142,10 +143,10 @@ async fn main() -> Result<()> {
     info!("Lag: div>={:.3}% edge>={:.2} gap>={:.2} momentum>={:.4}",
         cfg.lag.min_divergence_pct, cfg.lag.min_edge, cfg.lag.min_fair_gap,
         cfg.lag.min_bn_momentum);
-    info!("Strategy: stake=${} chase={}ticks hold<{}s profit>={:.2} max_pos={}",
+    info!("Strategy: stake=${} chase={}ticks hold<{}s profit>={:.2} max_pos={} max_dd=${}",
         cfg.strategy.stake, cfg.strategy.maker_chase_ticks,
         cfg.strategy.max_hold_secs, cfg.strategy.min_profit,
-        cfg.strategy.max_concurrent);
+        cfg.strategy.max_concurrent, cfg.strategy.max_drawdown);
 
     // ── Wallet keys ─────────────────────────────────────────────────────────
 
@@ -288,6 +289,7 @@ async fn main() -> Result<()> {
         min_profit:         cfg.strategy.min_profit,
         partial_tp_pct:     cfg.strategy.partial_tp_pct,
         taker_fee_rate:     cfg.strategy.taker_fee_rate,
+        max_drawdown:       cfg.strategy.max_drawdown,
     };
     let mut runner = LagRunner::new(runner_config, exec.clone(), "logs");
 
@@ -545,6 +547,14 @@ async fn main() -> Result<()> {
                     &meta.token_yes, &meta.token_no,
                 ).await;
             }
+        }
+
+        // ── DD kill switch → full shutdown when positions drained ────────
+
+        if runner.is_dd_halted() && runner.open_count() == 0 {
+            warn!("[MAIN] DD halt + no open positions → shutting down");
+            runner.print_stats();
+            break;
         }
 
         // ── Stats (every 30s) ───────────────────────────────────────────

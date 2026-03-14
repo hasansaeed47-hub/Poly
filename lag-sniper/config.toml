@@ -46,3 +46,4 @@ max_hold_secs      = 30.0    # exit if lag doesn't close in 30s
 min_profit         = 0.03    # 3 cents to trigger take-profit
 partial_tp_pct     = 0.50    # sell 50% on first TP, hold rest
 taker_fee_rate     = 0.015   # 1.5% for emergency taker exits
+max_drawdown       = 25.0    # kill switch: halt all entries if net PnL drops below -$25

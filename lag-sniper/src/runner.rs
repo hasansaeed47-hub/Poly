@@ -109,6 +109,7 @@ pub struct RunnerConfig {
     pub min_profit:         f64,   // cents profit to trigger early TP
     pub partial_tp_pct:     f64,   // fraction to sell on first TP
     pub taker_fee_rate:     f64,   // for emergency exits
+    pub max_drawdown:       f64,   // kill switch: halt entries if net_pnl < -max_drawdown
 }
 
 // ── Runner ──────────────────────────────────────────────────────────────────
@@ -119,6 +120,7 @@ pub struct LagRunner {
     positions:     HashMap<String, LagPosition>,
     stats:         RunnerStats,
     log_file:      Arc<Mutex<File>>,
+    dd_halted:     bool,
 }
 
 impl LagRunner {
@@ -137,6 +139,7 @@ impl LagRunner {
             positions: HashMap::new(),
             stats: RunnerStats::default(),
             log_file: Arc::new(Mutex::new(file)),
+            dd_halted: false,
         }
     }
 
@@ -239,6 +242,11 @@ impl LagRunner {
         token_no: &str,
     ) {
         self.stats.signals += 1;
+
+        // DD kill switch — no new entries
+        if self.dd_halted {
+            return;
+        }
 
         // Max concurrent positions cap
         if self.positions.len() >= self.config.max_concurrent {
@@ -474,9 +482,25 @@ impl LagRunner {
         self.write_log(&log).await;
 
         info!(
-            "[LAG_RUNNER] CLOSE {} {} exit={:.3} reason={} pnl={:+.3} hold={:.1}s",
-            log.slug, log.side, exit_price, reason, pnl, log.hold_secs
+            "[LAG_RUNNER] CLOSE {} {} exit={:.3} reason={} pnl={:+.3} hold={:.1}s net={:+.2}",
+            log.slug, log.side, exit_price, reason, pnl, log.hold_secs, self.stats.net_pnl
         );
+
+        // DD kill switch check
+        if self.config.max_drawdown > 0.0 && self.stats.net_pnl <= -self.config.max_drawdown {
+            if !self.dd_halted {
+                self.dd_halted = true;
+                warn!(
+                    "[LAG_RUNNER] DD KILL SWITCH — net={:+.2} breached max_dd=${:.0}. No new entries.",
+                    self.stats.net_pnl, self.config.max_drawdown
+                );
+                // Cancel all outstanding orders
+                match self.exec.cancel_all().await {
+                    Ok(_)  => info!("[LAG_RUNNER] DD halt: all orders cancelled"),
+                    Err(e) => warn!("[LAG_RUNNER] DD halt: cancel failed: {}", e),
+                }
+            }
+        }
     }
 
     async fn write_log(&self, log: &TradeLog) {
@@ -489,6 +513,10 @@ impl LagRunner {
     #[allow(dead_code)]
     pub fn open_count(&self) -> usize {
         self.positions.len()
+    }
+
+    pub fn is_dd_halted(&self) -> bool {
+        self.dd_halted
     }
 
     pub fn print_stats(&self) {
