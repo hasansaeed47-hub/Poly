@@ -665,18 +665,21 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 name = "arb_final"
 version = "1.0.0"
 dependencies = [
+ "alloy",
  "anyhow",
  "dashmap 5.5.3",
  "dotenvy",
+ "futures-util",
  "polymarket-client-sdk",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "sniper_final",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -4021,31 +4024,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sniper_final"
-version = "1.0.0"
-dependencies = [
- "alloy",
- "anyhow",
- "chrono",
- "dashmap 5.5.3",
- "dotenvy",
- "futures-util",
- "polymarket-client-sdk",
- "reqwest 0.12.28",
- "rust_decimal",
- "rust_decimal_macros",
- "serde",
- "serde_json",
- "tokio",
- "tokio-retry",
- "tokio-tungstenite",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "socket2"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4365,17 +4343,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbae76ab933c85776efabc971569dd6119c580d8f5d448769dec1764bf796ef2"
 dependencies = [
  "native-tls",
- "tokio",
-]
-
-[[package]]
-name = "tokio-retry"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f57eb36ecbe0fc510036adff84824dd3c24bb781e21bfa67b69d556aa85214f"
-dependencies = [
- "pin-project",
- "rand 0.8.5",
  "tokio",
 ]
 

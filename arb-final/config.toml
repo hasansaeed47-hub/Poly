@@ -9,7 +9,7 @@ assets     = ["btc", "eth", "sol", "xrp"]
 timeframes = [15, 60]    # 15m + 60m only (no 5m — too little time)
 clob_rest  = "https://clob.polymarket.com"
 clob_ws    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-live_ws    = "wss://live-data-ws.polymarket.com/ws"
+live_ws    = "wss://ws-live-data.polymarket.com"
 gamma_api  = "https://gamma-api.polymarket.com"
 bn_ws      = "wss://stream.binance.com:9443/ws"
 rest_throttle_ms = 500
@@ -29,7 +29,7 @@ maker_timeout_secs = 30.0   # cancel unfilled maker order after this
 
 # Trend filter: |CL delta from open| > threshold = trending market
 # BTC base value, auto-scaled by asset stdev (ETH 1.16x, SOL 1.48x, XRP 2.63x)
-trend_threshold_pct = 0.08
+trend_threshold_pct = 0.15
 
 # Phase timing (seconds)
 observe_secs_15m  = 120.0   # 2 min warmup before entries (15m windows)

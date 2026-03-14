@@ -5,24 +5,17 @@
 ///
 /// Core rules:
 ///   1. Matched sets: max 1 unmatched unit at any time
-///   2. Trend filter: skip trending markets (use directional strategy instead)
+///   2. Trend filter: skip trending markets (directional move = bad for arb)
 ///   3. Maker only: zero entry fees
 ///   4. Sequential: one order at a time globally
 ///   5. Entry condition: keep avg(YES) + avg(NO) < max_pair_cost ($0.98)
 ///   6. Max $10 exposure per window; merged pairs free up capital
-///   7. 15m + 60m markets (no 5m)
+///   7. 15m + 60m markets only
 
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
 // -- Helpers ------------------------------------------------------------------
-
-/// Polymarket taker fee: px * (1 - px) * 0.0625. Maker = 0.
-/// Needed for potential taker exits (selling unmatched shares in lockdown).
-#[allow(dead_code)]
-pub fn pm_fee(px: f64) -> f64 {
-    px * (1.0 - px) * 0.0625
-}
 
 const STDEV_BASE: f64 = 0.167;
 
@@ -226,22 +219,10 @@ impl ArbBook {
         self.yes_fills != self.no_fills
     }
 
-    /// Which side is unmatched (ahead)? Used for directional strategy handoff.
-    #[allow(dead_code)]
-    pub fn unmatched_side(&self) -> Option<Side> {
-        if self.yes_fills > self.no_fills {
-            Some(Side::Yes)
-        } else if self.no_fills > self.yes_fills {
-            Some(Side::No)
-        } else {
-            None
-        }
-    }
-
     // -- Matched sets constraint ----------------------------------------------
 
     /// Which sides are allowed for the next buy?
-    /// Balanced → either. Imbalanced → must buy the lagging side.
+    /// Balanced -> either. Imbalanced -> must buy the lagging side.
     pub fn allowed_sides(&self) -> Vec<Side> {
         if self.yes_fills == self.no_fills {
             vec![Side::Yes, Side::No]
@@ -264,12 +245,11 @@ impl ArbBook {
         // In lockdown, only allow completing an unmatched pair
         if self.phase == ArbPhase::Lockdown {
             if !self.has_unmatched() { return false; }
-            // Can only buy the side we need
             let needed = if self.yes_fills > self.no_fills { Side::No } else { Side::Yes };
             if side != needed { return false; }
         }
 
-        // Trending → skip arb
+        // Trending -> skip arb
         if self.is_trending { return false; }
 
         // Matched sets
@@ -383,7 +363,6 @@ impl ArbBook {
         };
 
         ArbSettlement {
-            slug: self.slug.clone(),
             asset: self.asset.clone(),
             tf: self.tf,
             pairs_complete: self.pairs_complete(),
@@ -422,8 +401,6 @@ impl ArbBook {
 
 #[derive(Debug)]
 pub struct ArbSettlement {
-    #[allow(dead_code)]
-    pub slug:               String,
     pub asset:              String,
     pub tf:                 u32,
     pub pairs_complete:     u32,
@@ -560,12 +537,12 @@ mod tests {
         let mut b = test_book(15);
         b.record_fill(Side::Yes, 0.45, 4.44, 2.0);
         let nar_one_side = b.net_at_risk();
-        assert!((nar_one_side - 2.0).abs() < 0.01); // $2 at risk
+        assert!((nar_one_side - 2.0).abs() < 0.01);
 
         b.record_fill(Side::No, 0.48, 4.17, 2.0);
         let nar_paired = b.net_at_risk();
-        assert!(nar_paired < nar_one_side); // Risk decreased after matching
-        assert!(nar_paired < 0.5); // Should be near 0 or negative
+        assert!(nar_paired < nar_one_side);
+        assert!(nar_paired < 0.5);
     }
 
     #[test]
@@ -577,40 +554,43 @@ mod tests {
 
         b.record_fill(Side::Yes, 0.45, 4.44, 2.0);
         b.yes_fills = 1;
-        // YES ahead — can only buy NO
         assert!(!b.can_buy(Side::Yes, 0.45, &cfg));
         assert!(b.can_buy(Side::No, 0.48, &cfg));
 
         b.record_fill(Side::No, 0.48, 4.17, 2.0);
         b.no_fills = 1;
-        // Balanced again
         assert!(b.can_buy(Side::Yes, 0.45, &cfg));
         assert!(b.can_buy(Side::No, 0.48, &cfg));
     }
 
     #[test]
     fn exposure_cap() {
-        let cfg = test_cfg();
         let mut b = test_book(15);
-        // Fill 4 YES units + 4 NO units = $16 spent, but matched shares reduce NAR
         for _ in 0..4 {
             b.record_fill(Side::Yes, 0.45, 4.44, 2.0);
             b.yes_fills += 1;
             b.record_fill(Side::No, 0.48, 4.17, 2.0);
             b.no_fills += 1;
         }
-        // NAR should be very low (pairs matched), so more buying possible
         assert!(b.net_at_risk() < 2.0);
     }
 
     #[test]
     fn pair_cost_rejects_expensive() {
         let cfg = test_cfg();
+        let b = test_book(15);
+        assert!(b.can_buy(Side::Yes, 0.50, &cfg)); // at max_ask boundary
+        assert!(!b.can_buy(Side::Yes, 0.51, &cfg)); // over max_ask
+    }
+
+    #[test]
+    fn pair_cost_rejects_above_threshold() {
+        let cfg = test_cfg();
         let mut b = test_book(15);
-        // YES at 0.50 — max_ask boundary
-        assert!(b.can_buy(Side::Yes, 0.50, &cfg));
-        // YES at 0.51 — over max_ask
-        assert!(!b.can_buy(Side::Yes, 0.51, &cfg));
+        // YES at 0.50, NO at 0.49 → pair_cost = 0.99 > 0.98
+        b.record_fill(Side::Yes, 0.50, 4.0, 2.0);
+        b.yes_fills = 1;
+        assert!(!b.can_buy(Side::No, 0.49, &cfg)); // would exceed max_pair_cost
     }
 
     #[test]
@@ -631,11 +611,9 @@ mod tests {
 
         let s = b.settle();
         assert!(s.matched_pnl > 0.0);
-        assert!(s.unmatched_yes_shares < 0.5); // small unmatched remainder
-        // Total P&L should be positive regardless of winner
+        assert!(s.unmatched_yes_shares < 0.5);
         let pnl_up = s.final_pnl("UP");
         let pnl_down = s.final_pnl("DOWN");
-        // Both should be close to matched_pnl (unmatched is small)
         assert!(pnl_up > 0.0 || pnl_down > 0.0);
     }
 
@@ -653,20 +631,51 @@ mod tests {
         b.phase = ArbPhase::Observing;
         b.cl_open = 100000.0;
 
-        // Before observation period
         b.update_phase(b.window_start as f64 + 60.0, &cfg);
         assert_eq!(b.phase, ArbPhase::Observing);
 
-        // After observation period
         b.update_phase(b.window_start as f64 + 130.0, &cfg);
         assert_eq!(b.phase, ArbPhase::Active);
 
-        // Near window end (lockdown)
         b.update_phase(b.window_end as f64 - 80.0, &cfg);
         assert_eq!(b.phase, ArbPhase::Lockdown);
 
-        // Past window end
         b.update_phase(b.window_end as f64 + 1.0, &cfg);
         assert_eq!(b.phase, ArbPhase::Settled);
+    }
+
+    #[test]
+    fn trend_detection_scales_by_asset() {
+        let cfg = test_cfg();
+
+        let mut btc = test_book(15);
+        btc.cl_open = 100000.0;
+        btc.check_trend(100100.0, &cfg); // +0.1% > 0.08% threshold
+        assert!(btc.is_trending);
+
+        let mut sol = test_book(15);
+        sol.asset = "sol".into();
+        sol.cl_open = 100.0;
+        sol.check_trend(100.10, &cfg); // +0.1% vs 0.08*1.48=0.118% threshold
+        assert!(!sol.is_trending); // SOL needs bigger move due to stdev scaling
+    }
+
+    #[test]
+    fn lockdown_only_completes_pairs() {
+        let cfg = test_cfg();
+        let mut b = test_book(15);
+        b.phase = ArbPhase::Lockdown;
+
+        // No unmatched — cannot buy anything
+        assert!(!b.can_buy(Side::Yes, 0.45, &cfg));
+        assert!(!b.can_buy(Side::No, 0.45, &cfg));
+
+        // Create imbalance
+        b.record_fill(Side::Yes, 0.45, 4.44, 2.0);
+        b.yes_fills = 1;
+
+        // Can only buy the lagging side
+        assert!(!b.can_buy(Side::Yes, 0.45, &cfg));
+        assert!(b.can_buy(Side::No, 0.48, &cfg));
     }
 }

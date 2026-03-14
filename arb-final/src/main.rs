@@ -6,12 +6,15 @@
 ///   3. Market discovery: Gamma API for 15m + 60m updown markets
 ///   4. One global ArbTracker: sequential maker-only orders
 ///   5. Matched sets with $10 max exposure per window
-///   6. Trend filter: skip trending, log for directional strategy
+///   6. Trend filter: skip trending markets (enter only non-directional)
 ///   7. Merged pairs free capital for re-entry within same window
 ///
 /// Paper mode by default (no private key = no live orders).
 
 mod arb;
+mod feeds;
+mod order;
+mod wallet;
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
@@ -27,13 +30,13 @@ use serde::Deserialize;
 use tracing::{info, warn, debug};
 use tracing_subscriber::EnvFilter;
 
-use sniper_final::feeds::{
+use feeds::{
     BookState, BnHistory, BnPrices, ClPrices, ClSnapshots, RateLimiter,
     build_slug, cl_at, current_window_starts, fetch_books_batch, fetch_market_meta,
     run_bn_feed, run_book_feed, run_cl_feed, MarketMeta,
 };
-use sniper_final::order::{ClobClient, ProxyConfig};
-use sniper_final::wallet::Wallet;
+use order::{ClobClient, ProxyConfig};
+use wallet::Wallet;
 
 use arb::{
     ArbBook, ArbConfig, ArbPhase, ArbTradeLog, PendingOrder, Side,
@@ -202,7 +205,6 @@ async fn main() -> Result<()> {
     info!("=======================================================");
 
     std::fs::create_dir_all("logs").context("cannot create logs/")?;
-    let mut event_log = open_log("logs/arb_events.jsonl");
     let mut trade_log = open_log("logs/arb_trades.jsonl");
 
     // -- Shared state ---------------------------------------------------------
@@ -303,9 +305,34 @@ async fn main() -> Result<()> {
 
     let max_open_delay = cfg.feed.max_open_delay;
 
+    // -- Shutdown signal ------------------------------------------------------
+
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let s = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Shutdown signal received — flushing logs...");
+            s.store(true, Ordering::Relaxed);
+        });
+    }
+
     // -- Main loop ------------------------------------------------------------
 
     loop {
+        if shutdown.load(Ordering::Relaxed) {
+            let _ = trade_log.flush();
+            info!("=======================================================");
+            info!("  SHUTDOWN — pairs={} cum_pnl=${:+.2}", total_pairs, cum_pnl);
+            for (slug, book) in &arb_books {
+                if book.yes_fills > 0 || book.no_fills > 0 {
+                    info!("  {} {}", slug, book.status());
+                }
+            }
+            info!("=======================================================");
+            break;
+        }
+
         let sleep_ms = if pending_order.is_some() {
             cfg.scan.tick_ms      // faster ticks when order pending
         } else {
@@ -362,9 +389,12 @@ async fn main() -> Result<()> {
             let elapsed = now - po.posted_at;
             let book_ask = book_state.get(&po.token_id).map(|b| b.best_ask).unwrap_or(0.0);
 
-            // Paper mode fill simulation: ask <= our limit price for 2+ ticks
-            // (In live mode, would check CLOB order status instead)
-            let filled = book_ask > 0.0 && book_ask <= po.price;
+            // Paper mode fill simulation: maker order fills when ask drops to
+            // or near our limit price. After 1s, assume fill if ask is within
+            // 1 tick (0.01) of our limit — simulates normal market-maker flow.
+            let filled = elapsed >= 1.0
+                && book_ask > 0.0
+                && book_ask <= po.price + 0.01;
             let timed_out = elapsed >= arb_cfg.maker_timeout_secs;
 
             if filled {
@@ -437,7 +467,6 @@ async fn main() -> Result<()> {
                 if now < meta.window_start as f64 { continue; }
                 let delay = now - meta.window_start as f64;
                 if delay > max_open_delay {
-                    // Missed — try to recover from CL snapshots
                     if let Some(px) = cl_at(&cl_snapshots, &meta.asset, meta.window_start as i64) {
                         if px > 0.0 {
                             book.cl_open = px;
@@ -548,7 +577,7 @@ async fn main() -> Result<()> {
         // -- Find best entry opportunity (if no pending order) ----------------
 
         if pending_order.is_none() {
-            let mut best: Option<(String, Side, f64, f64)> = None; // (slug, side, ask, projected_pair_cost)
+            let mut best: Option<(String, Side, f64, f64)> = None; // (slug, side, ask, priority)
 
             for (slug, book) in &arb_books {
                 if book.phase != ArbPhase::Active && book.phase != ArbPhase::Lockdown {
@@ -606,63 +635,64 @@ async fn main() -> Result<()> {
 
             // Post maker order for best opportunity
             if let Some((slug, side, ask, _priority)) = best {
-                let book = arb_books.get(&slug).unwrap();
-                let token_id = match side {
-                    Side::Yes => book.token_yes.clone(),
-                    Side::No  => book.token_no.clone(),
-                };
-
                 let limit_px = maker_limit_price(ask);
-                if limit_px < arb_cfg.min_ask { continue; } // skip if price too low
 
-                let shares = arb_cfg.unit_size / limit_px;
+                // Skip if maker price falls below minimum (don't break main loop)
+                if limit_px >= arb_cfg.min_ask {
+                    let book = arb_books.get(&slug).unwrap();
+                    let token_id = match side {
+                        Side::Yes => book.token_yes.clone(),
+                        Side::No  => book.token_no.clone(),
+                    };
 
-                info!("[ARB] POST {} {} @{:.3} (ask={:.3}) {:.0} shares ${:.2} | {}",
-                    side, slug, limit_px, ask, shares, arb_cfg.unit_size,
-                    book.status());
+                    let shares = arb_cfg.unit_size / limit_px;
 
-                // Place live order if wallet configured
-                if let Some(ref clob) = clob_client {
-                    let c = clob.clone();
-                    let tid = token_id.clone();
-                    let px = limit_px;
-                    let sz = shares;
-                    let s = slug.clone();
-                    tokio::spawn(async move {
-                        match c.place_limit_order(&tid, px, sz, "BUY").await {
-                            Ok(resp) => info!("[CLOB] BUY placed for {}: {:?}", s, resp),
-                            Err(e) => warn!("[CLOB] BUY failed for {} (px={} sz={}): {:#}", s, px, sz, e),
-                        }
+                    info!("[ARB] POST {} {} @{:.3} (ask={:.3}) {:.0} shares ${:.2} | {}",
+                        side, slug, limit_px, ask, shares, arb_cfg.unit_size,
+                        book.status());
+
+                    // Place live order if wallet configured
+                    if let Some(ref clob) = clob_client {
+                        let c = clob.clone();
+                        let tid = token_id.clone();
+                        let px = limit_px;
+                        let sz = shares;
+                        let s = slug.clone();
+                        tokio::spawn(async move {
+                            match c.place_limit_order(&tid, px, sz, "BUY").await {
+                                Ok(resp) => info!("[CLOB] BUY placed for {}: {:?}", s, resp),
+                                Err(e) => warn!("[CLOB] BUY failed for {} (px={} sz={}): {:#}", s, px, sz, e),
+                            }
+                        });
+                    }
+
+                    pending_order = Some(PendingOrder {
+                        slug: slug.clone(),
+                        side,
+                        token_id,
+                        price: limit_px,
+                        shares,
+                        cost: arb_cfg.unit_size,
+                        posted_at: now,
+                    });
+
+                    log_arb(&mut trade_log, &ArbTradeLog {
+                        event: "POST".into(), ts: now,
+                        slug, asset: book.asset.clone(), tf: book.tf,
+                        side: Some(side.to_string()), price: Some(limit_px),
+                        shares: Some(shares), cost: Some(arb_cfg.unit_size),
+                        yes_avg: None, no_avg: None, pair_cost: None,
+                        pairs_complete: None, net_at_risk: None,
+                        locked_profit: None, pnl: None, cl_delta_pct: None,
+                        phase: Some(format!("{:?}", book.phase)),
                     });
                 }
-
-                pending_order = Some(PendingOrder {
-                    slug: slug.clone(),
-                    side,
-                    token_id,
-                    price: limit_px,
-                    shares,
-                    cost: arb_cfg.unit_size,
-                    posted_at: now,
-                });
-
-                log_arb(&mut trade_log, &ArbTradeLog {
-                    event: "POST".into(), ts: now,
-                    slug, asset: book.asset.clone(), tf: book.tf,
-                    side: Some(side.to_string()), price: Some(limit_px),
-                    shares: Some(shares), cost: Some(arb_cfg.unit_size),
-                    yes_avg: None, no_avg: None, pair_cost: None,
-                    pairs_complete: None, net_at_risk: None,
-                    locked_profit: None, pnl: None, cl_delta_pct: None,
-                    phase: Some(format!("{:?}", book.phase)),
-                });
             }
         }
 
         // -- Flush logs -------------------------------------------------------
 
         if tick_count % 20 == 0 {
-            let _ = event_log.flush();
             let _ = trade_log.flush();
         }
 
@@ -689,10 +719,8 @@ async fn main() -> Result<()> {
                 if active_windows.is_empty() { "no active".to_string() }
                 else { format!("{} active", active_windows.len()) });
 
-            if !active_windows.is_empty() {
-                for w in &active_windows {
-                    info!("  {}", w);
-                }
+            for w in &active_windows {
+                info!("  {}", w);
             }
 
             last_stats = Instant::now();
@@ -701,17 +729,25 @@ async fn main() -> Result<()> {
         // -- Cleanup stale data (every 60s) -----------------------------------
 
         if tick_count % 120 == 0 {
-            let cutoff = now as i64 - 7200; // 2 hours
+            let cutoff = now as i64 - 7200;
             cl_opens.retain(|k, _| slug_ts(k) > cutoff);
-            arb_books.retain(|k, _| slug_ts(k) > cutoff);
+            // Protect arb_books with unmatched positions from cleanup
+            arb_books.retain(|k, b| slug_ts(k) > cutoff || b.has_unmatched());
             let stale: Vec<String> = markets.keys()
                 .filter(|k| slug_ts(k) < cutoff)
                 .cloned()
                 .collect();
-            for k in stale {
-                markets.remove(&k);
-                settled.remove(&k);
+            // Collect stale token IDs before removing markets
+            for k in &stale {
+                if let Some(meta) = markets.get(k) {
+                    token_ids.remove(&meta.token_yes);
+                    token_ids.remove(&meta.token_no);
+                }
+                markets.remove(k);
+                settled.remove(k);
             }
         }
     }
+
+    Ok(())
 }
