@@ -639,7 +639,10 @@ async fn connect_book_feed(
     book_state: &BookState,
     book_live:  &Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<()> {
-    let (mut ws, _) = connect_async(clob_ws).await.context("CLOB WS connect failed")?;
+    let (mut ws, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_async(clob_ws),
+    ).await.context("CLOB WS connect timed out")?.context("CLOB WS connect failed")?;
 
     let ids: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
     if !ids.is_empty() {
@@ -663,10 +666,17 @@ async fn connect_book_feed(
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut msg_count = 0u64;
+    let mut last_data = tokio::time::Instant::now();
+    const BOOK_STALE_TIMEOUT: Duration = Duration::from_secs(60);
 
     loop {
         tokio::select! {
             _ = ping_interval.tick() => {
+                if last_data.elapsed() > BOOK_STALE_TIMEOUT {
+                    warn!("[BOOK] Feed stale — no data for {:.0}s, forcing reconnect",
+                        last_data.elapsed().as_secs_f64());
+                    break;
+                }
                 ws.send(Message::Text("ping".into())).await?;
             }
             msg = ws.next() => {
@@ -676,6 +686,7 @@ async fn connect_book_feed(
                             continue;
                         }
 
+                        last_data = tokio::time::Instant::now();
                         msg_count += 1;
                         if msg_count <= 5 {
                             debug!("[BOOK] WS msg #{}: {}", msg_count, &text[..text.len().min(500)]);
@@ -869,15 +880,21 @@ async fn connect_bn_feed(
     let mut last_data = tokio::time::Instant::now();
     const STALE_TIMEOUT: Duration = Duration::from_secs(30);
 
-    while let Some(msg) = ws.next().await {
-        // Check for stale feed
-        if last_data.elapsed() > STALE_TIMEOUT {
-            warn!("[BN] Feed stale — no trade data for {:.0}s, forcing reconnect",
-                last_data.elapsed().as_secs_f64());
-            break;
-        }
+    let mut stale_check = tokio::time::interval(Duration::from_secs(5));
+    stale_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = stale_check.tick() => {
+                if last_data.elapsed() > STALE_TIMEOUT {
+                    warn!("[BN] Feed stale — no trade data for {:.0}s, forcing reconnect",
+                        last_data.elapsed().as_secs_f64());
+                    break;
+                }
+            }
+            msg = ws.next() => {
         match msg {
-            Ok(Message::Text(t)) => {
+            Some(Ok(Message::Text(t))) => {
                 let d: serde_json::Value = match serde_json::from_str(&t) {
                     Ok(d) => d,
                     _ => continue,
@@ -911,11 +928,18 @@ async fn connect_bn_feed(
                     }
                 }
             }
-            Ok(Message::Ping(data)) => {
+            Some(Ok(Message::Ping(data))) => {
                 let _ = ws.send(Message::Pong(data)).await;
             }
-            Err(e) => return Err(anyhow::anyhow!("BN WS error: {}", e)),
-            _ => {}
+            Some(Ok(Message::Close(frame))) => {
+                warn!("[BN] WS close frame: {:?}", frame);
+                break;
+            }
+            Some(Err(e)) => return Err(anyhow::anyhow!("BN WS error: {}", e)),
+            Some(Ok(_)) => {}
+            None => break,
+        }
+            }
         }
     }
 

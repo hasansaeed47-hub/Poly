@@ -124,3 +124,24 @@ entry_start     = 25
 taker_deadline  = 3
 min_entry       = 0.95
 max_entry       = 0.975
+
+# F: CL-lead reprice scalper — maker buy when CL leads PM, taker sell on catch-up
+# Entry T-60→T-40, force exit T-30. No settlement exposure.
+[engines.f]
+id                 = "F"
+tf                 = 0
+delta              = 0.0
+continuity         = 0
+bn_contra          = false
+cl_fade            = false
+regime             = false
+is_late_scalper    = false
+is_reprice_scalper = true
+entry_start        = 60
+taker_deadline     = 40
+min_entry          = 0.85
+max_entry          = 0.93
+exit_timeout_secs  = 30
+profit_target      = 0.02
+stop_exit_spread   = 0.03
+min_gap            = 0.03
