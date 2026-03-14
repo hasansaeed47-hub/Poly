@@ -3,7 +3,7 @@
 
 [feed]
 assets     = ["btc", "eth", "sol"]
-timeframes = [5, 15]
+timeframes = [5, 15, 60, 240]
 
 clob_rest  = "https://clob.polymarket.com"
 live_ws    = "wss://ws-live-data.polymarket.com"

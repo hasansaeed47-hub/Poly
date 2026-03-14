@@ -377,11 +377,11 @@ impl FileCache {
     fn get(&mut self, path: &str) -> std::io::Result<&mut std::fs::File> {
         if !self.handles.contains_key(path) {
             // Evict stale handles (old dates) when we open a new one
-            // Keep at most 12 handles (6 sections x 2 dates during rollover)
-            if self.handles.len() >= 12 {
+            // Keep at most 24 handles (6 sections x 2 dates during rollover + headroom)
+            if self.handles.len() >= 24 {
                 let stale: Vec<String> = self.handles.keys()
                     .filter(|k| *k != path)
-                    .take(self.handles.len() - 6)
+                    .take(self.handles.len() - 12)
                     .cloned()
                     .collect();
                 for k in stale { self.handles.remove(&k); }
@@ -1116,19 +1116,21 @@ async fn main() -> Result<()> {
             };
 
             // Set open price at window start.
-            // Only set if we're within the first 5s of the window — if we
+            // Only set if we're within the grace period of window start — if we
             // joined late (crash recovery), the CL price has drifted and using
             // it as "open" corrupts fair value. Skip the market instead.
+            // Grace period scales with timeframe: 5s for 5m, 30s for 60m, 120s for 240m.
             if meta.open_price <= 0.0 {
+                let grace_secs = (meta.tf as u64).max(5).min(120);
                 if now_u >= meta.window_start {
                     let window_age = now_u - meta.window_start;
-                    if window_age <= 5 {
+                    if window_age <= grace_secs {
                         meta.open_price = cl;
                         info!("[OPEN] {} open_price={:.2}", slug, cl);
                     } else {
                         // Joined too late — mark as settled so we don't keep retrying
-                        warn!("[OPEN] {} skipped: joined {}s late, CL has drifted",
-                            slug, window_age);
+                        warn!("[OPEN] {} skipped: joined {}s late (grace={}s), CL has drifted",
+                            slug, window_age, grace_secs);
                         settled.insert(slug.clone());
                     }
                 }
@@ -1312,6 +1314,9 @@ async fn main() -> Result<()> {
             // Fee-adjusted arb
             let yes_no_arb_net = yes_no_arb.map(|arb| arb - 2.0 * TAKER_FEE_BPS);
 
+            // Cache market flow lookup (1 DashMap hit instead of 6)
+            let mf_snap = market_flow.get(&meta.condition_id).map(|f| f.clone());
+
             // Log signal
             let log = SignalLog {
                 ts: now,
@@ -1395,13 +1400,13 @@ async fn main() -> Result<()> {
                 // Fair value dynamics
                 fair_yes_velocity,
                 fair_yes_prev: prev_fy,
-                // PM trade flow
-                pm_trade_count:    market_flow.get(&meta.condition_id).map(|f| f.trade_count_5m),
-                pm_buy_volume:     market_flow.get(&meta.condition_id).map(|f| f.buy_volume_5m),
-                pm_sell_volume:    market_flow.get(&meta.condition_id).map(|f| f.sell_volume_5m),
-                pm_trade_imbal:    market_flow.get(&meta.condition_id).map(|f| f.imbalance_5m),
-                pm_avg_trade_size: market_flow.get(&meta.condition_id).map(|f| f.avg_trade_size),
-                pm_whale_count:    market_flow.get(&meta.condition_id).map(|f| f.whale_trade_count),
+                // PM trade flow (single lookup, cached)
+                pm_trade_count:    mf_snap.as_ref().map(|f| f.trade_count_5m),
+                pm_buy_volume:     mf_snap.as_ref().map(|f| f.buy_volume_5m),
+                pm_sell_volume:    mf_snap.as_ref().map(|f| f.sell_volume_5m),
+                pm_trade_imbal:    mf_snap.as_ref().map(|f| f.imbalance_5m),
+                pm_avg_trade_size: mf_snap.as_ref().map(|f| f.avg_trade_size),
+                pm_whale_count:    mf_snap.as_ref().map(|f| f.whale_trade_count),
             };
 
             if let Ok(line) = serde_json::to_string(&log) {

@@ -438,8 +438,8 @@ fn process_cl_message(
 
     let mut hist = price_history.entry(asset).or_default();
     hist.push((ts, price));
-    if hist.len() > 1000 {
-        let drain_to = hist.len() - 1000;
+    if hist.len() > 5000 {
+        let drain_to = hist.len() - 5000;
         hist.drain(0..drain_to);
     }
 }
@@ -557,8 +557,8 @@ fn process_bn_message(
     let hist_key = format!("bn_{}", asset);
     let mut hist = bn_history.entry(hist_key).or_default();
     hist.push((ts, price));
-    if hist.len() > 1000 {
-        let drain_to = hist.len() - 1000;
+    if hist.len() > 5000 {
+        let drain_to = hist.len() - 5000;
         hist.drain(0..drain_to);
     }
 
