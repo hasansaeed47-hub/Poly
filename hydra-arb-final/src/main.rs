@@ -407,6 +407,7 @@ struct PT {
     tid_dn: String,
     cl_open: f64,           // CL price at entry
     entry_time: i64,        // unix ts of entry
+    cap_locked: f64,        // total capital locked on entry (stake + fees)
 }
 
 // ── Strategy Tracker ───────────────────────────────────────────────────────
@@ -431,11 +432,13 @@ impl Strat {
         }
     }
 
-    fn rec(&mut self, won: bool, p: f64) {
+    fn rec(&mut self, won: bool, p: f64, stake_locked: f64) {
         if won { self.w += 1; self.gross_win += p; }
         else { self.l += 1; self.gross_loss += p; }
         self.pnl += p;
-        self.cap += p;
+        // Return locked stake + PnL (PnL already has -stake baked in,
+        // so stake+pnl = total proceeds from market)
+        self.cap += stake_locked + p;
     }
 
     fn trades(&self) -> u32 { self.w + self.l }
@@ -544,6 +547,7 @@ impl Engine {
 
                 let cl_open = self.cl_o.get(&w.slug).copied().unwrap_or(cl_now);
 
+                let cap_locked = STAKE_2 + uf + df;
                 st.active.insert(w.slug.clone(), PT {
                     id, slug: w.slug.clone(), asset: w.asset, wmin: w.wmin,
                     dir: "UP".into(), px: up, shares: ush,
@@ -553,12 +557,13 @@ impl Engine {
                     wsold: false, wpx: 0.0,
                     tid_up: w.tid_up.clone(), tid_dn: w.tid_down.clone(),
                     cl_open, entry_time: Utc::now().timestamp(),
+                    cap_locked,
                 });
                 st.done.insert(w.slug.clone());
 
                 info!("[{}] ENTRY {} {}m T-{}s UP@{:.3} DN@{:.3} sum={:.3} cost=${:.2} cl=${:.2}",
                     id, w.asset.to_uppercase(), w.wmin, left,
-                    up, dn, bu.ba + bd.ba, STAKE_2 + uf + df, cl_open);
+                    up, dn, bu.ba + bd.ba, cap_locked, cl_open);
             }
         }
     }
@@ -600,7 +605,8 @@ impl Engine {
             let cl_now = self.st.read().await.cl.get(w.asset).copied().unwrap_or(0.0);
             let cl_open = self.cl_o.get(&w.slug).copied().unwrap_or(cl_now);
 
-            st.cap -= STAKE_1;
+            let cap_locked = STAKE_1;
+            st.cap -= cap_locked;
             st.active.insert(w.slug.clone(), PT {
                 id: "S4", slug: w.slug.clone(), asset: w.asset, wmin: w.wmin,
                 dir: dir.into(), px: fp, shares: sh,
@@ -610,6 +616,7 @@ impl Engine {
                 wsold: false, wpx: 0.0,
                 tid_up: w.tid_up.clone(), tid_dn: w.tid_down.clone(),
                 cl_open, entry_time: Utc::now().timestamp(),
+                cap_locked,
             });
             st.done.insert(w.slug.clone());
 
@@ -622,7 +629,7 @@ impl Engine {
     async fn manage(&mut self) {
         let now = Utc::now().timestamp();
         let state = self.st.read().await;
-        let mut settles: Vec<(&'static str, String, f64)> = Vec::new();
+        let mut settles: Vec<(&'static str, String, f64, f64)> = Vec::new(); // (id, slug, pnl, cap_locked)
 
         for st in self.s.values_mut() {
             let slugs: Vec<String> = st.active.keys().cloned().collect();
@@ -644,7 +651,7 @@ impl Engine {
                                 let pnl = rec - STAKE_1 - f;
                                 info!("[{}] SL {} {} {}m cl_d={:+.3}% pnl=${:+.2} cum=${:+.2} {}W/{}L",
                                     st.id, t.dir, t.asset.to_uppercase(), t.wmin, d, pnl, st.pnl + pnl, st.w, st.l + 1);
-                                settles.push((st.id, slug.clone(), pnl));
+                                settles.push((st.id, slug.clone(), pnl, t.cap_locked));
                                 continue;
                             }
                         }
@@ -660,7 +667,7 @@ impl Engine {
                             self.sub_r.insert(slug.clone(), if cc >= co { "UP" } else { "DOWN" }.into());
                         }
                         if co <= 0.0 || cc <= 0.0 {
-                            settles.push((st.id, slug.clone(), -STAKE_1));
+                            settles.push((st.id, slug.clone(), -STAKE_1, t.cap_locked));
                             continue;
                         }
                         let actual = if cc >= co { "UP" } else { "DOWN" };
@@ -672,7 +679,7 @@ impl Engine {
                             co, cc, (cc - co) / co * 100.0,
                             pnl, st.pnl + pnl,
                             st.w + if won { 1 } else { 0 }, st.l + if won { 0 } else { 1 });
-                        settles.push((st.id, slug.clone(), pnl));
+                        settles.push((st.id, slug.clone(), pnl, t.cap_locked));
                     }
                     continue;
                 }
@@ -768,7 +775,7 @@ impl Engine {
                         .or_else(|| state.cl_at(t.asset, t.end_ts, 5))
                         .or_else(|| state.cl.get(t.asset).copied())
                         .unwrap_or(0.0);
-                    if cc <= 0.0 { settles.push((st.id, slug.clone(), -STAKE_2)); continue; }
+                    if cc <= 0.0 { settles.push((st.id, slug.clone(), -STAKE_2, t.cap_locked)); continue; }
                     if t.wmin == 5 {
                         self.sub_r.insert(slug.clone(), if cc >= co { "UP" } else { "DOWN" }.into());
                     }
@@ -807,14 +814,14 @@ impl Engine {
                         pnl, st.pnl + pnl,
                         st.w + if pnl > 0.0 { 1 } else { 0 },
                         st.l + if pnl <= 0.0 { 1 } else { 0 });
-                    settles.push((st.id, slug.clone(), pnl));
+                    settles.push((st.id, slug.clone(), pnl, t.cap_locked));
                 }
             }
         }
 
-        for (id, slug, pnl) in settles {
+        for (id, slug, pnl, cap_locked) in settles {
             if let Some(st) = self.s.get_mut(id) {
-                st.rec(pnl > 0.0, pnl);
+                st.rec(pnl > 0.0, pnl, cap_locked);
                 st.active.remove(&slug);
             }
         }
