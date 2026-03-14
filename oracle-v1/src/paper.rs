@@ -45,6 +45,8 @@ pub struct PaperPosition {
     // What-if filter data captured at entry
     pub cl_momentum:          f64,
     pub book_imbal:           f64,
+    pub sigma:                f64,
+    pub pct_move:             f64,
     pub blocked_by_momentum:  bool,
     pub blocked_by_bookimbal: bool,
     pub blocked_by_both:      bool,
@@ -63,6 +65,8 @@ pub struct PaperTradeLog {
     pub entry_price:   f64,
     pub fair_at_entry: f64,
     pub edge_at_entry: f64,
+    pub sigma:         f64,
+    pub pct_move:      f64,
     pub secs_left:     f64,
     pub stake:         f64,
     pub exit_price:    f64,
@@ -204,6 +208,8 @@ impl PaperRunner {
         let blocked_by_bookimbal = !book_confirms;
         let blocked_by_both      = blocked_by_momentum || blocked_by_bookimbal;
 
+        let pct_move = ((sig.cl_price / sig.open_price) - 1.0).abs() * 100.0;
+
         let pos = PaperPosition {
             trade_id: trade_id.clone(),
             slug: sig.slug.clone(),
@@ -218,6 +224,8 @@ impl PaperRunner {
             window_end,
             cl_momentum: sig.cl_momentum,
             book_imbal: sig.book_imbal,
+            sigma: sig.sigma,
+            pct_move,
             blocked_by_momentum,
             blocked_by_bookimbal,
             blocked_by_both,
@@ -328,6 +336,8 @@ impl PaperRunner {
             entry_price:   pos.entry_price,
             fair_at_entry: pos.fair_at_entry,
             edge_at_entry: pos.fair_at_entry - pos.entry_price,
+            sigma:         pos.sigma,
+            pct_move:      pos.pct_move,
             secs_left:     pos.secs_left,
             stake:         pos.stake,
             exit_price,
