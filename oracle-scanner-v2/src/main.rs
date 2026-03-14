@@ -5,6 +5,8 @@
 ///   - Settlement outcomes        -> data/settlements_YYYY-MM-DD.jsonl
 ///   - Raw CL price ticks         -> data/cl_ticks_YYYY-MM-DD.jsonl
 ///   - Raw BN price ticks         -> data/bn_ticks_YYYY-MM-DD.jsonl
+///   - Whale/smart-money trades   -> data/whale_trades_YYYY-MM-DD.jsonl
+///   - Whale wallet snapshots     -> data/whale_wallets_YYYY-MM-DD.jsonl
 ///
 /// HTTP server on :8080 for section-wise downloads:
 ///   GET /files                -> list all data files
@@ -18,6 +20,7 @@
 
 mod feeds;
 mod signal;
+mod tracker;
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -50,7 +53,45 @@ struct AppConfig {
     scan:     ScanConfig,
     #[serde(default)]
     http:     HttpConfig,
+    #[serde(default)]
+    tracker:  TrackerConfig,
 }
+
+#[derive(Deserialize, Debug)]
+struct TrackerConfig {
+    #[serde(default = "default_tracker_enabled")]
+    enabled:            bool,
+    #[serde(default = "default_data_api")]
+    data_api:           String,
+    #[serde(default = "default_leaderboard_limit")]
+    leaderboard_limit:  usize,
+    #[serde(default = "default_min_trade_usd")]
+    min_trade_usd:      f64,
+    #[serde(default = "default_poll_interval")]
+    poll_interval_ms:   u64,
+    #[serde(default = "default_refresh_wallets")]
+    refresh_wallets_s:  u64,
+}
+
+impl Default for TrackerConfig {
+    fn default() -> Self {
+        Self {
+            enabled:           true,
+            data_api:          default_data_api(),
+            leaderboard_limit: default_leaderboard_limit(),
+            min_trade_usd:     default_min_trade_usd(),
+            poll_interval_ms:  default_poll_interval(),
+            refresh_wallets_s: default_refresh_wallets(),
+        }
+    }
+}
+
+fn default_tracker_enabled() -> bool { true }
+fn default_data_api() -> String { "https://data-api.polymarket.com".to_string() }
+fn default_leaderboard_limit() -> usize { 50 }
+fn default_min_trade_usd() -> f64 { 5000.0 }
+fn default_poll_interval() -> u64 { 10_000 }
+fn default_refresh_wallets() -> u64 { 300 }
 
 #[derive(Deserialize, Debug)]
 struct FeedConfig {
@@ -287,11 +328,13 @@ fn open_or_create(path: &str) -> std::io::Result<std::fs::File> {
 
 #[derive(Clone)]
 struct AppState {
-    signal_count: Arc<AtomicU64>,
-    settle_count: Arc<AtomicU64>,
-    market_count: Arc<AtomicU64>,
-    cl_tick_count: Arc<AtomicU64>,
-    bn_tick_count: Arc<AtomicU64>,
+    signal_count:      Arc<AtomicU64>,
+    settle_count:      Arc<AtomicU64>,
+    market_count:      Arc<AtomicU64>,
+    cl_tick_count:     Arc<AtomicU64>,
+    bn_tick_count:     Arc<AtomicU64>,
+    whale_trade_count: Arc<AtomicU64>,
+    whale_wallet_count: Arc<AtomicU64>,
     start_ts:     f64,
     cl_prices:    ClPrices,
     bn_prices:    BnPrices,
@@ -348,7 +391,7 @@ async fn download_file(AxumPath(filename): AxumPath<String>) -> impl IntoRespons
 
 /// List available data sections with their files
 async fn list_sections() -> impl IntoResponse {
-    let sections = vec!["signals", "settlements", "cl_ticks", "bn_ticks"];
+    let sections = vec!["signals", "settlements", "cl_ticks", "bn_ticks", "whale_trades", "whale_wallets"];
     let mut result: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
 
     if let Ok(entries) = std::fs::read_dir("data") {
@@ -379,7 +422,7 @@ async fn list_sections() -> impl IntoResponse {
 
 /// Download all files for a section, concatenated as JSONL
 async fn download_section(AxumPath(section): AxumPath<String>) -> impl IntoResponse {
-    let valid = ["signals", "settlements", "cl_ticks", "bn_ticks"];
+    let valid = ["signals", "settlements", "cl_ticks", "bn_ticks", "whale_trades", "whale_wallets"];
     if !valid.contains(&section.as_str()) {
         return axum::http::Response::builder()
             .status(400)
@@ -469,6 +512,8 @@ async fn status(
         "settlements_logged": state.settle_count.load(Ordering::Relaxed),
         "cl_ticks_logged": state.cl_tick_count.load(Ordering::Relaxed),
         "bn_ticks_logged": state.bn_tick_count.load(Ordering::Relaxed),
+        "whale_trades_logged": state.whale_trade_count.load(Ordering::Relaxed),
+        "whale_wallets_tracked": state.whale_wallet_count.load(Ordering::Relaxed),
         "active_markets": state.market_count.load(Ordering::Relaxed),
         "feeds": feed_status,
         "data_files": file_count,
@@ -499,6 +544,9 @@ async fn main() -> Result<()> {
     info!("Assets: {:?}", cfg.feed.assets);
     info!("Timeframes: {:?}m", cfg.feed.timeframes);
     info!("Feeds: CL (RTDS WS) + BN (aggTrade WS) + Book (REST)");
+    info!("Whale tracker: {} (top {}, min ${})",
+        if cfg.tracker.enabled { "ON" } else { "OFF" },
+        cfg.tracker.leaderboard_limit, cfg.tracker.min_trade_usd);
     info!("VWAP stake: ${}", cfg.scan.vwap_stake);
     info!("HTTP server: :{}", cfg.http.port);
     info!("Data dir: data/");
@@ -519,6 +567,8 @@ async fn main() -> Result<()> {
     let market_count  = Arc::new(AtomicU64::new(0));
     let cl_tick_count = Arc::new(AtomicU64::new(0));
     let bn_tick_count = Arc::new(AtomicU64::new(0));
+    let whale_trade_count  = Arc::new(AtomicU64::new(0));
+    let whale_wallet_count = Arc::new(AtomicU64::new(0));
 
     let http = Client::builder()
         .user_agent("oracle-scanner-v2/2")
@@ -536,6 +586,8 @@ async fn main() -> Result<()> {
         market_count: market_count.clone(),
         cl_tick_count: cl_tick_count.clone(),
         bn_tick_count: bn_tick_count.clone(),
+        whale_trade_count: whale_trade_count.clone(),
+        whale_wallet_count: whale_wallet_count.clone(),
         start_ts: now_secs(),
         cl_prices: cl_prices.clone(),
         bn_prices: bn_prices.clone(),
@@ -678,6 +730,33 @@ async fn main() -> Result<()> {
         });
     }
 
+    // -- Start whale tracker --------------------------------------------------
+
+    let active_markets_for_tracker: Arc<tokio::sync::RwLock<Vec<tracker::ActiveMarketInfo>>>
+        = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+
+    if cfg.tracker.enabled {
+        let tracker_cfg = tracker::TrackerConfig {
+            data_api:          cfg.tracker.data_api.clone(),
+            clob_rest:         cfg.feed.clob_rest.clone(),
+            leaderboard_limit: cfg.tracker.leaderboard_limit,
+            min_trade_usd:     cfg.tracker.min_trade_usd,
+            poll_interval_ms:  cfg.tracker.poll_interval_ms,
+            refresh_wallets_s: cfg.tracker.refresh_wallets_s,
+        };
+        let tracker_client = http.clone();
+        let tc = whale_trade_count.clone();
+        let wc = whale_wallet_count.clone();
+        let am = active_markets_for_tracker.clone();
+        tokio::spawn(async move {
+            tracker::run_whale_tracker(tracker_cfg, tracker_client, tc, wc, am).await;
+        });
+        info!("[WHALE] Tracker enabled (top {}, min ${}, poll {}ms)",
+            cfg.tracker.leaderboard_limit, cfg.tracker.min_trade_usd, cfg.tracker.poll_interval_ms);
+    } else {
+        info!("[WHALE] Tracker disabled");
+    }
+
     // -- Main scan loop -------------------------------------------------------
 
     let tick = Duration::from_millis(cfg.scan.tick_ms);
@@ -748,11 +827,12 @@ async fn main() -> Result<()> {
         tokio::time::sleep(tick).await;
 
         if shutdown.load(Ordering::SeqCst) {
-            info!("Shutdown -- signals={} settlements={} cl_ticks={} bn_ticks={}",
+            info!("Shutdown -- signals={} settlements={} cl={} bn={} whales={}",
                 signal_count.load(Ordering::Relaxed),
                 settle_count.load(Ordering::Relaxed),
                 cl_tick_count.load(Ordering::Relaxed),
-                bn_tick_count.load(Ordering::Relaxed));
+                bn_tick_count.load(Ordering::Relaxed),
+                whale_trade_count.load(Ordering::Relaxed));
             break;
         }
 
@@ -790,6 +870,22 @@ async fn main() -> Result<()> {
             }
             let active = markets.iter().filter(|(s, _)| !settled.contains_key(s.as_str())).count();
             market_count.store(active as u64, Ordering::Relaxed);
+
+            // Update active markets for whale tracker
+            if cfg.tracker.enabled {
+                let active_list: Vec<tracker::ActiveMarketInfo> = markets.iter()
+                    .filter(|(s, _)| !settled.contains_key(s.as_str()))
+                    .map(|(_, m)| tracker::ActiveMarketInfo {
+                        slug: m.slug.clone(),
+                        asset: m.asset.clone(),
+                        tf: m.tf,
+                        condition_id: m.condition_id.clone(),
+                        token_yes: m.token_yes.clone(),
+                        token_no: m.token_no.clone(),
+                    })
+                    .collect();
+                *active_markets_for_tracker.write().await = active_list;
+            }
         }
 
         // -- Batch book refresh (every other tick) ----------------------------
@@ -1228,11 +1324,12 @@ async fn main() -> Result<()> {
             last_stats_ts = now;
             let active = markets.iter().filter(|(s, _)| !settled.contains_key(s.as_str())).count();
             info!(
-                "[SCANNER] signals={} settles={} cl_ticks={} bn_ticks={} markets={} books={} | http://0.0.0.0:{}",
+                "[SCANNER] signals={} settles={} cl={} bn={} whales={} markets={} books={} | http://0.0.0.0:{}",
                 signal_count.load(Ordering::Relaxed),
                 settle_count.load(Ordering::Relaxed),
                 cl_tick_count.load(Ordering::Relaxed),
                 bn_tick_count.load(Ordering::Relaxed),
+                whale_trade_count.load(Ordering::Relaxed),
                 active, book_state.len(),
                 cfg.http.port
             );

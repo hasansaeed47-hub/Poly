@@ -21,4 +21,12 @@ min_secs           = 30      # capture data down to 30s left (more data than v1'
 vwap_stake         = 5.0     # stake amount for VWAP fill calc
 
 [http]
-port = 8080   # GET /files, GET /download/{f}, GET /status
+port = 8080   # GET /files, GET /download/{f}, GET /section/{name}, GET /status
+
+[tracker]
+enabled           = true
+data_api          = "https://data-api.polymarket.com"
+leaderboard_limit = 50       # top N crypto wallets to track
+min_trade_usd     = 5000.0   # only log trades >= $5k
+poll_interval_ms  = 10000    # poll trades every 10s
+refresh_wallets_s = 300      # refresh leaderboard every 5min
