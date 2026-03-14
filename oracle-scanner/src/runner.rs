@@ -35,10 +35,12 @@ pub struct PaperPosition {
     pub trade_id:      String,
     pub slug:          String,
     pub asset:         String,
+    pub tf:            u32,
     pub side:          Side,
     pub entry_price:   f64,
     pub fair_at_entry: f64,  // Black-Scholes fair at entry — used as TP target for C5
     pub stake:         f64,
+    pub secs_left:     f64,  // seconds left at entry
     pub entry_ts:      f64,
     pub window_end:    u64,  // unix timestamp when window closes
 }
@@ -207,10 +209,12 @@ impl ConfigRunner {
             trade_id:      trade_id.clone(),
             slug:          sig.slug.clone(),
             asset:         sig.asset.clone(),
+            tf:            sig.tf,
             side,
             entry_price:   fill_price,  // VWAP fill, not best ask
             fair_at_entry: sig.best_fair,
             stake:         self.stake,
+            secs_left:     sig.secs_left,
             entry_ts:      now,
             window_end,
         };
@@ -334,12 +338,12 @@ impl ConfigRunner {
             trade_id:      pos.trade_id.clone(),
             slug:          pos.slug.clone(),
             asset:         pos.asset.clone(),
-            tf:            0, // filled by caller if needed
+            tf:            pos.tf,
             side:          pos.side.to_string(),
             entry_price:   pos.entry_price,
             fair_at_entry: pos.fair_at_entry,
             edge_at_entry: pos.fair_at_entry - pos.entry_price,
-            secs_left:     0.0, // not stored in pos, logged at entry
+            secs_left:     pos.secs_left,
             stake:         pos.stake,
             exit_price,
             exit_reason:   exit_reason.to_string(),
