@@ -94,6 +94,17 @@ struct LagConfigFile {
     min_bn_flow_confirm: f64,
 }
 
+/// Override stale config values with tuned minimums
+fn enforce_lag_floor(cfg: &mut LagConfigFile) {
+    if cfg.min_divergence_pct < 0.035 { cfg.min_divergence_pct = 0.035; }
+    if cfg.min_edge            < 0.08  { cfg.min_edge            = 0.08;  }
+    if cfg.min_fair_gap        < 0.05  { cfg.min_fair_gap        = 0.05;  }
+    if cfg.min_bn_momentum     < 0.0003 { cfg.min_bn_momentum   = 0.0003; }
+    if cfg.max_secs_left       > 600.0 { cfg.max_secs_left       = 600.0; }
+    if cfg.min_entry_price     < 0.12  { cfg.min_entry_price     = 0.12;  }
+    if cfg.max_entry_price     > 0.88  { cfg.max_entry_price     = 0.88;  }
+}
+
 #[derive(Deserialize, Debug)]
 struct StrategyConfigFile {
     stake:              f64,
@@ -132,8 +143,9 @@ async fn main() -> Result<()> {
 
     let cfg_text = std::fs::read_to_string("config.toml")
         .context("cannot read config.toml")?;
-    let cfg: AppConfig = toml::from_str(&cfg_text)
+    let mut cfg: AppConfig = toml::from_str(&cfg_text)
         .context("invalid config.toml")?;
+    enforce_lag_floor(&mut cfg.lag);
 
     info!("═══════════════════════════════════════════════════════════");
     info!("  LAG SNIPER — BN-Leading Maker-First — 14th March 2026");
