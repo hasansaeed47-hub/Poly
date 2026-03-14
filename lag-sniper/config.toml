@@ -6,7 +6,7 @@ private_key    = ""
 funder_address = ""
 
 [feed]
-assets     = ["btc", "eth", "sol"]
+assets     = ["btc", "eth"]
 timeframes = [5, 15]
 
 clob_rest  = "https://clob.polymarket.com"
