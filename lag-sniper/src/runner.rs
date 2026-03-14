@@ -45,6 +45,7 @@ pub struct LagPosition {
     pub window_end:     u64,
     pub order_id:       String,
     pub tp_fired:       bool,
+    pub reversal_ts:    Option<f64>,  // when reversal first detected (confirmation delay)
 }
 
 // ── Trade log ───────────────────────────────────────────────────────────────
@@ -204,20 +205,39 @@ impl LagRunner {
                 continue;
             }
 
-            // ── Exit 3: REVERSAL ────────────────────────────────────────
+            // ── Exit 3: REVERSAL (with confirmation delay) ─────────────
             // BN momentum has flipped against our position
             let reversed = match pos.side {
                 Side::Yes => bn_momentum < -0.0005,  // BN now falling
                 Side::No  => bn_momentum > 0.0005,   // BN now rising
             };
-            // Only SL if we're also underwater
             if reversed && exit_bid < pos.entry_price && secs_left > 60.0 {
+                // Start or check reversal confirmation timer
+                let reversal_ts = match pos.reversal_ts {
+                    Some(ts) => ts,
+                    None => {
+                        // First detection — record timestamp, don't SL yet
+                        if let Some(p) = self.positions.get_mut(&trade_id) {
+                            p.reversal_ts = Some(now);
+                        }
+                        continue;
+                    }
+                };
+                // Only SL after momentum stays reversed for 3+ seconds
+                if now - reversal_ts < 3.0 {
+                    continue;
+                }
                 info!(
-                    "[LAG_RUNNER] REVERSAL {} momentum={:.4} bid={:.3} < entry={:.3}",
-                    pos.slug, bn_momentum, exit_bid, pos.entry_price
+                    "[LAG_RUNNER] REVERSAL {} momentum={:.4} bid={:.3} < entry={:.3} confirmed={:.1}s",
+                    pos.slug, bn_momentum, exit_bid, pos.entry_price, now - reversal_ts
                 );
                 self.exit_position(&trade_id, exit_bid, "REVERSAL_SL", now).await;
                 continue;
+            } else if !reversed {
+                // Momentum recovered — clear the reversal timer
+                if let Some(p) = self.positions.get_mut(&trade_id) {
+                    p.reversal_ts = None;
+                }
             }
 
             // ── Exit 4: HARD STOP-LOSS ────────────────────────────────
@@ -232,11 +252,21 @@ impl LagRunner {
             }
 
             // ── Exit 5: TIME ────────────────────────────────────────────
-            // Held too long without convergence → exit at bid
+            // Held too long without convergence
             if hold_secs > self.config.max_hold_secs && secs_left > 60.0 {
+                // If BN still supports our direction, hold to settlement
+                // rather than panic-selling into a thin bid
+                let bn_supports = match pos.side {
+                    Side::Yes => bn_momentum >= 0.0,
+                    Side::No  => bn_momentum <= 0.0,
+                };
+                if bn_supports || exit_bid < pos.entry_price * 0.85 {
+                    // Better to ride to settlement than sell at a big haircut
+                    continue;
+                }
                 info!(
-                    "[LAG_RUNNER] TIME_EXIT {} held={:.1}s > max={:.0}s bid={:.3}",
-                    pos.slug, hold_secs, self.config.max_hold_secs, exit_bid
+                    "[LAG_RUNNER] TIME_EXIT {} held={:.1}s > max={:.0}s bid={:.3} bn_mom={:.4}",
+                    pos.slug, hold_secs, self.config.max_hold_secs, exit_bid, bn_momentum
                 );
                 self.exit_position(&trade_id, exit_bid, "TIME_EXIT", now).await;
                 continue;
@@ -289,6 +319,10 @@ impl LagRunner {
             sig.divergence_pct, sig.secs_left
         );
 
+        // Cap best_ask to prevent chasing too far above maker price
+        // Max 3 ticks (0.03) above initial maker price
+        let max_chase_price = (sig.maker_price + 0.03).min(sig.best_ask);
+
         // Execute maker chase entry
         match self.exec.maker_chase_entry(
             token_id,
@@ -296,7 +330,7 @@ impl LagRunner {
             self.config.stake,
             self.config.maker_chase_ticks,
             self.config.chase_interval_ms,
-            sig.best_ask,
+            max_chase_price,
         ).await {
             Ok(fill) => {
                 let actual_price = fill.price;
@@ -352,6 +386,7 @@ impl LagRunner {
                     window_end,
                     order_id: fill.order_id,
                     tp_fired: false,
+                    reversal_ts: None,
                 };
 
                 self.positions.insert(trade_id, pos);
@@ -388,6 +423,16 @@ impl LagRunner {
             Some(p) => p,
             None => return,
         };
+
+        // Thin-book protection: if bid is garbage, hold to settlement instead
+        if exit_bid < pos.entry_price * 0.85 && reason != "HARD_SL" {
+            info!(
+                "[LAG_RUNNER] SKIP_SELL {} bid={:.3} < 85% of entry={:.3} — holding to settlement",
+                pos.slug, exit_bid, pos.entry_price
+            );
+            self.positions.insert(trade_id.to_string(), pos);
+            return;
+        }
 
         // Sell via GTC at bid
         match self.exec.sell_gtc(&pos.token_id, exit_bid, pos.shares).await {
