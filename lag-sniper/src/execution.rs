@@ -28,7 +28,7 @@ use hmac::{Hmac, Mac};
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::types::{
-    Amount, AssetType, OrderType, OrderStatusType, Side as ClobSide, SignatureType,
+    AssetType, OrderType, OrderStatusType, Side as ClobSide, SignatureType,
     request::BalanceAllowanceRequest,
 };
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
@@ -244,7 +244,7 @@ impl ExecutionLayer {
         }
     }
 
-    /// Place a FAK (taker) market order. Fills immediately, partial OK.
+    /// Place a FAK (taker) limit order at best ask. Price-protected.
     /// V6 FIX #9: Cancels order on zero fill to prevent orphaned orders.
     pub async fn buy_fak(
         &self,
@@ -267,21 +267,24 @@ impl ExecutionLayer {
             let tid = U256::from_str(token_id)
                 .map_err(|e| anyhow!("Invalid token_id: {}", e))?;
 
-            let dec_amount = dec(stake)?;
-            let amount = Amount::usdc(dec_amount)
-                .map_err(|e| anyhow!("Invalid USDC amount: {}", e))?;
+            // Use limit_order with FAK type for price protection
+            // This ensures we only fill at `price` or better, never sweeping the book
+            let dec_price = dec(price)?;
+            let shares = stake / price;
+            let dec_sz = dec_size(shares)?;
 
-            let order = self.client.market_order()
+            let order = self.client.limit_order()
                 .token_id(tid)
                 .side(ClobSide::Buy)
-                .amount(amount)
+                .price(dec_price)
+                .size(dec_sz)
                 .order_type(OrderType::FAK)
                 .build()
                 .await
-                .map_err(|e| anyhow!("Market order build failed: {}", e))?;
+                .map_err(|e| anyhow!("FAK order build failed: {}", e))?;
 
             let signed = self.client.sign(&*self.signer, order).await
-                .map_err(|e| anyhow!("Market order sign failed: {}", e))?;
+                .map_err(|e| anyhow!("FAK order sign failed: {}", e))?;
 
             self.client.post_order(signed).await
         }; // _lock released here
