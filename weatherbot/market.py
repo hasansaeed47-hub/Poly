@@ -125,7 +125,7 @@ def extract_city_buckets(event: dict) -> Tuple[str, List[Bucket]]:
             try:
                 tokens = json.loads(tokens)
             except Exception:
-                tokens = [tokens] if tokens else []
+                tokens = []
 
         if len(tokens) < 2:
             continue

@@ -161,8 +161,3 @@ class OrderManager:
             log.error(f"[EXEC] Cancel all failed: {e}")
             return 0
 
-    def order_filled(self, order_id: str):
-        """Remove an order from tracking (called when fill confirmed)."""
-        self._live_orders = [
-            o for o in self._live_orders if o["order_id"] != order_id
-        ]

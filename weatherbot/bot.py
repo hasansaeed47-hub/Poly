@@ -344,7 +344,7 @@ class WeatherBot:
             log.info(f"  -> [{play}] BUY {side} {t['label'][:35]} @ {price:.2f} ${stake:.2f}")
             oid = self.exec.buy(tid, price, stake)
             if oid:
-                shares = stake / price
+                shares = round(stake / price, 2)
                 pos = Position(
                     token_id=tid, label=t["label"], side=side,
                     buy_price=price, shares=shares, cost=stake,
