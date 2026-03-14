@@ -282,7 +282,8 @@ pub async fn fetch_books_batch(
                     Some(PriceLevel { price, size })
                 }).collect())
                 .unwrap_or_default();
-            asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap());
+            asks.retain(|l| l.price.is_finite() && l.size.is_finite());
+            asks.sort_by(|a, b| a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal));
 
             let mut bids: Vec<PriceLevel> = item.get("bids")
                 .and_then(|b| b.as_array())
@@ -292,7 +293,8 @@ pub async fn fetch_books_batch(
                     Some(PriceLevel { price, size })
                 }).collect())
                 .unwrap_or_default();
-            bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap());
+            bids.retain(|l| l.price.is_finite() && l.size.is_finite());
+            bids.sort_by(|a, b| b.price.partial_cmp(&a.price).unwrap_or(std::cmp::Ordering::Equal));
 
             let best_ask = asks.first().map(|l| l.price).unwrap_or(0.0);
             let best_bid = bids.first().map(|l| l.price).unwrap_or(0.0);

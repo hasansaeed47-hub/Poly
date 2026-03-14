@@ -23,12 +23,13 @@ use anyhow::{Context, Result, anyhow};
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::types::{
-    Amount, OrderType, OrderStatusType, Side as ClobSide, SignatureType,
+    Amount, AssetType, OrderType, OrderStatusType, Side as ClobSide, SignatureType,
+    request::BalanceAllowanceRequest,
 };
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::types::{Decimal, U256};
 use polymarket_client_sdk::POLYGON;
-use rust_decimal::prelude::FromPrimitive;
+use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use tokio::sync::Mutex;
 use tracing::{info, warn, error};
 
@@ -203,28 +204,33 @@ impl ExecutionLayer {
             return Err(anyhow!("In backoff period"));
         }
 
-        let _lock = self.clob_lock.lock().await;
+        // Post the order under lock, extract result, then release lock before cleanup
+        let post_result = {
+            let _lock = self.clob_lock.lock().await;
 
-        let tid = U256::from_str(token_id)
-            .map_err(|e| anyhow!("Invalid token_id: {}", e))?;
+            let tid = U256::from_str(token_id)
+                .map_err(|e| anyhow!("Invalid token_id: {}", e))?;
 
-        let dec_amount = dec(stake)?;
-        let amount = Amount::usdc(dec_amount)
-            .map_err(|e| anyhow!("Invalid USDC amount: {}", e))?;
+            let dec_amount = dec(stake)?;
+            let amount = Amount::usdc(dec_amount)
+                .map_err(|e| anyhow!("Invalid USDC amount: {}", e))?;
 
-        let order = self.client.market_order()
-            .token_id(tid)
-            .side(ClobSide::Buy)
-            .amount(amount)
-            .order_type(OrderType::FAK)
-            .build()
-            .await
-            .map_err(|e| anyhow!("Market order build failed: {}", e))?;
+            let order = self.client.market_order()
+                .token_id(tid)
+                .side(ClobSide::Buy)
+                .amount(amount)
+                .order_type(OrderType::FAK)
+                .build()
+                .await
+                .map_err(|e| anyhow!("Market order build failed: {}", e))?;
 
-        let signed = self.client.sign(&*self.signer, order).await
-            .map_err(|e| anyhow!("Market order sign failed: {}", e))?;
+            let signed = self.client.sign(&*self.signer, order).await
+                .map_err(|e| anyhow!("Market order sign failed: {}", e))?;
 
-        match self.client.post_order(signed).await {
+            self.client.post_order(signed).await
+        }; // _lock released here
+
+        match post_result {
             Ok(resp) => {
                 self.record_success().await;
                 let filled = resp.status == OrderStatusType::Matched;
@@ -232,10 +238,8 @@ impl ExecutionLayer {
                 // V6 FIX #9: Zero-fill cleanup — cancel order if not successfully filled
                 if !resp.success || !filled {
                     warn!("[EXEC] FAK zero/partial fill: {:?} status={:?}", resp.error_msg, resp.status);
-                    // Attempt to cancel the unfilled/partial order
-                    let oid = resp.order_id.clone();
-                    drop(_lock);
-                    let _ = self.client.cancel_order(&oid).await;
+                    // Lock already released — safe to call cancel_order which acquires its own lock
+                    let _ = self.cancel_order(&resp.order_id).await;
                     return Err(anyhow!("FAK zero fill"));
                 }
 
@@ -308,15 +312,33 @@ impl ExecutionLayer {
     }
 
     /// Cancel a specific order by ID.
+    /// Verifies the order actually appears in the `canceled` list.
+    /// Returns Err if the order ended up in `not_canceled` (e.g. already filled).
     pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
         let _lock = self.clob_lock.lock().await;
-        self.client.cancel_order(order_id).await
+        let resp = self.client.cancel_order(order_id).await
             .map_err(|e| anyhow!("Cancel failed: {}", e))?;
+
+        // SDK returns CancelOrdersResponse with canceled/not_canceled lists.
+        // If the order is in not_canceled, it may have already been filled.
+        if let Some(reason) = resp.not_canceled.get(order_id) {
+            return Err(anyhow!("Cancel rejected for {}: {}", order_id, reason));
+        }
         Ok(())
     }
 
+    /// Check USDC balance on the CLOB. Returns balance as f64.
+    pub async fn check_balance(&self) -> Result<f64> {
+        let req = BalanceAllowanceRequest::builder()
+            .asset_type(AssetType::Collateral)
+            .build();
+        let resp = self.client.balance_allowance(req).await
+            .map_err(|e| anyhow!("Balance check failed: {}", e))?;
+        let bal = resp.balance.to_f64().unwrap_or(0.0);
+        Ok(bal)
+    }
+
     /// Cancel all open orders.
-    #[allow(dead_code)]
     pub async fn cancel_all(&self) -> Result<()> {
         let _lock = self.clob_lock.lock().await;
         self.client.cancel_all_orders().await
@@ -418,26 +440,32 @@ impl ExecutionLayer {
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// Extract actual fill price from PostOrderResponse amounts.
-    /// making_amount = USDC spent, taking_amount = shares received (for buys).
-    /// Falls back to `fallback` if amounts are zero.
+    /// For BUY: making_amount = USDC spent, taking_amount = shares received.
+    ///   price = making / taking (USDC per share).
+    /// For SELL: making_amount = shares offered, taking_amount = USDC received.
+    ///   price = taking / making (USDC per share).
+    /// Falls back to `fallback` if amounts are zero or non-finite.
     fn fill_price_from_resp(
         &self,
         resp: &polymarket_client_sdk::clob::types::response::PostOrderResponse,
         fallback: f64,
     ) -> f64 {
-        let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
-        let taking = resp.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
-        if making > 0.0 && taking > 0.0 {
-            let ratio = making / taking;
-            if ratio > 0.0 && ratio < 1.0 {
-                ratio
-            } else if taking / making > 0.0 && taking / making < 1.0 {
-                taking / making
+        let making = resp.making_amount.to_f64().unwrap_or(0.0);
+        let taking = resp.taking_amount.to_f64().unwrap_or(0.0);
+        if making <= 0.0 || taking <= 0.0 {
+            return fallback;
+        }
+        // Try making/taking (BUY: USDC/shares), then taking/making (SELL: USDC/shares)
+        let ratio = making / taking;
+        if ratio.is_finite() && ratio > 0.0 && ratio < 1.0 {
+            ratio
+        } else {
+            let inverse = taking / making;
+            if inverse.is_finite() && inverse > 0.0 && inverse < 1.0 {
+                inverse
             } else {
                 fallback
             }
-        } else {
-            fallback
         }
     }
 

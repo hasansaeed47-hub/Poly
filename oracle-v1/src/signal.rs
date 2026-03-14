@@ -78,8 +78,11 @@ pub fn estimate_sigma(prices: &[(f64, f64)], window_secs: f64, now: f64) -> f64 
     if window.len() < MIN_SAMPLES { return 0.50; }
 
     let returns: Vec<f64> = window.windows(2)
+        .filter(|w| w[0] > 0.0 && w[1] > 0.0)
         .map(|w| (w[1] / w[0]).ln())
         .collect();
+
+    if returns.len() < 2 { return MIN_SIGMA; }
 
     let n    = returns.len() as f64;
     let mean = returns.iter().sum::<f64>() / n;
@@ -87,6 +90,7 @@ pub fn estimate_sigma(prices: &[(f64, f64)], window_secs: f64, now: f64) -> f64 
     let std  = var.sqrt();
 
     let annualised = std * SECS_PER_YEAR.sqrt();
+    if annualised.is_nan() || annualised.is_infinite() { return MIN_SIGMA; }
     annualised.clamp(MIN_SIGMA, 5.0)
 }
 

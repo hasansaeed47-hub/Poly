@@ -167,6 +167,18 @@ async fn main() -> Result<()> {
         Err(e) => warn!("[EXEC] Cancel all on startup failed (may be clean): {}", e),
     }
 
+    // ── Balance check on startup ────────────────────────────────────────────
+    match exec.check_balance().await {
+        Ok(bal) => {
+            info!("[EXEC] USDC balance: ${:.2}", bal);
+            if bal < cfg.strategy.stake {
+                warn!("[EXEC] Balance ${:.2} < stake ${:.2} — may fail on first trade!",
+                    bal, cfg.strategy.stake);
+            }
+        }
+        Err(e) => warn!("[EXEC] Balance check failed: {} (continuing anyway)", e),
+    }
+
     // ── Shared state ────────────────────────────────────────────────────────
 
     let cl_prices:     ClPrices     = Arc::new(DashMap::new());
