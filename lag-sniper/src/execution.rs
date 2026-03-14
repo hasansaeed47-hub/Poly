@@ -98,7 +98,20 @@ fn dec(val: f64) -> Result<Decimal> {
         .ok_or_else(|| anyhow!("Cannot convert {} to Decimal", rounded))
 }
 
-/// Convert f64 to Decimal, truncated to 2 decimal places for size (CLOB requirement).
+/// Compute size (shares) such that size * price has at most 2 decimal places.
+/// The CLOB requires: maker_amount (= size * price for buys) max 2dp,
+/// taker_amount (= size * (1 - price) for buys) max 4dp.
+/// Safest approach: floor size to a whole number so size * price always has <= 2dp.
+fn dec_size_for_price(shares: f64, _price: f64) -> Result<Decimal> {
+    let floored = shares.floor();
+    if floored <= 0.0 {
+        return Err(anyhow!("Size too small after floor: {}", shares));
+    }
+    Decimal::from_f64(floored)
+        .ok_or_else(|| anyhow!("Cannot convert {} to Decimal", floored))
+}
+
+/// Convert f64 to Decimal, truncated to 2 decimal places for size (sell-side).
 fn dec_size(val: f64) -> Result<Decimal> {
     let truncated = (val * 100.0).floor() / 100.0;
     Decimal::from_f64(truncated)
@@ -179,11 +192,7 @@ impl ExecutionLayer {
 
         let dec_price = dec(price)?;
         let shares = stake / price;
-        let dec_sz = dec_size(shares)?;
-
-        if dec_sz <= Decimal::ZERO {
-            return Err(anyhow!("Size too small: {}", shares));
-        }
+        let dec_sz = dec_size_for_price(shares, price)?;
 
         let order = self.client.limit_order()
             .token_id(tid)
@@ -273,7 +282,7 @@ impl ExecutionLayer {
             // This ensures we only fill at `price` or better, never sweeping the book
             let dec_price = dec(price)?;
             let shares = stake / price;
-            let dec_sz = dec_size(shares)?;
+            let dec_sz = dec_size_for_price(shares, price)?;
 
             let order = self.client.limit_order()
                 .token_id(tid)
