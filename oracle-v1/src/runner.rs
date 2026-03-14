@@ -102,6 +102,8 @@ pub struct StrategyConfig {
     pub max_secs_left:    f64,
     pub min_entry_price:  f64,
     pub max_sigma:        f64,
+    pub min_move_pct:     f64,
+    pub max_fair:         f64,
     pub stop_loss:        bool,
     pub take_profit:      bool,
     pub partial_tp_pct:   f64,
@@ -229,6 +231,19 @@ impl LiveRunner {
 
         // One position per slug
         if self.positions.keys().any(|k| k.starts_with(&sig.slug)) {
+            return;
+        }
+
+        // FIX: Min price deviation — skip when underlying move is within noise
+        // A -0.06% dip on BTC is bid-ask bounce, not a real directional signal.
+        // BS overextrapolates tiny moves into high-confidence bets.
+        let pct_move = ((sig.cl_price / sig.open_price) - 1.0).abs() * 100.0;
+        if pct_move < self.config.min_move_pct {
+            return;
+        }
+
+        // FIX: Fair value cap — BS becomes unreliable at extremes
+        if sig.best_fair > self.config.max_fair {
             return;
         }
 
