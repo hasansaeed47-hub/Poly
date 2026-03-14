@@ -44,3 +44,43 @@ max_concurrent     = 6
 # Maker chase: post GTC, chase N ticks at 500ms, then taker fill
 maker_chase_ticks  = 2
 chase_interval_ms  = 500
+
+# ── Paper Scanner (runs alongside live, no real orders) ──────────────
+[paper]
+stake          = 5.0
+taker_fee_rate = 0.015
+
+[paper_configs.c1]
+name           = "BASE"
+min_edge       = 0.12
+max_secs_left  = 840
+stop_loss      = false
+take_profit    = false
+
+[paper_configs.c2]
+name           = "TIME_FILTER"
+min_edge       = 0.12
+max_secs_left  = 180
+stop_loss      = false
+take_profit    = false
+
+[paper_configs.c3]
+name           = "EDGE_FILTER"
+min_edge       = 0.25
+max_secs_left  = 840
+stop_loss      = false
+take_profit    = false
+
+[paper_configs.c4]
+name           = "STOP_LOSS"
+min_edge       = 0.12
+max_secs_left  = 840
+stop_loss      = true
+take_profit    = false
+
+[paper_configs.c5]
+name           = "CL_TARGET"
+min_edge       = 0.12
+max_secs_left  = 840
+stop_loss      = false
+take_profit    = true

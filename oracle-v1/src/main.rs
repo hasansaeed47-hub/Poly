@@ -18,6 +18,7 @@ mod feeds;
 mod signal;
 mod execution;
 mod runner;
+mod paper;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ use feeds::{
     run_cl_feed,
 };
 use runner::{LiveRunner, StrategyConfig};
+use paper::{PaperRunner, PaperRunnerConfig};
 use signal::{compute, estimate_sigma, BookData};
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -47,6 +49,25 @@ struct AppConfig {
     feed:     FeedConfig,
     scan:     ScanConfig,
     strategy: StrategyConfigFile,
+    #[serde(default)]
+    paper:    Option<PaperConfigFile>,
+    #[serde(default)]
+    paper_configs: Option<PaperConfigsTable>,
+}
+
+#[derive(Deserialize, Debug)]
+struct PaperConfigFile {
+    stake:          f64,
+    taker_fee_rate: f64,
+}
+
+#[derive(Deserialize, Debug)]
+struct PaperConfigsTable {
+    c1: PaperRunnerConfig,
+    c2: PaperRunnerConfig,
+    c3: PaperRunnerConfig,
+    c4: PaperRunnerConfig,
+    c5: PaperRunnerConfig,
 }
 
 #[derive(Deserialize, Debug)]
@@ -257,6 +278,20 @@ async fn main() -> Result<()> {
 
     let mut runner = LiveRunner::new(strat_config, exec.clone(), "logs");
 
+    // ── Build paper runners (if configured) ─────────────────────────────────
+
+    let mut paper_runners: Vec<PaperRunner> = Vec::new();
+    if let (Some(paper_cfg), Some(paper_configs)) = (&cfg.paper, &cfg.paper_configs) {
+        info!("Paper scanner enabled — 5 configs running alongside live");
+        paper_runners.push(PaperRunner::new(paper_configs.c1.clone(), paper_cfg.stake, paper_cfg.taker_fee_rate, "logs"));
+        paper_runners.push(PaperRunner::new(paper_configs.c2.clone(), paper_cfg.stake, paper_cfg.taker_fee_rate, "logs"));
+        paper_runners.push(PaperRunner::new(paper_configs.c3.clone(), paper_cfg.stake, paper_cfg.taker_fee_rate, "logs"));
+        paper_runners.push(PaperRunner::new(paper_configs.c4.clone(), paper_cfg.stake, paper_cfg.taker_fee_rate, "logs"));
+        paper_runners.push(PaperRunner::new(paper_configs.c5.clone(), paper_cfg.stake, paper_cfg.taker_fee_rate, "logs"));
+    } else {
+        info!("Paper scanner disabled (no [paper] + [paper_configs] in config.toml)");
+    }
+
     // ── Main scan loop ──────────────────────────────────────────────────────
 
     let tick = Duration::from_millis(cfg.scan.tick_ms);
@@ -329,6 +364,9 @@ async fn main() -> Result<()> {
         if shutdown.load(Ordering::SeqCst) {
             info!("Shutdown flag set — exiting scan loop");
             runner.print_stats();
+            for pr in &paper_runners {
+                pr.print_stats();
+            }
             break;
         }
 
@@ -407,6 +445,9 @@ async fn main() -> Result<()> {
                     slug, cl_settle, meta.open_price, if outcome == 1.0 { "YES" } else { "NO" });
 
                 runner.on_settlement(slug, outcome, now).await;
+                for pr in &mut paper_runners {
+                    pr.on_settlement(slug, outcome, now).await;
+                }
                 settled.insert(slug.clone(), true);
             }
         }
@@ -505,6 +546,11 @@ async fn main() -> Result<()> {
             };
 
             runner.on_signal(&sig, meta.window_end, &meta.token_yes, &meta.token_no).await;
+
+            // Dispatch to paper runners (no execution, just paper tracking)
+            for pr in &mut paper_runners {
+                pr.on_signal(&sig, meta.window_end).await;
+            }
         }
 
         // ── Real-time dashboard (every 2s) ──────────────────────────────────
@@ -577,6 +623,9 @@ async fn main() -> Result<()> {
             last_stats_ts = now;
             info!("══════════════════════════════════════════════════════════════");
             runner.print_stats();
+            for pr in &paper_runners {
+                pr.print_stats();
+            }
             info!("markets={} settled={} books={}", markets.len(), settled.len(), book_state.len());
         }
     }
