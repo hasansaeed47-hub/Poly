@@ -232,6 +232,25 @@ impl LiveRunner {
             return;
         }
 
+        // FIX: CL momentum confirmation — skip if CL moving against our side
+        let momentum_confirms = match side {
+            Side::Yes => sig.cl_momentum >= 0.0,   // YES needs CL going UP
+            Side::No  => sig.cl_momentum <= 0.0,   // NO needs CL going DOWN
+        };
+        if !momentum_confirms {
+            return;
+        }
+
+        // FIX: Book imbalance confirmation — skip if book skew contradicts signal
+        // book_imbal > 1.0 = bullish (more bids), < 1.0 = bearish (more asks)
+        let book_confirms = match side {
+            Side::Yes => sig.book_imbal >= 0.7,   // YES: don't enter if heavily bearish book
+            Side::No  => sig.book_imbal <= 1.5,   // NO: don't enter if heavily bullish book
+        };
+        if !book_confirms {
+            return;
+        }
+
         // Max $5 (one stake) per asset per window — block if any open position on same asset
         let asset_lower = sig.asset.to_lowercase();
         let asset_exposure: f64 = self.positions.values()

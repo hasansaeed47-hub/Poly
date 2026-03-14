@@ -53,6 +53,8 @@ pub struct Signal {
     pub bid_no:      f64,
     pub edge_fill_yes: f64,
     pub edge_fill_no:  f64,
+    pub cl_momentum:   f64,   // CL price change over last 30s (positive = UP)
+    pub book_imbal:    f64,   // bid_depth / ask_depth ratio (>1 = bullish)
     pub ts:          f64,
 }
 
@@ -117,6 +119,7 @@ pub fn compute(
     book_yes:   &BookData,
     book_no:    &BookData,
     stake:      f64,
+    cl_momentum: f64,
     ts:         f64,
 ) -> Option<Signal> {
     if open_price <= 0.0 || cl_price <= 0.0 || secs_left <= 0.0 { return None; }
@@ -139,6 +142,11 @@ pub fn compute(
 
     let depth_yes: f64 = book_yes.asks.iter().map(|l| l.price * l.size).sum();
     let depth_no:  f64 = book_no.asks.iter().map(|l| l.price * l.size).sum();
+
+    // Book imbalance: YES bid depth / YES ask depth (>1 = market is bullish)
+    let bid_depth_yes: f64 = book_yes.bids.iter().map(|l| l.price * l.size).sum();
+    let ask_depth_yes: f64 = depth_yes.max(0.01);
+    let book_imbal = bid_depth_yes / ask_depth_yes;
 
     let best_side = if edge_fill_yes > edge_fill_no && edge_fill_yes > 0.0 {
         Some(Side::Yes)
@@ -165,6 +173,8 @@ pub fn compute(
         depth_yes, depth_no,
         bid_yes: book_yes.best_bid, bid_no: book_no.best_bid,
         edge_fill_yes, edge_fill_no,
+        cl_momentum,
+        book_imbal,
         ts,
     })
 }
