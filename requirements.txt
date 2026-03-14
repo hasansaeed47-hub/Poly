@@ -1,0 +1,2 @@
+requests>=2.28
+py-clob-client>=0.5.0; extra == "live"
