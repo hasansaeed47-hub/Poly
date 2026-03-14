@@ -117,6 +117,63 @@ needed, done. Already handled — CITIES config uses airport coordinates.
 
 ---
 
+---
+
+### Signal Layer: WHALE FLOW (confirms other plays)
+
+Not a standalone play — a signal that strengthens or weakens our other plays.
+
+**How we know they're weather whales:**
+Polymarket has a weather-specific leaderboard. We don't guess.
+
+```
+GET https://data-api.polymarket.com/v1/leaderboard?category=WEATHER&orderBy=PNL&limit=100
+```
+
+Returns top 100 weather traders by profit with wallet addresses. No auth.
+
+**How we watch them:**
+
+```
+GET https://data-api.polymarket.com/trades?market={condition_id}
+```
+
+Returns all trades on a weather market: wallet, side, size, price, timestamp.
+Filter for wallets from the leaderboard. Poll every 30-60 seconds.
+
+**Two signals:**
+
+1. **Volume spike on a bucket.** If $500 flows into "66-67°F NYC" in 5 min
+   when normal flow is $20/hr, someone with information is moving.
+   We don't need to know who — the flow itself is the signal.
+
+2. **Whale convergence.** If 3+ leaderboard wallets buy the same bucket
+   within an hour, they probably all got the same model update.
+   Strong confirmation for Play 2 shift trades.
+
+**How it fits each play:**
+- Play 1 (end-of-day lock): irrelevant — we already know the answer
+- Play 2 (shift scalp): whale flow CONFIRMS the shift is real
+- Play 3 (NO grind): if a whale buys YES on a bucket we hold NO on, warning
+
+**Key endpoints (all public, no auth):**
+
+| What | Endpoint |
+|------|----------|
+| Weather leaderboard | `data-api/v1/leaderboard?category=WEATHER&orderBy=PNL` |
+| Trades on a market | `data-api/trades?market={condition_id}` |
+| Whale's positions | `data-api/positions?user={wallet}` |
+| Whale's profile | `gamma-api/public-profile?address={wallet}` |
+
+**Known whale wallets (from research):**
+- gopfan2: `0xf2f6af4f27ec2dcf4072095ab804016e14cd5817` ($700K+ weather profits)
+- Hans323: `0x0f37cb80dee49d55b5f6d9e595d52591d6371410` ($1.1M single weather trade)
+- (more discovered automatically from leaderboard)
+
+**Implementation priority:** After Play 1, 2, 3 are working. This is enhancement.
+
+---
+
 ## Decisions Made
 
 - **Hold rules:** Play 1 (end-of-day lock) → hold to settlement.
