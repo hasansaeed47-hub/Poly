@@ -220,7 +220,18 @@ impl LagRunner {
                 continue;
             }
 
-            // ── Exit 4: TIME ────────────────────────────────────────────
+            // ── Exit 4: HARD STOP-LOSS ────────────────────────────────
+            // Bid dropped 50%+ from entry → cut losses immediately
+            if exit_bid <= pos.entry_price * 0.50 && secs_left > 60.0 {
+                info!(
+                    "[LAG_RUNNER] HARD_SL {} bid={:.3} <= 50% of entry={:.3} hold={:.1}s",
+                    pos.slug, exit_bid, pos.entry_price, hold_secs
+                );
+                self.exit_position(&trade_id, exit_bid, "HARD_SL", now).await;
+                continue;
+            }
+
+            // ── Exit 5: TIME ────────────────────────────────────────────
             // Held too long without convergence → exit at bid
             if hold_secs > self.config.max_hold_secs && secs_left > 60.0 {
                 info!(
@@ -391,7 +402,7 @@ impl LagRunner {
 
         match reason {
             "CONVERGENCE" => self.stats.convergence += 1,
-            "REVERSAL_SL" => self.stats.reversal_sl += 1,
+            "REVERSAL_SL" | "HARD_SL" => self.stats.reversal_sl += 1,
             "TIME_EXIT"   => self.stats.time_exits += 1,
             _ => {}
         }
