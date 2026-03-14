@@ -1,0 +1,66 @@
+# Split-Sell Arbitrage Paper Trading Bot
+# WebSocket-driven with 500ms arb scan tick
+# Targets ALL binary markets — 5m crypto windows are highest-frequency arb source
+
+[api]
+# Polymarket CLOB REST (discovery + initial snapshots only)
+clob_rest = "https://clob.polymarket.com"
+# Polymarket CLOB WebSocket (real-time book updates)
+clob_ws = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# Gamma API (market discovery)
+gamma_api = "https://gamma-api.polymarket.com"
+# Throttle between REST calls (ms) — only affects discovery, not scan tick
+throttle_ms = 400
+# Book fetch batch size — how many token IDs per /books POST
+# Polymarket CLOB handles up to ~100 per request; bigger batches = fewer throttled calls
+book_batch_size = 100
+
+[scan]
+# Arb scan tick interval (milliseconds) — how fast we check all books
+# 500ms = 2 scans/second, continuously checking for YES+NO > $1.00
+interval_ms = 500
+# REST discovery interval — find new markets (seconds)
+# Markets don't appear/disappear fast, so 60s is fine
+# Crypto windows rotate every 5min — discover every 15s to catch new opens fast
+discovery_interval_secs = 15
+# Max markets to track simultaneously
+max_markets = 200
+# Gamma API: how many events per page
+gamma_page_size = 50
+# Gamma API: how many pages to fetch on discovery
+gamma_pages = 10
+# Only consider markets with this much fillable depth on EACH side ($)
+min_depth_usd = 20.0
+# Slug/question keyword filter — used by general discovery fallback only
+# Crypto window discovery always uses ["btc", "eth", "sol", "xrp"]
+slug_keywords = ["btc", "eth", "sol", "xrp"]
+time_keywords = []
+
+[arb]
+# Paper bankroll ($)
+bankroll = 500.0
+# Max stake per arb ($) — amount of USDC to split
+max_stake = 25.0
+# Min profit after fees to trigger entry (cents)
+min_profit_cents = 1.5
+# Taker fee rate (Polymarket max — 1.56% at 50c, 0% at 0c/100c)
+max_taker_fee_rate = 0.02
+# Simulated fill slippage (bps off best bid)
+slippage_bps = 10
+# Simulated execution delay (seconds) — relayer confirmation
+exec_delay_secs = 2.0
+# Cooldown per market: don't re-arb same market within N seconds
+# Prevents hammering the same mispriced book before it corrects
+cooldown_secs = 5.0
+# Max entries per market per session — allows repeated arbs on longer windows
+# 60m market swinging 3-5 times = 3-5 arb entries on the same market
+# Set high to not cap artificially; the cooldown + depth check are the real limits
+max_entries_per_market = 10
+
+[logging]
+# JSONL trade log
+trade_log = "logs/trades.jsonl"
+# JSONL scan log (all opportunities seen)
+scan_log = "logs/scans.jsonl"
+# Console log level: DEBUG, INFO, WARN, ERROR
+level = "INFO"
