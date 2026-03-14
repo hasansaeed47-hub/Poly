@@ -103,7 +103,6 @@ pub struct StrategyConfig {
     pub min_entry_price:  f64,
     pub max_sigma:        f64,
     pub min_move_pct:     f64,
-    pub max_fair:         f64,
     pub stop_loss:        bool,
     pub take_profit:      bool,
     pub partial_tp_pct:   f64,
@@ -234,16 +233,11 @@ impl LiveRunner {
             return;
         }
 
-        // FIX: Min price deviation — skip when underlying move is within noise
-        // A -0.06% dip on BTC is bid-ask bounce, not a real directional signal.
-        // BS overextrapolates tiny moves into high-confidence bets.
+        // FIX: Noise filter — require minimum absolute price move
+        // Pure safety net for sub-noise moves (e.g. 0.01% jitter)
+        // The main overconfidence fix is the sigma inflation in signal.rs
         let pct_move = ((sig.cl_price / sig.open_price) - 1.0).abs() * 100.0;
         if pct_move < self.config.min_move_pct {
-            return;
-        }
-
-        // FIX: Fair value cap — BS becomes unreliable at extremes
-        if sig.best_fair > self.config.max_fair {
             return;
         }
 

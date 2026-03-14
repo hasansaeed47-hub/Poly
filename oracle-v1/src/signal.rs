@@ -58,10 +58,28 @@ pub struct Signal {
 
 // ── Black-Scholes binary call ───────────────────────────────────────────────
 
+/// Microstructure noise floor: crypto prices at the 5-min timescale exhibit
+/// ~0.10% noise from bid-ask bounce, spread crossing, and CL feed jitter.
+/// When BS remaining_vol drops below this, the model becomes overconfident
+/// on tiny moves. Inflate sigma so remaining_vol never falls below this floor.
+const NOISE_FLOOR: f64 = 0.0010; // 0.10% — tuned for BTC/ETH/SOL 5-min markets
+
 pub fn fair_yes(cl: f64, open: f64, sigma: f64, secs_left: f64) -> f64 {
     let sigma = sigma.max(MIN_SIGMA);
     let t     = (secs_left / SECS_PER_YEAR).max(MIN_T);
-    let d1    = (cl / open).ln() / (sigma * t.sqrt());
+
+    // Inflate sigma when remaining vol is below microstructure noise floor.
+    // This prevents BS from being overconfident on sub-noise price moves.
+    // At T-206s, sigma=0.30: remaining_vol = 0.077% < 0.10%, inflate to ~0.39
+    // At T-600s, sigma=0.30: remaining_vol = 0.131% > 0.10%, no change
+    let remaining_vol = sigma * t.sqrt();
+    let effective_sigma = if remaining_vol < NOISE_FLOOR {
+        NOISE_FLOOR / t.sqrt()
+    } else {
+        sigma
+    };
+
+    let d1    = (cl / open).ln() / (effective_sigma * t.sqrt());
     let n     = Normal::new(0.0, 1.0).expect("normal distribution");
     n.cdf(d1).clamp(0.001, 0.999)
 }

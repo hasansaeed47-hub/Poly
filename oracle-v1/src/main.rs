@@ -106,8 +106,6 @@ struct StrategyConfigFile {
     max_sigma:         f64,
     #[serde(default = "default_min_move_pct")]
     min_move_pct:      f64,
-    #[serde(default = "default_max_fair")]
-    max_fair:          f64,
     stop_loss:         bool,
     take_profit:       bool,
     partial_tp_pct:    f64,
@@ -120,8 +118,7 @@ struct StrategyConfigFile {
 }
 
 fn default_max_concurrent() -> usize { 6 }
-fn default_min_move_pct() -> f64 { 0.08 }
-fn default_max_fair() -> f64 { 0.85 }
+fn default_min_move_pct() -> f64 { 0.05 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -273,7 +270,6 @@ async fn main() -> Result<()> {
         min_entry_price:   cfg.strategy.min_entry_price,
         max_sigma:         cfg.strategy.max_sigma,
         min_move_pct:      cfg.strategy.min_move_pct,
-        max_fair:          cfg.strategy.max_fair,
         stop_loss:         cfg.strategy.stop_loss,
         take_profit:       cfg.strategy.take_profit,
         partial_tp_pct:    cfg.strategy.partial_tp_pct,
