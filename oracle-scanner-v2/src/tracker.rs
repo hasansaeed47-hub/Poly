@@ -95,43 +95,6 @@ struct LeaderboardEntry {
     display_name: Option<String>,
 }
 
-// -- Trades API response ------------------------------------------------------
-
-#[derive(Deserialize, Debug)]
-#[allow(dead_code)]
-struct TradeEntry {
-    #[serde(default)]
-    id:            Option<String>,
-    #[serde(default, alias = "tradeId")]
-    trade_id:      Option<String>,
-    #[serde(default)]
-    maker:         Option<String>,
-    #[serde(default)]
-    taker:         Option<String>,
-    #[serde(default, alias = "makerAddress")]
-    maker_address: Option<String>,
-    #[serde(default, alias = "takerAddress")]
-    taker_address: Option<String>,
-    #[serde(default)]
-    price:         Option<serde_json::Value>,  // can be string or float
-    #[serde(default)]
-    size:          Option<serde_json::Value>,
-    #[serde(default)]
-    side:          Option<String>,  // "BUY" or "SELL"
-    #[serde(default)]
-    outcome:       Option<String>,
-    #[serde(default, alias = "asset_id", alias = "assetId")]
-    token_id:      Option<String>,
-    #[serde(default, alias = "conditionId", alias = "condition_id")]
-    condition_id:  Option<String>,
-    #[serde(default)]
-    timestamp:     Option<serde_json::Value>,
-    #[serde(default, alias = "matchTime")]
-    match_time:    Option<serde_json::Value>,
-    #[serde(default, alias = "market")]
-    market_slug:   Option<String>,
-}
-
 // -- Tracked wallet -----------------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -146,6 +109,7 @@ struct TrackedWallet {
 // -- Active market info passed from main --------------------------------------
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct ActiveMarketInfo {
     pub slug:         String,
     pub asset:        String,
@@ -297,7 +261,9 @@ impl WhaleTracker {
         Ok(())
     }
 
-    /// Poll trades for tracked wallets on active markets
+    /// Poll trades for tracked wallets on active markets.
+    /// Uses the public /live-activity/events/{condition_id} endpoint which
+    /// returns user.address per trade — one call per market, no auth needed.
     async fn poll_trades(&mut self, active_markets: &[ActiveMarketInfo]) -> Result<Vec<WhaleTradeLog>> {
         if self.wallets.is_empty() || active_markets.is_empty() {
             return Ok(Vec::new());
@@ -306,98 +272,120 @@ impl WhaleTracker {
         let now = Self::now_secs();
         let mut all_trades: Vec<WhaleTradeLog> = Vec::new();
 
-        // Strategy: poll trades by token_id (more efficient than per-wallet)
-        // Then filter for our tracked wallets
         let wallet_set: HashMap<String, &TrackedWallet> = self.wallets.iter()
             .map(|w| (w.address.to_lowercase(), w))
             .collect();
 
+        // Deduplicate condition_ids (multiple slugs may share same condition)
+        let mut seen_conditions: HashSet<String> = HashSet::new();
+
         for market in active_markets {
-            // Poll trades for YES token
-            for (token_id, outcome) in [
-                (&market.token_yes, "YES"),
-                (&market.token_no, "NO"),
-            ] {
-                let trades = self.fetch_recent_trades(token_id).await;
-                let trades = match trades {
-                    Ok(t) => t,
-                    Err(e) => {
-                        debug!("[WHALE] trade fetch failed for {}: {}", market.slug, e);
+            if !seen_conditions.insert(market.condition_id.clone()) { continue; }
+            if market.condition_id.is_empty() { continue; }
+
+            let events = self.fetch_live_activity(&market.condition_id).await;
+            let events = match events {
+                Ok(e) => e,
+                Err(e) => {
+                    debug!("[WHALE] live-activity failed for {}: {}", market.slug, e);
+                    continue;
+                }
+            };
+
+            for event in &events {
+                // Dedup by transaction_hash (most reliable unique ID)
+                let tx_hash = event.get("transaction_hash")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if tx_hash.is_empty() { continue; }
+                if self.seen_trades.contains(&tx_hash) { continue; }
+
+                // Extract user address from nested user object
+                let user_addr = event.get("user")
+                    .and_then(|u| u.get("address"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+
+                // Check if this is a tracked wallet
+                let wallet = match wallet_set.get(&user_addr) {
+                    Some(w) => *w,
+                    None => {
+                        self.seen_trades.insert(tx_hash);
                         continue;
                     }
                 };
 
-                for trade in &trades {
-                    let trade_id = trade.id.as_deref()
-                        .or(trade.trade_id.as_deref())
-                        .unwrap_or_default()
-                        .to_string();
-                    if trade_id.is_empty() { continue; }
-                    if self.seen_trades.contains(&trade_id) { continue; }
+                let price = parse_f64_json(event.get("price"));
+                let size = parse_f64_json(event.get("size"));
+                let usd_value = price * size;
 
-                    // Check if maker or taker is a tracked wallet
-                    let maker_addr = trade.maker.as_deref()
-                        .or(trade.maker_address.as_deref())
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    let taker_addr = trade.taker.as_deref()
-                        .or(trade.taker_address.as_deref())
-                        .unwrap_or_default()
-                        .to_lowercase();
+                // Always dedup, even if below threshold
+                self.seen_trades.insert(tx_hash.clone());
 
-                    let (wallet, taker_or_maker) = if let Some(w) = wallet_set.get(&maker_addr) {
-                        (*w, "MAKER")
-                    } else if let Some(w) = wallet_set.get(&taker_addr) {
-                        (*w, "TAKER")
-                    } else {
-                        continue; // not a tracked wallet
-                    };
+                if usd_value < self.cfg.min_trade_usd { continue; }
 
-                    let price = parse_f64_value(trade.price.as_ref());
-                    let size = parse_f64_value(trade.size.as_ref());
-                    let usd_value = price * size;
+                let side = event.get("side")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("UNKNOWN")
+                    .to_string();
 
-                    // Filter by minimum trade size
-                    if usd_value < self.cfg.min_trade_usd {
-                        self.seen_trades.insert(trade_id);
-                        continue;
-                    }
+                let outcome = event.get("outcome")
+                    .and_then(|o| o.as_str())
+                    .unwrap_or("UNKNOWN")
+                    .to_string();
 
-                    let side = trade.side.clone().unwrap_or_else(|| "UNKNOWN".to_string());
+                // Determine which token was traded
+                let asset_id = event.get("market")
+                    .and_then(|m| m.get("asset_id"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or_default()
+                    .to_string();
 
-                    info!("[WHALE] {} ${:.0} {} {} on {} (rank #{}, PNL ${:.0})",
-                        taker_or_maker,
-                        usd_value, &side, outcome, market.slug,
-                        wallet.rank, wallet.pnl
-                    );
+                // Map outcome: UP->YES, DOWN->NO (Polymarket naming)
+                let outcome_mapped = if outcome.eq_ignore_ascii_case("Up") { "YES" }
+                    else if outcome.eq_ignore_ascii_case("Down") { "NO" }
+                    else { &outcome };
 
-                    let log = WhaleTradeLog {
-                        ts: now,
-                        wallet: wallet.address.clone(),
-                        wallet_rank: wallet.rank,
-                        wallet_pnl: wallet.pnl,
-                        market_slug: market.slug.clone(),
-                        asset: market.asset.clone(),
-                        tf: market.tf,
-                        side,
-                        outcome: outcome.to_string(),
-                        price,
-                        size,
-                        usd_value,
-                        trade_id: trade_id.clone(),
-                        condition_id: market.condition_id.clone(),
-                        token_id: token_id.clone(),
-                        taker_or_maker: taker_or_maker.to_string(),
-                    };
+                let username = event.get("user")
+                    .and_then(|u| u.get("pseudonym")
+                        .or(u.get("username")))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or_default();
 
-                    all_trades.push(log);
-                    self.seen_trades.insert(trade_id);
-                    self.trade_count.fetch_add(1, Ordering::Relaxed);
-                }
+                info!("[WHALE] ${:.0} {} {} on {} by rank #{} {} (PNL ${:.0})",
+                    usd_value, side, outcome_mapped, market.slug,
+                    wallet.rank,
+                    if username.is_empty() { &user_addr[..8.min(user_addr.len())] } else { username },
+                    wallet.pnl
+                );
+
+                let log = WhaleTradeLog {
+                    ts: now,
+                    wallet: wallet.address.clone(),
+                    wallet_rank: wallet.rank,
+                    wallet_pnl: wallet.pnl,
+                    market_slug: market.slug.clone(),
+                    asset: market.asset.clone(),
+                    tf: market.tf,
+                    side,
+                    outcome: outcome_mapped.to_string(),
+                    price,
+                    size,
+                    usd_value,
+                    trade_id: tx_hash,
+                    condition_id: market.condition_id.clone(),
+                    token_id: asset_id,
+                    taker_or_maker: "TAKER".to_string(), // live-activity doesn't distinguish
+                };
+
+                all_trades.push(log);
+                self.trade_count.fetch_add(1, Ordering::Relaxed);
             }
         }
 
-        // Prevent unbounded growth of seen_trades (keep last 50k)
+        // Cap seen_trades at 50k
         if self.seen_trades.len() > 50_000 {
             let to_remove: Vec<String> = self.seen_trades.iter()
                 .take(self.seen_trades.len() - 25_000)
@@ -411,73 +399,46 @@ impl WhaleTracker {
         Ok(all_trades)
     }
 
-    /// Fetch recent trades for a token_id from CLOB API
-    async fn fetch_recent_trades(&self, token_id: &str) -> Result<Vec<TradeEntry>> {
-        // CLOB endpoint: GET /trades?asset_id={token_id}
-        let url = format!("{}/trades?asset_id={}", self.cfg.clob_rest, token_id);
+    /// Fetch recent trade events via public CLOB endpoint.
+    /// GET /live-activity/events/{condition_id}
+    /// Returns array of trade events with user.address, side, size, price, etc.
+    /// No auth required.
+    async fn fetch_live_activity(&self, condition_id: &str) -> Result<Vec<serde_json::Value>> {
+        let url = format!("{}/live-activity/events/{}", self.cfg.clob_rest, condition_id);
 
         let resp = self.client.get(&url)
             .timeout(Duration::from_secs(5))
             .send()
             .await
-            .context("CLOB trades request failed")?;
+            .context("CLOB live-activity request failed")?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            debug!("[WHALE] trades endpoint returned {} for {}: {}",
-                status, token_id, &body[..body.len().min(200)]);
-
-            // Fallback: try data-api trades endpoint
-            return self.fetch_trades_data_api(token_id).await;
+            debug!("[WHALE] live-activity returned {} for {}", status, condition_id);
+            // Fallback: try older trades endpoint by token_id
+            return Ok(Vec::new());
         }
 
         let text = resp.text().await.unwrap_or_default();
 
-        // Response might be array or { trades: [...] } or { data: [...] }
-        if let Ok(trades) = serde_json::from_str::<Vec<TradeEntry>>(&text) {
-            return Ok(trades);
+        // Response is typically an array of trade event objects
+        if let Ok(events) = serde_json::from_str::<Vec<serde_json::Value>>(&text) {
+            return Ok(events);
         }
 
+        // Or might be wrapped: { "data": [...] } or { "events": [...] }
         if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&text) {
-            for key in &["trades", "data", "results"] {
+            for key in &["data", "events", "trades"] {
                 if let Some(arr) = obj.get(key) {
-                    if let Ok(trades) = serde_json::from_value::<Vec<TradeEntry>>(arr.clone()) {
-                        return Ok(trades);
+                    if let Ok(events) = serde_json::from_value::<Vec<serde_json::Value>>(arr.clone()) {
+                        return Ok(events);
                     }
                 }
             }
-        }
-
-        Ok(Vec::new())
-    }
-
-    /// Fallback: use data-api for trades
-    async fn fetch_trades_data_api(&self, token_id: &str) -> Result<Vec<TradeEntry>> {
-        let url = format!("{}/trades?asset_id={}&limit=100", self.cfg.data_api, token_id);
-
-        let resp = self.client.get(&url)
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await;
-
-        match resp {
-            Ok(r) if r.status().is_success() => {
-                let text = r.text().await.unwrap_or_default();
-                if let Ok(trades) = serde_json::from_str::<Vec<TradeEntry>>(&text) {
-                    return Ok(trades);
-                }
-                if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&text) {
-                    for key in &["trades", "data"] {
-                        if let Some(arr) = obj.get(key) {
-                            if let Ok(trades) = serde_json::from_value::<Vec<TradeEntry>>(arr.clone()) {
-                                return Ok(trades);
-                            }
-                        }
-                    }
-                }
+            // If it's an object with trade-like fields, wrap it
+            if obj.get("transaction_hash").is_some() {
+                return Ok(vec![obj]);
             }
-            _ => {}
         }
 
         Ok(Vec::new())
@@ -559,7 +520,8 @@ fn open_append(path: &str) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-fn parse_f64_value(v: Option<&serde_json::Value>) -> f64 {
+/// Parse f64 from JSON value (can be number or string)
+fn parse_f64_json(v: Option<&serde_json::Value>) -> f64 {
     match v {
         Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(0.0),
         Some(serde_json::Value::String(s)) => s.parse::<f64>().unwrap_or(0.0),
