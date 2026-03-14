@@ -1,209 +1,132 @@
-# Weather Bot Strategy — v4
+# Weather Bot Strategy — v5 (verified data feeds)
 
-## The 3 Plays
+## Data Feeds
 
-### Play 1: END-OF-DAY LOCK (highest conviction) → HOLD TO WIN
+All free, no API keys required (except WU which is optional):
 
-The temperature is already recorded. Weather Underground shows today's high.
-The winning bucket is KNOWN or nearly known. But the market hasn't settled yet
-(UMA oracle takes 2+ hours). So the winning bucket might still be at 60-80¢
-instead of $1.00.
+| Feed | Endpoint | What | Used For |
+|------|----------|------|----------|
+| **METAR** | `aviationweather.gov/api/data/metar?ids=KLGA&format=json` | Airport observations (°C, hourly) | Play 1: observed high tracking |
+| **Open-Meteo** | `api.open-meteo.com/v1/forecast` | Point forecast (worldwide) | Fallback forecast |
+| **GFS Ensemble** | `ensemble-api.open-meteo.com/v1/ensemble` | 31-member ensemble (member00-30) | Probability engine |
+| **NOAA** | `api.weather.gov/gridpoints/{office}/{grid}/forecast` | US forecast | Backup forecast |
+| **WU** (optional) | `api.weather.com/v2/pws/observations/current` | Settlement source obs | Higher confidence obs |
+| **Gamma API** | `gamma-api.polymarket.com/events` | Market discovery | Find temperature markets |
+| **CLOB** | `clob.polymarket.com/midpoints`, `/book` | Prices + orderbook | Live pricing |
+| **Data API** | `data-api.polymarket.com/trades`, `/v1/leaderboard` | Trades + whales | Play 4 whale tracking |
 
-**How it works:**
-- Late afternoon / evening: fetch ACTUAL high from Weather Underground
-- The high is already set — it's an observation, not a forecast
-- Find the matching bucket. If it's trading below 90¢, buy YES.
-- HOLD TO SETTLEMENT. Collect the spread to $1.00.
+### Key API details (verified)
 
-**Why this is the best play:**
-- Zero forecast risk. The temperature already happened.
-- The only risk is: WU revises the data (rare), or we misread the bucket.
-- This is basically free money limited only by liquidity and timing.
-
-**When:** Last 4-6 hours of the day (after the daily high is likely set).
-Earlier if the weather pattern is simple (clear day, high hit by 2pm).
-
-**Edge:** 5-40¢ per dollar depending on how fast the market converges.
-
-**Exit:** HOLD TO SETTLEMENT. The outcome is already determined. No reason
-to sell early — every cent below $1.00 is profit we'd leave on the table.
+- **GFS ensemble fields**: `temperature_2m_max_member00` through `_member30` (zero-indexed, zero-padded)
+- **Gamma clobTokenIds/outcomePrices**: returned as JSON **strings**, must `json.loads()` to parse
+- **Trade fields**: `asset` = token ID, `size` = shares (not USD), `side` = `"BUY"`/`"SELL"` (uppercase), `timestamp` = unix epoch
+- **Leaderboard fields**: `proxyWallet`, `pnl`, `userName` — category `WEATHER` confirmed
+- **METAR fields**: `temp` in °C, `obsTime` = unix epoch, `maxT` exists but usually null (must track running max ourselves)
 
 ---
 
-### Play 2: FORECAST SHIFT SCALP (main active trading) → FAST SCALP
+## The 4 Plays
 
-GFS model updates 4x/day. When it shifts, market prices lag 10-30 min.
-Buy the shift, sell as soon as the market reprices. Fast in, fast out.
+### Play 1: END-OF-DAY LOCK → HOLD TO WIN
 
-**How it works:**
-- Store previous ensemble probabilities
-- When new GFS data drops (every ~6h), compute new probabilities
-- Buy buckets that GAINED probability where market price is stale
-- Sell AS SOON AS market price moves toward our probability
-- NEVER hold to settlement. Scalp the reprice only.
+**What:** After the daily high is set, buy YES on the winning bucket.
 
-**Fresh run detection:**
-We can't directly see which GFS init time Open-Meteo is serving. But we CAN:
-1. Compare ensemble member values between fetches. If 5+ members changed by
-   1°F+, a new run dropped.
-2. Track the GFS schedule (data avail ~03:30, 09:30, 15:30, 21:30 UTC).
-   Fetch more frequently during these windows.
-3. Cross-reference: if our ensemble shifted AND our WU/NOAA point forecast
-   also moved, it's a real model update, not API noise.
+**Data source:** METAR airport observation (free, same stations WU uses).
+We fetch current temp hourly and track the **running maximum** — that's
+today's observed high. WU observations used if WU_API_KEY is set.
 
-**Sell FAST:**
-- Don't wait for full convergence. If we bought at 15¢ and it's now 18¢,
-  sell. That's a 20% return in minutes. Take it.
-- Target: 3-5¢ profit per share, exit immediately.
-- Place limit sell at entry + 3-5¢ right after buy fills.
-- Hard timeout: exit at market after 30 min regardless of P&L.
-  If the market didn't move in 30 min, the shift wasn't tradeable.
-- NEVER hold past the next model run (6h max). Stale shift = no edge.
+**Time gate:** Only activates after 20:00 UTC for US cities (~4pm ET),
+after 10:00 UTC for Asian cities (~7pm local). By this time the daily
+high is almost always locked in.
 
-**First boot:** NO shift trades until second ensemble fetch. Need history.
+**Single bucket:** Only buys the ONE bucket where the observed high falls
+most centrally. Previous version bought all adjacent buckets — guaranteed
+loss on all but one.
+
+**Edge:** 5-40¢ per dollar. Zero forecast risk. The temp already happened.
+
+**Exit:** HOLD TO SETTLEMENT.
 
 ---
 
-### Play 3: NO GRIND (safe income, always on)
+### Play 2: FORECAST SHIFT SCALP → FAST SCALP
 
-Buy NO on dead buckets (extreme tails). Ensemble says <5% probability,
-NO price is 85¢+. Collect 5-15¢ per dollar when bucket resolves to 0.
+**What:** GFS updates 4x/day. Buy buckets that gained probability. Sell fast.
 
-This doesn't require any edge or timing. Dead buckets stay dead.
-Win rate ~95%. Small profit per trade but extremely consistent.
+**Shift detection:** Compare ensemble members between fetches. A real model
+update changes 5+ of 31 members by 1°F+. If members are identical, it's
+the same GFS run and we DON'T trade (prevents false signals from API noise).
 
-**Sell:** Never. Hold to settlement. These almost always win.
+**Kelly sizing:** Uses AVAILABLE capital (MAX_DEPLOYED minus deployed), not
+the fixed MAX_DEPLOYED. Prevents over-allocation as positions accumulate.
 
----
-
-## What We Do NOT Do
-
-- **Buy YES on random buckets hoping they hit.** A 20% bucket loses 80% of the time.
-- **Hold shift trades to settlement.** The edge is in the reprice, not the outcome.
-- **Trade without a shift signal or end-of-day observation.** No signal = no trade.
-- **Buy YES above 50¢.** The $2M loss trader bought at 51-67¢. We don't.
-- **Trade on first boot.** Wait for second ensemble fetch to have shift data.
+**Exit:** 4¢ take profit, 30 min timeout, or 8%+ probability reversal.
 
 ---
 
-## Model Calibration — SKIP
+### Play 3: NO GRIND → HOLD TO WIN
 
-Decided against ongoing model calibration. Reasoning:
+**What:** Buy NO on dead buckets. Ensemble says <5% probability, NO price >85¢.
 
-- **Play 1:** Uses actual observations, not forecasts. Calibration irrelevant.
-- **Play 2:** The edge is SPEED (trading the shift delta), not ACCURACY.
-  When GFS shifts 3°F, the market reprices regardless of which model is
-  "more accurate." We sell in minutes. We don't need to be right about
-  the final temperature.
-- **Play 3:** Dead buckets are dead. A 2°F model bias doesn't matter.
+**No timing dependency.** Always valid.
 
-Research backs this: profitable bots (suislanchez, solship, gopfan2) use
-simple threshold rules, not calibrated models. The $2M loss trader probably
-had the most sophisticated model.
-
-**The one thing that matters (one-time, not ongoing):**
-Verify that Open-Meteo ensemble coordinates match the WU settlement station.
-If ensemble is for central Manhattan but PM settles on LaGuardia airport,
-there could be a systematic 1-2°F offset. Check once, adjust lat/lon if
-needed, done. Already handled — CITIES config uses airport coordinates.
+**Exit:** HOLD TO SETTLEMENT.
 
 ---
 
-## Priority Order
+### Play 4: WHALE FLOW → FAST SCALP
 
-1. **End-of-day lock** — highest conviction, zero forecast risk
-2. **NO grind** — always running, no timing dependency
-3. **Forecast shift scalp** — main active trading, needs ensemble history
-4. **Whale flow** — copy proven winners, needs leaderboard + trade polling
+**What:** Copy the top 50 weather traders from Polymarket's weather leaderboard.
+
+**Trade filtering (fixed):**
+- Timestamp filter: only follow trades from the last hour (unix epoch comparison)
+- `asset` field confirmed = token ID (matches `bucket.token_yes`)
+- `size` field = shares, so USD = `size * price`
+
+**Exit:** Same as Play 2 — fast scalp.
 
 ---
 
+## Fixes in v5 (from v4 weakness analysis)
+
+1. **Play 1 time gate** — only fires after 20 UTC (US) / 10 UTC (Asia)
+2. **Play 1 uses observations** — METAR + WU running max, not forecast high
+3. **Play 1 single bucket** — picks the one best bucket, not all adjacent
+4. **Ensemble member00 fix** — was looking for wrong key name, now `member{i:02d}`
+5. **Whale timestamp filter** — cutoff variable actually used now
+6. **Kelly uses available capital** — `MAX_DEPLOYED - deployed` not `MAX_DEPLOYED`
+7. **Position persistence** — saves to `bot_state.json` every tick, restores on restart
+8. **Event caching** — Gamma API called every 15 min, not every 60s
+9. **Settlement PnL fix** — uses `profit = -pos.cost` consistently for losses
+10. **Shift detection** — verifies ensemble members actually changed (new GFS run)
+11. **City coordinates** — updated to actual airport coords, not city centers
+12. **METAR data feed** — free alternative to WU for airport observations
+
 ---
 
-### Play 4: WHALE FLOW (copy the best weather traders) → FAST SCALP
+## Running
 
-Follow the money. Polymarket has a weather-specific leaderboard that tells
-us exactly who the profitable weather traders are and what they're buying.
+```bash
+# Paper mode (default)
+python simple.py
 
-**How we know they're weather whales:**
-Polymarket categorizes them for us. One API call:
+# Live mode (requires POLY_API_KEY)
+POLY_API_KEY=xxx POLY_API_SECRET=xxx POLY_API_PASSPHRASE=xxx python simple.py --live
 
-```
-GET https://data-api.polymarket.com/v1/leaderboard?category=WEATHER&orderBy=PNL&limit=100
+# With Weather Underground (optional, improves Play 1)
+WU_API_KEY=xxx python simple.py
 ```
 
-Returns top 100 weather traders by profit with wallet addresses. No auth.
-
-**How we watch them:**
-
-```
-GET https://data-api.polymarket.com/trades?market={condition_id}
-```
-
-Returns all trades on a weather market: wallet, side, size, price, timestamp.
-Filter for wallets from the leaderboard. Poll every 30-60 seconds.
-
-**How it works:**
-- On startup: fetch weather leaderboard, store top 50 wallet addresses
-- Every tick: poll recent trades on today's weather markets
-- When a whale buys YES on a bucket → that's a BUY signal
-- When multiple whales converge on the same bucket → strong signal
-- Buy the same bucket, scalp fast (same as Play 2 — don't hold)
-
-**Two independent signals:**
-
-1. **Volume spike on a bucket.** $500+ flows into one bucket in 5 min
-   when normal flow is $20/hr. Someone with information is moving.
-   Don't need to know who — the flow is the signal.
-
-2. **Whale convergence.** 3+ leaderboard wallets buy the same bucket
-   within an hour. They probably all got the same model update.
-
-**Interaction with other plays:**
-- Strengthens Play 2: if our shift signal AND whale flow agree, higher confidence
-- Warns Play 3: if a whale buys YES on a bucket we hold NO on, consider exiting
-- Independent of Play 1: end-of-day lock doesn't need whale confirmation
-
-**Exit:** Same as Play 2 — fast scalp. Don't hold to settlement.
-
-**Key endpoints (all public, no auth):**
-
-| What | Endpoint |
-|------|----------|
-| Weather leaderboard | `data-api/v1/leaderboard?category=WEATHER&orderBy=PNL` |
-| Trades on a market | `data-api/trades?market={condition_id}` |
-| Whale's positions | `data-api/positions?user={wallet}` |
-| Whale's profile | `gamma-api/public-profile?address={wallet}` |
-
-**Known whale wallets (from research):**
-- gopfan2: `0xf2f6af4f27ec2dcf4072095ab804016e14cd5817` ($700K+ weather profits)
-- Hans323: `0x0f37cb80dee49d55b5f6d9e595d52591d6371410` ($1.1M single weather trade)
-- (rest discovered automatically from leaderboard on each startup)
-
 ---
-
-## Decisions Made
-
-- **Hold rules:** Play 1 (end-of-day lock) → hold to settlement.
-  Play 2 (shift scalp) → sell fast, 30 min hard timeout.
-  Play 3 (NO grind) → hold to settlement.
-- **Model calibration:** Skip. Edge is speed not accuracy.
-- **First boot:** NO shift trades. Only NO grind and end-of-day lock.
 
 ## Open Questions
 
-1. **WU API key:** Do we have one? Without it, Play 1 needs an alternative
-   for actual observations. NOAA hourly actuals are close but may not
-   match WU exactly (different station, different rounding).
+1. **METAR vs WU discrepancy:** METAR observations are every ~1 hour. WU may
+   update more frequently. The daily high from METAR should be within 1°F of WU
+   but edge cases exist (temp spike between METAR reports).
 
-2. **Bucket matching precision:** WU shows "high: 72°F" — is the winning
-   bucket "72-73°F" or "71-72°F"? Need to verify PM's rounding rules.
-   Market rules say "whole degrees" from the specific WU station page.
+2. **Bucket rounding:** WU shows "high: 72°F" — is the winning bucket "72-73°F"
+   or "71-72°F"? PM market rules say "whole degrees" from the station page.
 
-3. **End-of-day liquidity:** When the winning bucket is obvious, will there
-   be asks left below 95¢? If the book is empty, Play 1 doesn't work.
-   Need to observe actual book depth near settlement time.
-
-4. **Sell mechanics for scalps:** Place limit sell at entry+3-5¢ immediately
-   after buy confirms? Or watch the book and sell into bids? Need to test
-   CLOB latency for round-trip speed.
+3. **Liquidity at EOD:** When the winning bucket is obvious, asks may dry up
+   above 90¢. Play 1 won't fire if no asks below 90¢.
