@@ -232,6 +232,16 @@ impl LiveRunner {
             return;
         }
 
+        // Max $5 (one stake) per asset per window — block if any open position on same asset
+        let asset_lower = sig.asset.to_lowercase();
+        let asset_exposure: f64 = self.positions.values()
+            .filter(|p| p.asset.to_lowercase() == asset_lower)
+            .map(|p| p.stake)
+            .sum();
+        if asset_exposure >= self.config.stake {
+            return;
+        }
+
         let token_id = match side {
             Side::Yes => token_yes,
             Side::No  => token_no,
