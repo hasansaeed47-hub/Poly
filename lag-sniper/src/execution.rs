@@ -91,12 +91,14 @@ pub struct FillResult {
 
 /// Convert f64 to Decimal without restricting decimal places.
 /// SDK will validate against tick_size internally.
+/// Convert f64 price to Decimal, rounded to 2 decimal places (CLOB requirement).
 fn dec(val: f64) -> Result<Decimal> {
-    Decimal::from_f64(val)
-        .ok_or_else(|| anyhow!("Cannot convert {} to Decimal", val))
+    let rounded = (val * 100.0).round() / 100.0;
+    Decimal::from_f64(rounded)
+        .ok_or_else(|| anyhow!("Cannot convert {} to Decimal", rounded))
 }
 
-/// Convert f64 to Decimal, truncated to N decimal places for size (SDK requires <= 2dp).
+/// Convert f64 to Decimal, truncated to 2 decimal places for size (CLOB requirement).
 fn dec_size(val: f64) -> Result<Decimal> {
     let truncated = (val * 100.0).floor() / 100.0;
     Decimal::from_f64(truncated)
