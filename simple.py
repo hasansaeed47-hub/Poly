@@ -56,9 +56,12 @@ NO_STAKE = 5.0        # $ per NO bet (play 3 — bigger stake, small payout)
 MAX_DEPLOYED = 80.0   # max total $ out at once
 MAX_POSITIONS = 30    # max open positions
 
-# ── Play 1: Open ──
-TOP_N_BUCKETS = 3     # buy top 3 forecast-aligned buckets
+# ── Play 1: Open (neobrother-style weighted laddering) ──
+TOP_N_BUCKETS = 5     # spread across 5 forecast-aligned buckets
 MAX_YES_PRICE = 0.50  # don't overpay for YES (50¢ max = 2:1 payout)
+# Weight multipliers by rank: center bucket gets full stake, edges get less
+# Rank 0 (center) = 1.5x, Rank 1 = 1.0x, Rank 2 = 0.7x, Rank 3 = 0.4x, Rank 4 = 0.25x
+LADDER_WEIGHTS = [1.5, 1.0, 0.7, 0.4, 0.25]
 
 # ── Play 3: NO Grind ──
 MIN_NO_PRICE = 0.90   # only buy NO if price >= 90¢ (very likely to win)
@@ -734,14 +737,24 @@ def forecast_to_probs(forecast: Forecast, buckets: List[Bucket]) -> List[Bucket]
 
 def play1_open(buckets: List[Bucket], forecast: Forecast) -> List[dict]:
     """
-    PLAY 1: OPEN — Buy YES on top 3 forecast-aligned buckets.
-    The closer to forecast center, the more we trust it.
+    PLAY 1: OPEN — Weighted ladder across top 5 forecast-aligned buckets.
+
+    Neobrother-style: spread bets across adjacent buckets with heavier
+    weight on center (highest-probability) buckets. This increases
+    hit rate (~53%) at the cost of smaller per-trade profit.
+
+    Weight distribution (LADDER_WEIGHTS):
+      Rank 0 (center): 1.5x stake  — highest confidence
+      Rank 1:          1.0x stake  — strong adjacent
+      Rank 2:          0.7x stake  — moderate edge
+      Rank 3:          0.4x stake  — tail coverage
+      Rank 4:          0.25x stake — cheap lottery
     """
     # Sort by our probability (highest first)
     ranked = sorted(buckets, key=lambda b: -b.our_prob)
     trades = []
 
-    for b in ranked[:TOP_N_BUCKETS]:
+    for rank, b in enumerate(ranked[:TOP_N_BUCKETS]):
         edge = b.our_prob - b.yes_price
         if edge <= 0:
             continue  # market already priced correctly or higher
@@ -750,15 +763,21 @@ def play1_open(buckets: List[Bucket], forecast: Forecast) -> List[dict]:
         if b.yes_price < 0.01:
             continue  # no liquidity
 
+        # Weighted stake: center buckets get more, edges get less
+        weight = LADDER_WEIGHTS[rank] if rank < len(LADDER_WEIGHTS) else 0.25
+        weighted_stake = round(YES_STAKE * weight, 2)
+
         trades.append({
             "play": "open",
             "side": "YES",
             "token_id": b.token_yes,
             "label": b.label,
             "price": b.yes_price,
-            "stake": YES_STAKE,
+            "stake": weighted_stake,
             "our_prob": b.our_prob,
             "edge": edge,
+            "rank": rank,
+            "weight": weight,
         })
 
     return trades
