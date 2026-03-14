@@ -1,0 +1,41 @@
+# Oracle Scanner V1 — 14th March 2026
+# OPT2 Maker Strategy: edge>=0.20, SL, 50% TP, maker chase
+
+[wallet]
+# Hardcode your keys here before running
+private_key    = ""
+funder_address = ""
+
+[feed]
+assets     = ["btc", "eth", "sol"]
+timeframes = [5, 15]
+
+clob_rest  = "https://clob.polymarket.com"
+live_ws    = "wss://ws-live-data.polymarket.com"
+gamma_api  = "https://gamma-api.polymarket.com"
+
+# Batch size for book REST (keep <=20 to avoid payload errors)
+book_batch_size  = 20
+rest_throttle_ms = 500
+book_warmup_secs = 5
+
+[scan]
+tick_ms            = 500
+sigma_window_secs  = 300
+min_secs           = 60
+
+[strategy]
+# OPT2 maker parameters (backtested)
+stake              = 5.0
+min_edge           = 0.20
+max_secs_left      = 840
+min_entry_price    = 0.30
+stop_loss          = true
+take_profit        = true
+partial_tp_pct     = 0.50
+taker_fee_rate     = 0.015
+maker_fee_rate     = 0.0
+
+# Maker chase: post GTC, chase N ticks at 500ms, then taker fill
+maker_chase_ticks  = 2
+chase_interval_ms  = 500
