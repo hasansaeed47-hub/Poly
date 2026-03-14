@@ -509,7 +509,7 @@ async fn main() -> Result<()> {
 
         // ── Real-time dashboard (every 2s) ──────────────────────────────────
 
-        if now - last_dash_ts >= 2.0 {
+        if now - last_dash_ts >= 60.0 {
             last_dash_ts = now;
             let mut lines: Vec<String> = Vec::new();
 
