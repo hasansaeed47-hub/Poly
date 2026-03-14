@@ -38,10 +38,10 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use feeds::{
-    BnPrices, BookState, ClPrices, MarketMeta, PriceHistory, RateLimiter,
+    BnPrices, BnTradeFlow, BookState, ClPrices, MarketMeta, PriceHistory, RateLimiter,
     build_slug, current_window_starts, fetch_books_batch, fetch_market_meta,
     run_cl_feed, run_bn_feed, momentum_from_history, count_updates_in_window,
-    max_gap_in_window,
+    max_gap_in_window, bn_trade_flow_stats, price_acceleration,
 };
 use signal::{compute, estimate_sigma, fair_yes, BookData};
 
@@ -182,11 +182,11 @@ struct SignalLog {
     spread_yes:   f64,
     spread_no:    f64,
 
-    // Book levels (top 5)
-    asks_yes_5:   Vec<[f64; 2]>,
-    bids_yes_5:   Vec<[f64; 2]>,
-    asks_no_5:    Vec<[f64; 2]>,
-    bids_no_5:    Vec<[f64; 2]>,
+    // Full orderbook depth (all levels, [price, size] pairs)
+    asks_yes:     Vec<[f64; 2]>,
+    bids_yes:     Vec<[f64; 2]>,
+    asks_no:      Vec<[f64; 2]>,
+    bids_no:      Vec<[f64; 2]>,
 
     // --- NEW: Binance parallel capture ---
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -236,9 +236,11 @@ struct SignalLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     cl_gap_max_ms:    Option<f64>,  // max gap between CL updates in window
 
-    // --- NEW: Arb ---
+    // --- Arb ---
     #[serde(skip_serializing_if = "Option::is_none")]
     yes_no_arb:       Option<f64>,  // 1.0 - (best_ask_yes + best_ask_no), positive = arb exists
+    #[serde(skip_serializing_if = "Option::is_none")]
+    yes_no_arb_net:   Option<f64>,  // yes_no_arb minus 2x taker fee (real profitability)
 
     // --- NEW: Book dynamics ---
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,11 +260,57 @@ struct SignalLog {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_bid_size_no:  Option<f64>,
 
-    // --- NEW: Time context ---
+    // --- Time context ---
     #[serde(skip_serializing_if = "Option::is_none")]
     hour_utc:         Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     window_elapsed_pct: Option<f64>, // how far through the window (0.0 = start, 1.0 = end)
+
+    // --- BN microstructure (from aggTrade) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_trade_side:    Option<String>,  // last aggTrade: "BUY" or "SELL" (buyer was maker?)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_trade_qty:     Option<f64>,     // last aggTrade quantity
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_buy_vol_5s:    Option<f64>,     // buyer-initiated volume in last 5s
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_sell_vol_5s:   Option<f64>,     // seller-initiated volume in last 5s
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_trade_imbal_5s: Option<f64>,    // (buy_vol - sell_vol) / total_vol, last 5s
+
+    // --- BN-based sigma (alternative vol source for lag bot) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sigma_bn:         Option<f64>,     // 300s BN sigma (more responsive than CL)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sigma_bn_60s:     Option<f64>,     // 60s BN sigma
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sigma_cl_bn_ratio: Option<f64>,    // sigma_cl / sigma_bn (>1 = CL noisier than BN)
+
+    // --- True acceleration (2nd derivative) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cl_accel_true:    Option<f64>,     // d²price/dt² via finite differencing on CL
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_accel_true:    Option<f64>,     // d²price/dt² via finite differencing on BN
+
+    // --- Fair value dynamics ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fair_yes_velocity: Option<f64>,    // delta(fair_yes) since last tick (how fast frontier moves)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fair_yes_prev:     Option<f64>,    // fair_yes from previous tick (for diff analysis)
+
+    // --- PM trade flow (from live-activity, aggregated by tracker) ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pm_trade_count:    Option<u32>,    // trades on this market in last poll
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pm_buy_volume:     Option<f64>,    // USD buy volume
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pm_sell_volume:    Option<f64>,    // USD sell volume
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pm_trade_imbal:    Option<f64>,    // (buy-sell)/total, [-1,+1]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pm_avg_trade_size: Option<f64>,    // avg USD per trade
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pm_whale_count:    Option<u32>,    // tracked wallet trades on this market
 }
 
 #[derive(Serialize)]
@@ -312,8 +360,8 @@ fn today_str() -> String {
     Utc::now().format("%Y-%m-%d").to_string()
 }
 
-fn top_n_levels(levels: &[feeds::PriceLevel], n: usize) -> Vec<[f64; 2]> {
-    levels.iter().take(n).map(|l| [l.price, l.size]).collect()
+fn levels_to_array(levels: &[feeds::PriceLevel]) -> Vec<[f64; 2]> {
+    levels.iter().map(|l| [l.price, l.size]).collect()
 }
 
 /// Cached file handle pool — avoids reopening the same file every 500ms tick.
@@ -597,6 +645,7 @@ async fn main() -> Result<()> {
     let book_state:    BookState    = Arc::new(DashMap::new());
     let price_history: PriceHistory = Arc::new(DashMap::new());
     let bn_history:    PriceHistory = Arc::new(DashMap::new());
+    let bn_trades:     BnTradeFlow  = Arc::new(DashMap::new());
     let token_ids:     Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
 
     let signal_count  = Arc::new(AtomicU64::new(0));
@@ -763,9 +812,10 @@ async fn main() -> Result<()> {
     {
         let bp = bn_prices.clone();
         let bh = bn_history.clone();
+        let bt = bn_trades.clone();
         let assets = cfg.feed.assets.clone();
         tokio::spawn(async move {
-            run_bn_feed(assets, bp, bh).await;
+            run_bn_feed(assets, bp, bh, bt).await;
         });
     }
 
@@ -773,6 +823,7 @@ async fn main() -> Result<()> {
 
     let active_markets_for_tracker: Arc<tokio::sync::RwLock<Vec<tracker::ActiveMarketInfo>>>
         = Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let market_flow: tracker::MarketFlowState = Arc::new(DashMap::new());
 
     if cfg.tracker.enabled {
         let tracker_cfg = tracker::TrackerConfig {
@@ -787,8 +838,9 @@ async fn main() -> Result<()> {
         let tc = whale_trade_count.clone();
         let wc = whale_wallet_count.clone();
         let am = active_markets_for_tracker.clone();
+        let mf = market_flow.clone();
         tokio::spawn(async move {
-            tracker::run_whale_tracker(tracker_cfg, tracker_client, tc, wc, am).await;
+            tracker::run_whale_tracker(tracker_cfg, tracker_client, tc, wc, am, mf).await;
         });
         info!("[WHALE] Tracker enabled (top {}, min ${}, poll {}ms)",
             cfg.tracker.leaderboard_limit, cfg.tracker.min_trade_usd, cfg.tracker.poll_interval_ms);
@@ -807,6 +859,10 @@ async fn main() -> Result<()> {
     let mut cl_close_snap: HashMap<String, f64> = HashMap::new();
     let mut current_date = today_str();
     let mut file_cache = FileCache::new();
+    let mut prev_fair_yes: HashMap<String, f64> = HashMap::new(); // slug -> last fair_yes
+
+    // Polymarket taker fee: ~2% on net winnings. For arb: you pay fee on both legs.
+    const TAKER_FEE_BPS: f64 = 0.02;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -1142,6 +1198,10 @@ async fn main() -> Result<()> {
             let cl_gap_max_ms = cl_hist_ref.as_ref()
                 .map(|h| max_gap_in_window(h.value(), meta.window_start as f64, now) * 1000.0);
 
+            // True acceleration (d²price/dt², 10s finite differencing)
+            let cl_accel_true = cl_hist_ref.as_ref()
+                .and_then(|h| price_acceleration(h.value(), now, 10.0));
+
             // Drop CL history lock
             drop(cl_hist_ref);
 
@@ -1158,8 +1218,29 @@ async fn main() -> Result<()> {
                 (m5, m30, m60)
             } else { (None, None, None) };
 
+            // BN sigma (300s + 60s) — alternative vol source for lag bot
+            let sigma_bn = bn_hist_ref.as_ref()
+                .map(|h| estimate_sigma(h.value(), cfg.scan.sigma_window_secs, now));
+            let sigma_bn_60s = bn_hist_ref.as_ref()
+                .map(|h| estimate_sigma(h.value(), 60.0, now));
+            let sigma_cl_bn_ratio = sigma_bn.map(|sbn| if sbn > 0.0 { sigma / sbn } else { 1.0 });
+
+            // BN true acceleration
+            let bn_accel_true = bn_hist_ref.as_ref()
+                .and_then(|h| price_acceleration(h.value(), now, 10.0));
+
             // Drop BN history lock
             drop(bn_hist_ref);
+
+            // BN trade flow (side + volume imbalance in last 5s)
+            let (bn_buy_vol_5s, bn_sell_vol_5s, bn_trade_imbal_5s, bn_last_side, bn_last_qty) = {
+                let trades_ref = bn_trades.get(&meta.asset);
+                match trades_ref {
+                    Some(trades) => bn_trade_flow_stats(&trades, now, 5.0),
+                    None => (0.0, 0.0, 0.0, None, None),
+                }
+            };
+            let bn_trade_side = bn_last_side.map(|s| if s { "SELL" } else { "BUY" }.to_string());
 
             let cl_bn_spread = if bn_available && bn_price > 0.0 {
                 Some((cl - bn_price) / bn_price)
@@ -1223,6 +1304,14 @@ async fn main() -> Result<()> {
 
             let hour_utc = Some(Utc::now().format("%H").to_string().parse::<u32>().unwrap_or(0));
 
+            // Fair value velocity: how fast the BS frontier is moving
+            let prev_fy = prev_fair_yes.get(slug.as_str()).copied();
+            let fair_yes_velocity = prev_fy.map(|pfy| sig.fair_yes - pfy);
+            prev_fair_yes.insert(slug.clone(), sig.fair_yes);
+
+            // Fee-adjusted arb
+            let yes_no_arb_net = yes_no_arb.map(|arb| arb - 2.0 * TAKER_FEE_BPS);
+
             // Log signal
             let log = SignalLog {
                 ts: now,
@@ -1252,11 +1341,12 @@ async fn main() -> Result<()> {
                 book_imbal: sig.book_imbal,
                 spread_yes: book_yes_entry.best_ask - book_yes_entry.best_bid,
                 spread_no: book_no_entry.best_ask - book_no_entry.best_bid,
-                asks_yes_5: top_n_levels(&book_yes_entry.asks, 5),
-                bids_yes_5: top_n_levels(&book_yes_entry.bids, 5),
-                asks_no_5: top_n_levels(&book_no_entry.asks, 5),
-                bids_no_5: top_n_levels(&book_no_entry.bids, 5),
-                // New fields
+                // Full orderbook depth (all levels)
+                asks_yes: levels_to_array(&book_yes_entry.asks),
+                bids_yes: levels_to_array(&book_yes_entry.bids),
+                asks_no: levels_to_array(&book_no_entry.asks),
+                bids_no: levels_to_array(&book_no_entry.bids),
+                // BN + CL cross-feed
                 bn_price: if bn_available { Some(bn_price) } else { None },
                 bn_momentum_5s,
                 bn_momentum_30s,
@@ -1278,6 +1368,7 @@ async fn main() -> Result<()> {
                 cl_update_count,
                 cl_gap_max_ms,
                 yes_no_arb,
+                yes_no_arb_net,
                 midpoint_yes: mid_yes,
                 midpoint_no: mid_no,
                 effective_spread_yes,
@@ -1288,6 +1379,29 @@ async fn main() -> Result<()> {
                 top_bid_size_no: book_no_entry.bids.first().map(|l| l.size),
                 hour_utc,
                 window_elapsed_pct,
+                // BN microstructure
+                bn_trade_side,
+                bn_trade_qty: bn_last_qty,
+                bn_buy_vol_5s:    if bn_available { Some(bn_buy_vol_5s) } else { None },
+                bn_sell_vol_5s:   if bn_available { Some(bn_sell_vol_5s) } else { None },
+                bn_trade_imbal_5s: if bn_available { Some(bn_trade_imbal_5s) } else { None },
+                // BN sigma
+                sigma_bn,
+                sigma_bn_60s,
+                sigma_cl_bn_ratio,
+                // True acceleration
+                cl_accel_true,
+                bn_accel_true,
+                // Fair value dynamics
+                fair_yes_velocity,
+                fair_yes_prev: prev_fy,
+                // PM trade flow
+                pm_trade_count:    market_flow.get(&meta.condition_id).map(|f| f.trade_count_5m),
+                pm_buy_volume:     market_flow.get(&meta.condition_id).map(|f| f.buy_volume_5m),
+                pm_sell_volume:    market_flow.get(&meta.condition_id).map(|f| f.sell_volume_5m),
+                pm_trade_imbal:    market_flow.get(&meta.condition_id).map(|f| f.imbalance_5m),
+                pm_avg_trade_size: market_flow.get(&meta.condition_id).map(|f| f.avg_trade_size),
+                pm_whale_count:    market_flow.get(&meta.condition_id).map(|f| f.whale_trade_count),
             };
 
             if let Ok(line) = serde_json::to_string(&log) {

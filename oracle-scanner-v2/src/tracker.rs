@@ -119,16 +119,33 @@ pub struct ActiveMarketInfo {
     pub token_no:     String,
 }
 
+/// Per-market trade flow summary (shared back to main for signal enrichment)
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MarketTradeFlow {
+    pub trade_count_5m:   u32,    // trades in last 5 minutes
+    pub buy_count_5m:     u32,    // BUY trades
+    pub sell_count_5m:    u32,    // SELL trades
+    pub buy_volume_5m:    f64,    // USD buy volume
+    pub sell_volume_5m:   f64,    // USD sell volume
+    pub imbalance_5m:     f64,    // (buy - sell) / total, [-1,+1]
+    pub avg_trade_size:   f64,    // avg USD per trade
+    pub whale_trade_count: u32,   // trades by tracked wallets
+    pub last_update:      f64,    // timestamp of last update
+}
+
+pub type MarketFlowState = Arc<::dashmap::DashMap<String, MarketTradeFlow>>; // condition_id -> flow
+
 // -- Tracker state ------------------------------------------------------------
 
 pub struct WhaleTracker {
     cfg:            TrackerConfig,
     client:         Client,
     wallets:        Vec<TrackedWallet>,
-    seen_set:       HashSet<String>,        // O(1) lookup for dedup
-    seen_queue:     VecDeque<String>,        // FIFO order for eviction
+    seen_set:       HashSet<String>,
+    seen_queue:     VecDeque<String>,
     trade_count:    Arc<AtomicU64>,
     wallet_count:   Arc<AtomicU64>,
+    market_flow:    MarketFlowState,
     last_refresh:   f64,
 }
 
@@ -138,6 +155,7 @@ impl WhaleTracker {
         client: Client,
         trade_count: Arc<AtomicU64>,
         wallet_count: Arc<AtomicU64>,
+        market_flow: MarketFlowState,
     ) -> Self {
         Self {
             cfg,
@@ -147,6 +165,7 @@ impl WhaleTracker {
             seen_queue: VecDeque::new(),
             trade_count,
             wallet_count,
+            market_flow,
             last_refresh: 0.0,
         }
     }
@@ -313,23 +332,42 @@ impl WhaleTracker {
                 }
             };
 
+            // Aggregate trade flow for ALL events (not just whale trades)
+            let mut flow = MarketTradeFlow { last_update: now, ..Default::default() };
+
             for event in &events {
-                // Dedup by transaction_hash (most reliable unique ID)
                 let tx_hash = event.get("transaction_hash")
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
+
+                let price = parse_f64_json(event.get("price"));
+                let size = parse_f64_json(event.get("size"));
+                let usd_value = price * size;
+
+                // Aggregate flow stats from ALL events (even non-whale)
+                let side_str = event.get("side")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default();
+                flow.trade_count_5m += 1;
+                if side_str.eq_ignore_ascii_case("BUY") {
+                    flow.buy_count_5m += 1;
+                    flow.buy_volume_5m += usd_value;
+                } else if side_str.eq_ignore_ascii_case("SELL") {
+                    flow.sell_count_5m += 1;
+                    flow.sell_volume_5m += usd_value;
+                }
+
+                // Dedup for whale tracking
                 if tx_hash.is_empty() { continue; }
                 if self.is_seen(&tx_hash) { continue; }
 
-                // Extract user address from nested user object
                 let user_addr = event.get("user")
                     .and_then(|u| u.get("address"))
                     .and_then(|a| a.as_str())
                     .unwrap_or_default()
                     .to_lowercase();
 
-                // Check if this is a tracked wallet
                 let wallet = match wallet_set.get(&user_addr) {
                     Some(w) => w,
                     None => {
@@ -338,9 +376,7 @@ impl WhaleTracker {
                     }
                 };
 
-                let price = parse_f64_json(event.get("price"));
-                let size = parse_f64_json(event.get("size"));
-                let usd_value = price * size;
+                flow.whale_trade_count += 1;
 
                 // Always dedup, even if below threshold
                 self.mark_seen(tx_hash.clone());
@@ -404,6 +440,16 @@ impl WhaleTracker {
                 all_trades.push(log);
                 self.trade_count.fetch_add(1, Ordering::Relaxed);
             }
+
+            // Finalize and publish flow stats for this market
+            let total_vol = flow.buy_volume_5m + flow.sell_volume_5m;
+            flow.imbalance_5m = if total_vol > 0.0 {
+                (flow.buy_volume_5m - flow.sell_volume_5m) / total_vol
+            } else { 0.0 };
+            flow.avg_trade_size = if flow.trade_count_5m > 0 {
+                total_vol / flow.trade_count_5m as f64
+            } else { 0.0 };
+            self.market_flow.insert(market.condition_id.clone(), flow);
         }
 
         Ok(all_trades)
@@ -477,8 +523,9 @@ pub async fn run_whale_tracker(
     trade_count: Arc<AtomicU64>,
     wallet_count: Arc<AtomicU64>,
     active_markets: Arc<tokio::sync::RwLock<Vec<ActiveMarketInfo>>>,
+    market_flow: MarketFlowState,
 ) {
-    let mut tracker = WhaleTracker::new(cfg.clone(), client, trade_count, wallet_count);
+    let mut tracker = WhaleTracker::new(cfg.clone(), client, trade_count, wallet_count, market_flow);
 
     // Ensure data dir exists (may run before main creates it)
     let _ = std::fs::create_dir_all("data");

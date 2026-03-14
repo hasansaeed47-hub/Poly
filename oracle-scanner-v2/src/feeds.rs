@@ -29,6 +29,16 @@ pub type ClPrices     = Arc<DashMap<String, (f64, f64)>>;   // asset -> (ts, pri
 pub type BnPrices     = Arc<DashMap<String, (f64, f64)>>;   // asset -> (ts, price)
 pub type BookState    = Arc<DashMap<String, BookEntry>>;
 pub type PriceHistory = Arc<DashMap<String, Vec<(f64, f64)>>>; // key -> [(ts, price)]
+pub type BnTradeFlow  = Arc<DashMap<String, Vec<BnTradeEvent>>>; // asset -> recent trades
+
+/// Individual Binance aggTrade with side information
+#[derive(Debug, Clone)]
+pub struct BnTradeEvent {
+    pub ts:       f64,
+    pub price:    f64,
+    pub qty:      f64,
+    pub is_sell:  bool,  // true = seller-initiated (buyer was maker)
+}
 
 #[derive(Debug, Clone)]
 pub struct PriceLevel {
@@ -449,14 +459,15 @@ fn bn_symbol_to_asset(symbol: &str) -> Option<String> {
 }
 
 pub async fn run_bn_feed(
-    assets:     Vec<String>,
-    bn_prices:  BnPrices,
-    bn_history: PriceHistory,
+    assets:      Vec<String>,
+    bn_prices:   BnPrices,
+    bn_history:  PriceHistory,
+    bn_trades:   BnTradeFlow,
 ) {
     let url = bn_stream_url(&assets);
     loop {
         info!("[BN] Connecting to {}", url);
-        match connect_bn_feed(&url, &bn_prices, &bn_history).await {
+        match connect_bn_feed(&url, &bn_prices, &bn_history, &bn_trades).await {
             Ok(_)  => warn!("[BN] Feed closed, reconnecting..."),
             Err(e) => error!("[BN] Feed error: {}, reconnecting in {}s", e, WS_RECONNECT_SECS),
         }
@@ -468,6 +479,7 @@ async fn connect_bn_feed(
     url:        &str,
     bn_prices:  &BnPrices,
     bn_history: &PriceHistory,
+    bn_trades:  &BnTradeFlow,
 ) -> Result<()> {
     let parsed = Url::parse(url).context("invalid BN WS URL")?;
     let (mut ws, _) = connect_async(parsed.to_string()).await.context("BN WS connect failed")?;
@@ -492,7 +504,7 @@ async fn connect_bn_feed(
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    process_bn_message(&v, bn_prices, bn_history);
+                    process_bn_message(&v, bn_prices, bn_history, bn_trades);
                 }
             }
             Ok(Message::Ping(data)) => { let _ = ws.send(Message::Pong(data)).await; }
@@ -508,6 +520,7 @@ fn process_bn_message(
     v:          &serde_json::Value,
     bn_prices:  &BnPrices,
     bn_history: &PriceHistory,
+    bn_trades:  &BnTradeFlow,
 ) {
     // Combined stream: {"stream":"btcusdt@aggTrade","data":{"s":"BTCUSDT","p":"...","T":...}}
     let data = match v.get("data") {
@@ -548,6 +561,25 @@ fn process_bn_message(
         let drain_to = hist.len() - 1000;
         hist.drain(0..drain_to);
     }
+
+    // Capture trade side + quantity from aggTrade
+    // "m": true = buyer was maker = seller-initiated (taker sold)
+    // "q": quantity traded
+    let qty: f64 = data.get("q")
+        .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_f64()))
+        .unwrap_or(0.0);
+    let is_sell = data.get("m").and_then(|m| m.as_bool()).unwrap_or(false);
+
+    if qty > 0.0 {
+        let event = BnTradeEvent { ts, price, qty, is_sell };
+        let mut trades = bn_trades.entry(asset).or_default();
+        trades.push(event);
+        // Keep last 500 trades (~10-30s of BTC, less for quieter assets)
+        if trades.len() > 500 {
+            let drain_to = trades.len() - 500;
+            trades.drain(0..drain_to);
+        }
+    }
 }
 
 // -- Helpers for momentum/lag computation (used by main.rs) -------------------
@@ -580,6 +612,59 @@ pub fn max_gap_in_window(hist: &[(f64, f64)], start: f64, end: f64) -> f64 {
         .collect();
     if window.len() < 2 { return 0.0; }
     window.windows(2).map(|w| w[1] - w[0]).fold(0.0_f64, f64::max)
+}
+
+// -- BN trade flow helpers ----------------------------------------------------
+
+/// Compute buy/sell volume and imbalance over the last `window_secs`.
+/// Returns (buy_vol, sell_vol, imbalance, last_side, last_qty).
+/// Imbalance = (buy - sell) / (buy + sell), in [-1, +1]. +1 = all buying.
+pub fn bn_trade_flow_stats(
+    trades: &[BnTradeEvent], now: f64, window_secs: f64,
+) -> (f64, f64, f64, Option<bool>, Option<f64>) {
+    let cutoff = now - window_secs;
+    let mut buy_vol = 0.0;
+    let mut sell_vol = 0.0;
+
+    for t in trades.iter().rev() {
+        if t.ts < cutoff { break; }
+        let notional = t.price * t.qty;
+        if t.is_sell { sell_vol += notional; } else { buy_vol += notional; }
+    }
+
+    let total = buy_vol + sell_vol;
+    let imbalance = if total > 0.0 { (buy_vol - sell_vol) / total } else { 0.0 };
+    let last = trades.last();
+    (buy_vol, sell_vol, imbalance, last.map(|t| t.is_sell), last.map(|t| t.qty))
+}
+
+// -- Acceleration (true 2nd derivative via finite differencing) ---------------
+
+/// Compute d²price/dt² using 3-point finite differencing on price history.
+/// Uses prices at (now - 2*dt, now - dt, now) where dt = lookback_secs.
+/// Returns acceleration in price_units/s², or None if insufficient data.
+pub fn price_acceleration(hist: &[(f64, f64)], now: f64, dt_secs: f64) -> Option<f64> {
+    let t0 = now - 2.0 * dt_secs;
+    let t1 = now - dt_secs;
+
+    // Find prices closest to t0, t1, t2(=now)
+    let p0 = nearest_price(hist, t0, dt_secs * 0.5)?;
+    let p1 = nearest_price(hist, t1, dt_secs * 0.5)?;
+    let p2 = nearest_price(hist, now, dt_secs * 0.5)?;
+
+    if p0 <= 0.0 || p1 <= 0.0 || p2 <= 0.0 { return None; }
+
+    // 2nd derivative: (p2 - 2*p1 + p0) / dt^2, normalized by price
+    let accel = (p2 - 2.0 * p1 + p0) / (dt_secs * dt_secs * p1);
+    if accel.is_finite() { Some(accel) } else { None }
+}
+
+fn nearest_price(hist: &[(f64, f64)], target_ts: f64, tolerance: f64) -> Option<f64> {
+    hist.iter()
+        .filter(|(ts, _)| (*ts - target_ts).abs() < tolerance)
+        .min_by(|a, b| (a.0 - target_ts).abs().partial_cmp(&(b.0 - target_ts).abs())
+            .unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(_, p)| *p)
 }
 
 // -- Tests --------------------------------------------------------------------
