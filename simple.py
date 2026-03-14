@@ -829,7 +829,8 @@ class OrderManager:
             log.error(f"[EXEC] buy failed: {e}")
             return None
 
-    def sell(self, token_id: str, price: float, shares: float) -> Optional[str]:
+    def sell(self, token_id: str, price: float, shares: float,
+             taker: bool = False) -> Optional[str]:
         price = round(price, 2)
         if price <= 0 or price >= 1.0 or shares <= 0:
             return None
@@ -844,7 +845,8 @@ class OrderManager:
         try:
             order = OrderArgs(price=price, size=round(shares, 2), side=SELL, token_id=token_id)
             signed = self._clob.create_order(order)
-            resp = self._clob.post_order(signed, OrderType.GTC)
+            otype = OrderType.FOK if taker else OrderType.GTC
+            resp = self._clob.post_order(signed, otype)
             if resp.get("errorMsg"):
                 log.warning(f"[EXEC] {resp['errorMsg']}")
                 return None
@@ -1338,6 +1340,8 @@ def scalp_exit(positions: List[Position], buckets: List[Bucket]) -> List[dict]:
         if sell_reason:
             book = get_book(b.token_yes)
             sell_price = book["best_bid"] if book and book["best_bid"] > 0.01 else current_price - 0.01
+            # Use taker (FOK) when profitable — guarantees fill on take-profit
+            is_profitable = profit_per_share >= SCALP_TARGET
             if sell_price > 0.01:
                 trades.append({
                     "play": "scalp_exit",
@@ -1347,6 +1351,7 @@ def scalp_exit(positions: List[Position], buckets: List[Bucket]) -> List[dict]:
                     "price": sell_price,
                     "shares": pos.shares,
                     "reason": sell_reason,
+                    "taker": is_profitable,
                 })
 
     return trades
@@ -1659,8 +1664,10 @@ class WeatherBot:
             reason = t.get("reason", "")
             city = t.get("city", "?")
 
-            log.info(f"  → SELL {t['label'][:35]} @ {price:.2f} ({shares:.0f}sh) — {reason}")
-            oid = self.exec.sell(tid, price, shares)
+            taker = t.get("taker", False)
+            tag = "TAKE" if taker else "SELL"
+            log.info(f"  → {tag} {t['label'][:35]} @ {price:.2f} ({shares:.0f}sh) — {reason}")
+            oid = self.exec.sell(tid, price, shares, taker=taker)
             if oid:
                 for pos in self.positions:
                     if pos.token_id == tid and not pos.sold and not pos.settled:
