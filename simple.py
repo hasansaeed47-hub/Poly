@@ -702,28 +702,51 @@ def parse_temp_range(question: str) -> Tuple[float, float]:
 def get_live_prices(token_ids: List[str]) -> Dict[str, float]:
     """
     Batch-fetch midpoint prices from CLOB.
-    CLOB /midpoints returns {"mid": "0.XX"} for single token,
-    or a dict of {token_id: "price"} for batch.
+
+    Single token:  GET /midpoint?token_id=X  → {"mid": "0.XX"}
+    Batch tokens:  POST /midpoints body=[{"token_id": "X"}, ...]  → [{"mid": "0.XX"}, ...]
     """
     if not token_ids:
         return {}
+    result = {}
+
+    # Batch via POST /midpoints
     try:
-        # Batch: pass comma-separated token_ids
-        r = S.get(
-            f"{CLOB}/midpoints",
-            params={"token_ids": ",".join(token_ids)},
-            timeout=5,
-        )
+        body = [{"token_id": tid} for tid in token_ids]
+        r = S.post(f"{CLOB}/midpoints", json=body, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            # Handle both single {"mid": "X"} and batch {tid: "X"} formats
-            if isinstance(data, dict):
-                if "mid" in data and len(token_ids) == 1:
-                    return {token_ids[0]: float(data["mid"])}
-                return {k: float(v) for k, v in data.items() if k != "mid"}
+            if isinstance(data, list):
+                # Response is list of {"mid": "X"} in same order as request
+                for tid, item in zip(token_ids, data):
+                    mid = item.get("mid") if isinstance(item, dict) else item
+                    if mid is not None:
+                        result[tid] = float(mid)
+            elif isinstance(data, dict):
+                # Fallback: dict keyed by token_id
+                for k, v in data.items():
+                    try:
+                        result[k] = float(v) if isinstance(v, (str, int, float)) else float(v.get("mid", 0))
+                    except (ValueError, AttributeError):
+                        pass
+            if result:
+                return result
     except Exception:
         pass
-    return {}
+
+    # Fallback: individual GET /midpoint for each token
+    for tid in token_ids[:20]:  # cap to avoid hammering
+        try:
+            r = S.get(f"{CLOB}/midpoint", params={"token_id": tid}, timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                mid = data.get("mid")
+                if mid is not None:
+                    result[tid] = float(mid)
+        except Exception:
+            pass
+
+    return result
 
 
 def get_book(token_id: str) -> Optional[dict]:
