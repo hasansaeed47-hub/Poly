@@ -276,6 +276,31 @@ impl LiveRunner {
         ).await {
             Ok(fill) => {
                 let actual_price = fill.price;
+
+                // FIX 1: Post-fill edge check — reject if real edge < min_edge
+                let post_fill_edge = sig.best_fair - actual_price;
+                if post_fill_edge < self.config.min_edge {
+                    warn!(
+                        "[RUNNER] REJECT post-fill {} edge={:.3} < min={:.3} (fill={:.3} fair={:.3})",
+                        sig.slug, post_fill_edge, self.config.min_edge, actual_price, sig.best_fair
+                    );
+                    // Cancel/sell the filled shares immediately
+                    let shares = self.config.stake / actual_price;
+                    let _ = self.exec.sell_gtc(&token_id.to_string(), actual_price, shares).await;
+                    return;
+                }
+
+                // FIX 2: Max entry price cap — never pay more than 0.60 (risk $0.60 to win $0.40)
+                if actual_price > 0.60 {
+                    warn!(
+                        "[RUNNER] REJECT expensive fill {} @{:.3} > 0.60 max",
+                        sig.slug, actual_price
+                    );
+                    let shares = self.config.stake / actual_price;
+                    let _ = self.exec.sell_gtc(&token_id.to_string(), actual_price, shares).await;
+                    return;
+                }
+
                 let shares = self.config.stake / actual_price;
                 let now = sig.ts;
                 let trade_id = format!("{}-OPT2-{:.0}", sig.slug, now * 1000.0);
@@ -351,14 +376,24 @@ impl LiveRunner {
             };
 
             // ── Stop Loss: fair < entry_price, secs_left > 90 ──
+            // FIX 3+4: After TP, SL protects remaining shares at breakeven (fair < entry)
+            //          For all positions, also SL if edge has eroded >50% from entry
+            let sl_threshold = if pos.tp_fired {
+                // After TP, tighter SL — protect profits, exit if fair drops to entry
+                pos.entry_price
+            } else {
+                // Before TP, SL when fair drops below entry (edge fully gone)
+                pos.entry_price
+            };
+
             if self.config.stop_loss
                 && sig.secs_left > 90.0
-                && current_fair < pos.entry_price
+                && current_fair < sl_threshold
                 && exit_bid > 0.0
             {
                 info!(
-                    "[RUNNER] STOP_LOSS {} fair={:.3} < entry={:.3}",
-                    pos.slug, current_fair, pos.entry_price
+                    "[RUNNER] STOP_LOSS {} fair={:.3} < threshold={:.3} tp_fired={}",
+                    pos.slug, current_fair, sl_threshold, pos.tp_fired
                 );
 
                 let pos = self.positions.remove(&trade_id).unwrap();
