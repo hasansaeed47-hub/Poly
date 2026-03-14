@@ -3,13 +3,21 @@ Persistence: save/load bot state for crash recovery.
 State is date-stamped -- auto-resets on new day.
 """
 
+import csv
 import json
+import os
 import time
 from datetime import datetime, timezone
 from typing import Optional, Dict, List
 
-from weatherbot.config import log, STATE_FILE
+from weatherbot.config import log, STATE_FILE, TRADE_LOG
 from weatherbot.models import Position
+
+_TRADE_COLS = [
+    "timestamp", "date", "time_utc", "action", "play", "city",
+    "side", "label", "price", "shares", "cost", "pnl", "reason",
+    "order_id",
+]
 
 
 def save_state(
@@ -61,6 +69,43 @@ def load_state() -> Optional[dict]:
     except Exception as e:
         log.debug(f"[STATE] Load failed: {e}")
         return None
+
+
+def log_trade(
+    action: str, play: str, city: str, side: str, label: str,
+    price: float, shares: float, cost: float, pnl: float = 0.0,
+    reason: str = "", order_id: str = "",
+):
+    """
+    Append one row to trades.csv. Persistent across days/restarts.
+    Actions: BUY, SELL, TAKE, WIN, LOSS
+    """
+    now = datetime.now(timezone.utc)
+    row = {
+        "timestamp": int(now.timestamp()),
+        "date": now.strftime("%Y-%m-%d"),
+        "time_utc": now.strftime("%H:%M:%S"),
+        "action": action,
+        "play": play,
+        "city": city,
+        "side": side,
+        "label": label,
+        "price": f"{price:.4f}",
+        "shares": f"{shares:.2f}",
+        "cost": f"{cost:.2f}",
+        "pnl": f"{pnl:+.2f}",
+        "reason": reason,
+        "order_id": order_id,
+    }
+    try:
+        write_header = not TRADE_LOG.exists() or TRADE_LOG.stat().st_size == 0
+        with open(TRADE_LOG, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=_TRADE_COLS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as e:
+        log.debug(f"[TRADE LOG] Write failed: {e}")
 
 
 def restore_positions(state: dict) -> List[Position]:

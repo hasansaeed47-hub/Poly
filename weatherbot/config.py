@@ -125,6 +125,7 @@ ORDER_CANCEL_TIMEOUT = 120  # cancel unfilled live orders after 2 min
 # =============================================================================
 
 STATE_FILE = Path(os.environ.get("WEATHERBOT_STATE_DIR", ".")) / "bot_state.json"
+TRADE_LOG = Path(os.environ.get("WEATHERBOT_LOG_DIR", ".")) / "trades.csv"
 
 # =============================================================================
 # CITIES — PM settles on Weather Underground airport stations (ICAO codes)

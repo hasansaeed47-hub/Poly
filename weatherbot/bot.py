@@ -31,7 +31,7 @@ from weatherbot.engine import (
     play4_whale_flow, scalp_exit,
 )
 from weatherbot.execution import OrderManager
-from weatherbot.state import save_state, load_state, restore_positions
+from weatherbot.state import save_state, load_state, restore_positions, log_trade
 
 
 class WeatherBot:
@@ -321,6 +321,12 @@ class WeatherBot:
                         held_tids.discard(tid)
                         self._track_play(pos.play, profit)
                         log.info(f"    SOLD: cost=${pos.cost:.2f} rev=${revenue:.2f} pnl=${profit:+.2f}")
+                        log_trade(
+                            action=tag, play=pos.play, city=city,
+                            side=pos.side, label=pos.label,
+                            price=price, shares=shares, cost=pos.cost,
+                            pnl=profit, reason=reason, order_id=oid,
+                        )
                         break
 
         # Execute buys
@@ -357,6 +363,12 @@ class WeatherBot:
                 available -= stake
                 held_tids.add(tid)
                 open_count += 1
+                log_trade(
+                    action="BUY", play=play, city=city,
+                    side=side, label=t["label"],
+                    price=price, shares=shares, cost=stake,
+                    order_id=oid,
+                )
 
         self._check_settlements()
 
@@ -402,6 +414,12 @@ class WeatherBot:
                 if pos.play == "no_grind":
                     self.daily_no_profit += profit
                 log.info(f"[WIN] {pos.label[:35]} ({pos.play}) +${profit:.2f}")
+                log_trade(
+                    action="WIN", play=pos.play, city=pos.city,
+                    side=pos.side, label=pos.label,
+                    price=1.0, shares=pos.shares, cost=pos.cost,
+                    pnl=profit, reason="settled", order_id=pos.order_id,
+                )
 
             elif price <= 0.05:
                 pos.settled = True
@@ -412,6 +430,12 @@ class WeatherBot:
                 self.city_pnl[pos.city] = self.city_pnl.get(pos.city, 0.0) + profit
                 self._track_play(pos.play, profit)
                 log.info(f"[LOSS] {pos.label[:35]} ({pos.play}) -${pos.cost:.2f}")
+                log_trade(
+                    action="LOSS", play=pos.play, city=pos.city,
+                    side=pos.side, label=pos.label,
+                    price=0.0, shares=pos.shares, cost=pos.cost,
+                    pnl=profit, reason="settled", order_id=pos.order_id,
+                )
 
     # ── Display ──
 
