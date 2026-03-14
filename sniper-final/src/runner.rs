@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use crate::engine::{EngineConfig, ExecConfig, min_delta};
 use crate::execution::{
     Position, TradeResult, check_sl, execute_sl, execute_settlement,
-    fill_price, open_position, resolve_settlement,
+    execute_reprice_exit, fill_price, open_position, resolve_settlement,
 };
 use crate::feeds::{
     BookState, BnHistory, BnPrices, ClPrices, ClSnapshots,
@@ -287,7 +287,9 @@ impl Tracker {
         // Entry window check
         if left > self.cfg.entry_start || left < self.cfg.taker_deadline { return false; }
 
-        if self.cfg.is_late_scalper {
+        if self.cfg.is_reprice_scalper {
+            self.evaluate_reprice(win, cl_prices, cl_opens, book_state, now)
+        } else if self.cfg.is_late_scalper {
             self.evaluate_late_scalper(win, cl_prices, cl_snapshots, cl_opens, book_state,
                                       bn_prices, bn_hist, hour_ranges, now)
         } else {
@@ -542,6 +544,185 @@ impl Tracker {
         self.delta_ticks.remove(win.slug);
         self.maker_ticks.remove(win.slug);
         true
+    }
+
+    // -- Engine F: CL-lead reprice scalper entry --------------------------------
+
+    fn evaluate_reprice(
+        &mut self,
+        win:          &MarketWindow<'_>,
+        cl_prices:    &ClPrices,
+        cl_opens:     &HashMap<String, f64>,
+        book_state:   &BookState,
+        now:          f64,
+    ) -> bool {
+        // CL delta from window open
+        let cl_open = match cl_opens.get(win.slug) {
+            Some(&p) if p > 0.0 => p,
+            _ => return false,
+        };
+        let cl_now = match cl_prices.get(win.asset) {
+            Some(entry) if entry.1 > 0.0 => entry.1,
+            _ => return false,
+        };
+
+        let delta = (cl_now - cl_open) / cl_open * 100.0;
+        if delta.abs() < min_delta(win.asset) { return false; }
+
+        let dir = if delta > 0.0 { "UP" } else { "DOWN" };
+        let tid = if dir == "UP" { win.tid_up } else { win.tid_dn };
+
+        // Book check — ask in range
+        let bk = match book_state.get(tid) {
+            Some(b) if b.best_ask >= self.cfg.min_entry && b.best_ask <= self.cfg.max_entry => b,
+            _ => return false,
+        };
+        let best_ask = bk.best_ask;
+        drop(bk);
+
+        // Gap check: is PM significantly behind CL?
+        // Implied fair value from delta magnitude relative to asset stdev
+        let stdev = crate::engine::stdev_scale(win.asset) * crate::engine::STDEV_BASE;
+        let delta_ratio = delta.abs() / stdev;
+        let implied_fair = (0.50 + delta_ratio * 0.25).min(0.99);
+        let gap = implied_fair - best_ask;
+
+        if gap < self.cfg.min_gap { return false; }
+
+        // Maker entry
+        let maker_elapsed = self.maker_ticks.entry(win.slug.to_string()).or_insert(0);
+        *maker_elapsed += 1;
+
+        let mk = crate::execution::maker_price(best_ask, self.cfg.min_entry);
+        let fill_method = if mk >= best_ask {
+            "MAKER_CROSS"
+        } else if *maker_elapsed >= 2 {
+            "MAKER_WAIT"
+        } else {
+            return false; // still waiting for maker fill
+        };
+
+        let fp = mk.max(self.cfg.min_entry).min(self.cfg.max_entry);
+        if fp > self.cfg.max_entry || fp < self.cfg.min_entry { return false; }
+
+        let mut pos = open_position(
+            &self.cfg.id, win.slug, win.asset, dir, fp, &self.exec,
+            win.end_ts, tid, win.tid_up, win.tid_dn, win.wmin, now,
+        );
+
+        // Maker buy = 0 fee
+        pos.entry_fee = 0.0;
+
+        let target_bid = fp + self.cfg.profit_target;
+
+        info!("═══════════════════════════════════════════════════════");
+        info!("  [F] SIGNAL: MAKER BUY {} {} {}m @{:.3} ({:.0}s left) [{}]",
+            dir, win.asset.to_uppercase(), win.wmin, fp, win.secs_left, fill_method);
+        info!("  gap={:.3} (implied={:.3} ask={:.3}) d={:+.4}%",
+            gap, implied_fair, best_ask, delta);
+        info!("  target_bid={:.3}  stop={:.3}  timeout=T-{}s",
+            target_bid, fp - self.cfg.stop_exit_spread, self.cfg.exit_timeout_secs);
+        info!("═══════════════════════════════════════════════════════");
+
+        self.entry_fill_method = Some(fill_method.to_string());
+        self.sl_decline_ticks = 0;
+        self.entry_bn_trend = None;
+        self.entry_cl_trend = None;
+        self.entry_hour_range = None;
+
+        self.active = Some(pos);
+        self.sl_skip_logged = false;
+        self.done.insert(win.slug.to_string());
+        self.delta_ticks.remove(win.slug);
+        self.maker_ticks.remove(win.slug);
+        true
+    }
+
+    // -- Engine F: reprice exit check (every tick) ----------------------------
+
+    pub fn check_reprice_exit(
+        &mut self,
+        book_state: &BookState,
+        secs_left:  i64,
+        now:        f64,
+    ) -> Option<TradeResult> {
+        if !self.cfg.is_reprice_scalper { return None; }
+        let pos = self.active.as_ref()?;
+
+        let bid = book_state.get(&pos.tid).map(|b| b.best_bid).unwrap_or(0.0);
+
+        // Timeout: force exit at T-exit_timeout_secs regardless
+        if secs_left <= self.cfg.exit_timeout_secs {
+            let exit_bid = if bid > 0.0 { bid } else { pos.fill_px - self.cfg.stop_exit_spread };
+            let pos = self.active.take().unwrap();
+            let result = execute_reprice_exit(&pos, exit_bid, "REPRICE_TIMEOUT", &self.exec, now);
+
+            info!("═══════════════════════════════════════════════════════");
+            info!("  [F] TIMEOUT {} {} {}m @{:.3} → bid={:.3} ({:.0}s left)",
+                pos.dir, pos.asset.to_uppercase(), pos.wmin, pos.fill_px, exit_bid, secs_left);
+            info!("  hold={:.1}s  P&L=${:+.4}  exit_fee=${:.4}",
+                now - pos.entry_ts, result.pnl, result.exit_fee);
+            info!("═══════════════════════════════════════════════════════");
+
+            self.stats.losses += 1;
+            self.stats.pnl += result.pnl;
+            self.done.insert(pos.slug.clone());
+            self.log_trade(&result);
+            self.clear_diag();
+            return Some(result);
+        }
+
+        if bid <= 0.0 { return None; }
+
+        // Profit target: bid >= fill + profit_target
+        if bid >= pos.fill_px + self.cfg.profit_target {
+            let pos = self.active.take().unwrap();
+            let result = execute_reprice_exit(&pos, bid, "REPRICE_WIN", &self.exec, now);
+
+            info!("═══════════════════════════════════════════════════════");
+            info!("  [F] REPRICE WIN {} {} {}m @{:.3} → bid={:.3}",
+                pos.dir, pos.asset.to_uppercase(), pos.wmin, pos.fill_px, bid);
+            info!("  hold={:.1}s  P&L=${:+.4}  exit_fee=${:.4}",
+                now - pos.entry_ts, result.pnl, result.exit_fee);
+            info!("═══════════════════════════════════════════════════════");
+
+            self.stats.wins += 1;
+            self.stats.pnl += result.pnl;
+            self.done.insert(pos.slug.clone());
+            self.log_trade(&result);
+            self.clear_diag();
+            return Some(result);
+        }
+
+        // Stop exit: bid dropped too far below fill
+        if bid <= pos.fill_px - self.cfg.stop_exit_spread {
+            let pos = self.active.take().unwrap();
+            let result = execute_reprice_exit(&pos, bid, "REPRICE_STOP", &self.exec, now);
+
+            info!("═══════════════════════════════════════════════════════");
+            info!("  [F] REPRICE STOP {} {} {}m @{:.3} → bid={:.3}",
+                pos.dir, pos.asset.to_uppercase(), pos.wmin, pos.fill_px, bid);
+            info!("  hold={:.1}s  P&L=${:+.4}  exit_fee=${:.4}",
+                now - pos.entry_ts, result.pnl, result.exit_fee);
+            info!("═══════════════════════════════════════════════════════");
+
+            self.stats.sl_count += 1;
+            self.stats.pnl += result.pnl;
+            self.done.insert(pos.slug.clone());
+            self.log_trade(&result);
+            self.clear_diag();
+            return Some(result);
+        }
+
+        None
+    }
+
+    fn clear_diag(&mut self) {
+        self.entry_bn_trend = None;
+        self.entry_cl_trend = None;
+        self.entry_hour_range = None;
+        self.entry_fill_method = None;
+        self.sl_decline_ticks = 0;
     }
 
     // -- Logging --------------------------------------------------------------

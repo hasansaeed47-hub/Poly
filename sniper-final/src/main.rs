@@ -4,7 +4,7 @@
 /// 1. Three WS feeds: CL (Polymarket RTDS), BN (Binance aggTrade), PM Book (CLOB)
 /// 2. REST fallback: batch book refresh every 2s for new tokens
 /// 3. Market discovery: Gamma API, auto-refresh every 60s
-/// 4. Five engines (A-E) evaluate entry signals independently
+/// 4. Six engines (A-F) evaluate entry signals independently
 /// 5. Maker-first entry (ask-0.01 for 2s, then taker fallback)
 /// 6. SL with flip confirmation (bid <= 50% AND opp_bid >= 0.80)
 /// 7. Settlement: CLOB post-settle bids (ground truth) + CL fallback
@@ -212,7 +212,11 @@ async fn main() -> Result<()> {
     info!("  Timeframes: {:?}m", cfg.feed.timeframes);
     info!("  Engines: {}", engine_cfgs.len());
     for eng in &engine_cfgs {
-        if eng.is_late_scalper {
+        if eng.is_reprice_scalper {
+            info!("    [{}] reprice scalper  entry=T-{}→T-{}  exit=T-{}  gap>={:.2}  target={:.2}  stop={:.2}",
+                eng.id, eng.entry_start, eng.taker_deadline, eng.exit_timeout_secs,
+                eng.min_gap, eng.profit_target, eng.stop_exit_spread);
+        } else if eng.is_late_scalper {
             info!("    [{}] late scalper  book>={:.2}  entry<={}s",
                 eng.id, eng.min_entry, eng.entry_start);
         } else {
@@ -513,26 +517,32 @@ async fn main() -> Result<()> {
 
             let secs_left = meta.window_end as i64 - now_i;
 
-            // SL check for all trackers with active positions
+            // Exit checks for all trackers with active positions
             for tr in &mut trackers {
                 if let Some(pos) = &tr.active {
                     if pos.slug == *slug {
-                        if let Some(result) = tr.check_stop_loss(&book_state, now) {
+                        let result = if tr.cfg.is_reprice_scalper {
+                            tr.check_reprice_exit(&book_state, secs_left, now)
+                        } else {
+                            tr.check_stop_loss(&book_state, now)
+                        };
+                        if let Some(result) = result {
                             if let Some(ref clob) = clob_client {
                                 let c = clob.clone();
                                 let tid = result.tid.clone();
                                 let exit_px = result.exit_px;
                                 let shares = result.shares;
                                 let eid = result.engine_id.clone();
+                                let reason = result.exit_reason.clone();
                                 tokio::spawn(async move {
                                     match c.place_market_order(&tid, exit_px, shares, "SELL").await {
-                                        Ok(resp) => info!("[CLOB] [{}] SL SELL placed: {:?}", eid, resp),
-                                        Err(e) => warn!("[CLOB] [{}] SL SELL failed (px={} sz={}): {:#}", eid, exit_px, shares, e),
+                                        Ok(resp) => info!("[CLOB] [{}] {} SELL placed: {:?}", eid, reason, resp),
+                                        Err(e) => warn!("[CLOB] [{}] {} SELL failed (px={} sz={}): {:#}", eid, reason, exit_px, shares, e),
                                     }
                                 });
                             }
                             log_json(&mut event_log, &serde_json::json!({
-                                "event": "SL", "ts": now, "slug": slug,
+                                "event": &result.exit_reason, "ts": now, "slug": slug,
                                 "engine": result.engine_id, "dir": result.dir,
                                 "pnl": result.pnl, "exit_px": result.exit_px,
                             }));

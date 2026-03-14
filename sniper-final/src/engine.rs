@@ -48,7 +48,7 @@ pub fn pm_fee(px: f64) -> f64 {
 #[derive(Debug, Clone, Deserialize)]
 pub struct EngineConfig {
     pub id:              String,
-    pub tf:              u32,       // 5 or 15 (0 = both, for Engine E)
+    pub tf:              u32,       // 5 or 15 (0 = both, for Engine E/F)
     pub delta:           f64,       // delta threshold (scaled by stdev)
     pub continuity:      u32,       // ticks above threshold before entry
     pub bn_contra:       bool,      // Binance contra-momentum filter
@@ -63,6 +63,18 @@ pub struct EngineConfig {
     // Book price range
     pub min_entry:       f64,       // minimum ask price to enter
     pub max_entry:       f64,       // maximum ask price to enter
+
+    // Engine F: CL-lead reprice scalper
+    #[serde(default)]
+    pub is_reprice_scalper: bool,
+    #[serde(default)]
+    pub exit_timeout_secs:  i64,    // force exit at T-Ns (30)
+    #[serde(default)]
+    pub profit_target:      f64,    // exit when bid >= fill + this (0.02)
+    #[serde(default)]
+    pub stop_exit_spread:   f64,    // cut when bid <= fill - this (0.03)
+    #[serde(default)]
+    pub min_gap:            f64,    // min CL-implied vs PM ask gap (0.03)
 }
 
 impl EngineConfig {
@@ -98,26 +110,45 @@ pub fn default_engines() -> Vec<EngineConfig> {
             id: "A".into(), tf: 5, delta: 0.04, continuity: 4,
             bn_contra: true, cl_fade: true, regime: true, is_late_scalper: false,
             entry_start: 57, taker_deadline: 44, min_entry: 0.88, max_entry: 0.98,
+            is_reprice_scalper: false, exit_timeout_secs: 0, profit_target: 0.0,
+            stop_exit_spread: 0.0, min_gap: 0.0,
         },
         EngineConfig {
             id: "B".into(), tf: 5, delta: 0.15, continuity: 0,
             bn_contra: true, cl_fade: true, regime: true, is_late_scalper: false,
             entry_start: 57, taker_deadline: 44, min_entry: 0.88, max_entry: 0.98,
+            is_reprice_scalper: false, exit_timeout_secs: 0, profit_target: 0.0,
+            stop_exit_spread: 0.0, min_gap: 0.0,
         },
         EngineConfig {
             id: "C".into(), tf: 15, delta: 0.04, continuity: 4,
             bn_contra: true, cl_fade: true, regime: true, is_late_scalper: false,
             entry_start: 57, taker_deadline: 44, min_entry: 0.88, max_entry: 0.98,
+            is_reprice_scalper: false, exit_timeout_secs: 0, profit_target: 0.0,
+            stop_exit_spread: 0.0, min_gap: 0.0,
         },
         EngineConfig {
             id: "D".into(), tf: 15, delta: 0.15, continuity: 0,
             bn_contra: true, cl_fade: true, regime: true, is_late_scalper: false,
             entry_start: 57, taker_deadline: 44, min_entry: 0.88, max_entry: 0.98,
+            is_reprice_scalper: false, exit_timeout_secs: 0, profit_target: 0.0,
+            stop_exit_spread: 0.0, min_gap: 0.0,
         },
         EngineConfig {
             id: "E".into(), tf: 0, delta: 0.0, continuity: 0,
             bn_contra: false, cl_fade: false, regime: false, is_late_scalper: true,
             entry_start: 25, taker_deadline: 3, min_entry: 0.95, max_entry: 0.975,
+            is_reprice_scalper: false, exit_timeout_secs: 0, profit_target: 0.0,
+            stop_exit_spread: 0.0, min_gap: 0.0,
+        },
+        EngineConfig {
+            id: "F".into(), tf: 0, delta: 0.0, continuity: 0,
+            bn_contra: false, cl_fade: false, regime: false,
+            is_late_scalper: false, is_reprice_scalper: true,
+            entry_start: 60, taker_deadline: 40,
+            min_entry: 0.85, max_entry: 0.93,
+            exit_timeout_secs: 30, profit_target: 0.02,
+            stop_exit_spread: 0.03, min_gap: 0.03,
         },
     ]
 }

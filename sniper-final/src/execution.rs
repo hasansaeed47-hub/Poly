@@ -259,6 +259,41 @@ pub fn execute_settlement(pos: &Position, actual_dir: &str, exec: &ExecConfig, n
     }
 }
 
+// -- Engine F: reprice exit ---------------------------------------------------
+
+/// Execute a reprice exit (Engine F): taker sell at current bid.
+/// Entry was maker (0 fee), exit is taker.
+pub fn execute_reprice_exit(
+    pos:    &Position,
+    bid:    f64,
+    reason: &str,
+    exec:   &ExecConfig,
+    now:    f64,
+) -> TradeResult {
+    let exit_px  = (bid - exec.slip).max(0.01);
+    let exit_fee = pm_fee(exit_px) * pos.shares;
+    let recovery = pos.shares * exit_px;
+    let pnl      = recovery - exec.stake - pos.entry_fee - exit_fee;
+
+    TradeResult {
+        engine_id:   pos.engine_id.clone(),
+        slug:        pos.slug.clone(),
+        tid:         pos.tid.clone(),
+        asset:       pos.asset.clone(),
+        dir:         pos.dir.clone(),
+        fill_px:     pos.fill_px,
+        shares:      pos.shares,
+        exit_px,
+        exit_reason: reason.to_string(),
+        pnl,
+        entry_fee:   pos.entry_fee,
+        exit_fee,
+        entry_ts:    pos.entry_ts,
+        exit_ts:     now,
+        wmin:        pos.wmin,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
