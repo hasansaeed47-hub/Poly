@@ -281,27 +281,135 @@ after a CL move. If convergence takes 10s, you have a 10s window; if 500ms, you'
 
 ---
 
+## 12. MARKET MICROSTRUCTURE INTELLIGENCE (from research)
+
+These are academic/professional-grade metrics used by HFT desks and crypto arb firms.
+
+| Field | Type | Why |
+|-------|------|-----|
+| `vpin` | f64 | **Volume-Synchronized Probability of Informed Trading** — measures order flow toxicity. High VPIN = other bots are active on this market = your edge gets competed away faster. Low VPIN = retail flow = edge persists. Partition volume into equal buckets, classify buy/sell, `VPIN = sum(\|V_buy - V_sell\|) / (n * bucket_vol)` |
+| `kyle_lambda` | f64 | **Price impact coefficient** — how much price moves per $1 of signed order flow. `delta_price = lambda * signed_volume`. Tells you max stake before your own impact eats your edge. High lambda on a binary token = even $5 moves the price 1-2c |
+| `amihud_illiquidity` | f64 | `\|return\| / dollar_volume` — illiquidity ratio. Compare across markets. High = thin market = more slippage. SOL-5m may be 10x more illiquid than BTC-15m |
+| `realized_spread` | f64 | `2 * sign(trade) * (trade_price - midpoint_{t+30s})` — what the liquidity provider ACTUALLY earns after adverse selection. Negative = informed flow is winning = your taker orders are more likely profitable |
+| `effective_spread` | f64 | `2 * \|fill_price - midpoint\|` — actual trading cost vs theoretical (quoted spread). If your effective < quoted, you're getting price improvement via maker |
+| `trade_arrival_rate` | f64 | Trades per second on this binary token — high = active = faster price discovery = less edge window |
+
+### Execution Quality (professional TCA metrics)
+
+| Field | Type | Why |
+|-------|------|-----|
+| `implementation_shortfall` | f64 | `paper_pnl - actual_pnl` — THE single best execution metric. Captures ALL costs: spread, impact, timing, fees, slippage. If IS = 75% of your edge, only 25% reaches your pocket |
+| `edge_capture_ratio` | f64 | `realized_pnl / theoretical_edge_at_signal` — what fraction of detected edge you actually capture. <0.5 = fix execution, >0.8 = execution is good |
+| `adverse_selection` | f64 | `fair_value_at_fill - fair_value_at_signal` — did fair value move against you while waiting to fill? Consistently positive = you're the dumb money, others are faster |
+| `timing_risk` | f64 | `var(fair_value_at_fill - fair_value_at_signal)` — uncertainty of your edge between signal and fill. High = maker chase is too slow |
+| `maker_chase_effectiveness` | f64 | `maker_fills / (maker_fills + taker_fallbacks)` — is the chase strategy working or just wasting time? |
+| `market_impact_est` | f64 | `midpoint_after_trade - midpoint_before_trade` — your own footprint. At what stake does your impact > your edge? |
+
+### Settlement & Oracle Integrity
+
+| Field | Type | Why |
+|-------|------|-----|
+| `cl_settlement_vs_bn` | f64 | `\|cl_at_settlement - bn_at_settlement\|` — did the oracle settle at a manipulated price? Detects flash-loan or concentrated-reporter attacks |
+| `cl_revert_post_settlement` | f64 | CL price 30s after settlement vs at settlement — if CL spikes only at T=0 and reverts, possible manipulation |
+| `last_60s_flip_prob` | f64 | Probability the outcome flipped in the final 60s (when you can't enter) — measures how much settlement uncertainty you can't control |
+| `book_at_settlement` | f64 | Market's prediction just before settlement — calibration check: is the PM book efficient? |
+| `market_prediction_error` | f64 | `\|book_price_at_T-5s - outcome(0 or 1)\|` — how wrong the market was. Persistently wrong = there IS edge |
+| `fair_value_calibration` | f64 | Actual win rate for trades entered at fair_value=X — plots the calibration curve. Perfect model = 45-degree line |
+| `settlement_autocorrelation` | f64 | Serial correlation of outcomes at lag 1,2,3 — do streaks exist? Feeds XW_WEIGHTS tuning |
+
+### Risk Metrics (compute from trade logs, but need the raw data)
+
+| Field | Type | Why |
+|-------|------|-----|
+| `sharpe_ratio` | f64 | `mean(returns) / std(returns) * sqrt(252)` — risk-adjusted return |
+| `sortino_ratio` | f64 | Like Sharpe but only penalises downside — better for binary's asymmetric payoff |
+| `max_drawdown` | f64 | Largest peak-to-trough in cumulative PnL — survival metric |
+| `max_drawdown_duration_s` | f64 | How long worst drawdown lasted |
+| `calmar_ratio` | f64 | `annual_return / max_drawdown` |
+| `max_consecutive_losses` | u32 | Longest losing streak — stress-tests bankroll |
+| `profit_factor` | f64 | `gross_wins / gross_losses` — >1 = profitable |
+| `kelly_fraction` | f64 | `(p * b - q) / b` — optimal bet sizing given your win rate and payoff |
+| `win_loss_ratio` | f64 | `avg_win / avg_loss` — payoff asymmetry |
+| `tail_ratio` | f64 | `p95_wins / p5_losses` — tail risk symmetry |
+| `expected_value` | f64 | `wr * avg_win - (1-wr) * avg_loss` — per-trade EV |
+| `pnl_per_signal` | f64 | `total_pnl / total_signals` — signal efficiency |
+| `roi_per_hour` | f64 | `net_pnl / hours_running` — capital efficiency |
+
+---
+
+## 13. FEED INTEGRITY REQUIREMENTS (no throttled / stale data)
+
+**Critical**: All data must come from live, unthrottled WebSocket feeds. No REST polling as primary.
+No hypothesis or interpolation — only real observed prices.
+
+### BN Feed (NEW — must add to Scanner-V2)
+- **Source**: `wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/ethusdt@aggTrade/solusdt@aggTrade`
+- **Rate**: ~10-50 messages/second per symbol (aggTrade). NO throttling. No rate limit on WS reads.
+- **Storage**: `DashMap<String, (f64, f64)>` for current price + `Vec<(f64, f64)>` for history (1000 cap)
+- **Staleness check**: If `now - last_bn_update > 5s`, flag `bn_stale = true` on signal
+- **DO NOT** use REST polling as primary — REST has 1200 req/min limit and introduces 100-500ms latency
+
+### CL Feed (existing — validate no throttle)
+- **Source**: `wss://ws-live-data.polymarket.com` topic `crypto_prices_chainlink`
+- **Rate**: ~1 tick/second per asset. This IS throttled by Chainlink's heartbeat/deviation threshold.
+- **Reality**: CL updates are inherently sparse (~1/s). This is not a bug — it's the oracle's design.
+  The sparseness IS the lag opportunity. Log every tick with microsecond precision.
+- **Staleness**: Already tracked via `cl_feed_age_ms`. Add `cl_tick_age_ms` (time since price CHANGED, not just message received)
+
+### Book Feed (existing — validate freshness)
+- **Source**: REST batch `POST /books` every 1s (current Scanner-V2 approach)
+- **Problem**: REST polling at 1s means book data is always 0-1s stale. For a 500ms tick loop, you're often working with data from the previous tick.
+- **Upgrade path**: Switch to WS book feed (`wss://ws-subscriptions-clob.polymarket.com/ws/market`)
+  like Oracle Scanner V1 already does. Real-time pushes, no polling delay.
+- **Log `book_age_ms`** on every signal so post-hoc analysis knows how fresh the data was
+
+### BN Tick Log (NEW — parallel to ClTickLog)
+```
+BnTickLog: ts, asset, price
+```
+Log every BN aggTrade price change (with >0.001 threshold to avoid noise).
+This gives you the ground truth timeline for measuring CL lag.
+
+### Data Integrity Flags (add to every SignalLog)
+| Field | Type | Why |
+|-------|------|-----|
+| `cl_stale` | bool | CL price age > 10s — signal computed on stale oracle |
+| `bn_stale` | bool | BN price age > 5s — no spot reference available |
+| `book_stale` | bool | Book age > 3s — fill prices unreliable |
+| `cl_feed_source` | String | "rtds_ws" or "bn_fallback" — which feed powered this signal |
+| `data_quality` | String | "full"/"degraded"/"stale" — composite flag for filtering in analysis |
+
+**Analysis rule**: Any signal where `data_quality != "full"` should be flagged separately.
+Don't mix clean and degraded signals when computing win rates.
+
+---
+
 ## Priority Implementation Order
 
-### P0 — Do immediately (highest impact on analysis)
-1. **BN parallel capture** (`bn_price`, `bn_momentum_30s`, `cl_bn_spread`)
-2. **Latency fields** (`cl_feed_age_ms`, `book_age_ms`, `cl_bn_lag_ms`)
-3. **Multi-timeframe momentum** (`cl_momentum_5s`, `cl_momentum_60s`, `cl_acceleration`)
+### P0 — Do immediately (highest impact, required for all analysis)
+1. **BN WebSocket feed** in `feeds.rs` — aggTrade stream, no REST polling. Log `BnTickLog` parallel to `ClTickLog`
+2. **BN parallel capture** on every SignalLog — `bn_price`, `bn_momentum_5s/30s`, `cl_bn_spread`, `bn_sigma`
+3. **Latency fields** — `cl_feed_age_ms`, `cl_tick_age_ms`, `book_age_ms`, `cl_bn_lag_ms`
+4. **Data integrity flags** — `cl_stale`, `bn_stale`, `book_stale`, `data_quality`
+5. **Multi-timeframe momentum** — `cl_momentum_5s`, `cl_momentum_60s`, `cl_acceleration`
 
-### P1 — Next sprint (execution quality)
-4. **Book dynamics** (`book_velocity`, `depth_change`, `book_sweep_flag`)
-5. **Effective spread** and **VWAP slippage**
-6. **Vol regime** (`sigma_ratio`, `vol_regime`, `vol_percentile`)
+### P1 — Next (execution + microstructure)
+6. **Book dynamics** — `book_velocity`, `depth_change`, `book_sweep_flag`, `top_ask_size`, `top_bid_size`
+7. **Effective/realized spread** — `effective_spread`, `midpoint`, `vwap_slippage`
+8. **Vol regime** — `sigma_ratio`, `sigma_60s`, `vol_regime`, `vol_percentile`
+9. **Arb metrics** — `yes_no_arb`, `convergence_speed`, `implied_probability_sum`
 
 ### P2 — Analysis enrichment
-7. **Cross-window** (`prev_outcome`, `streak_length`, `hour_utc`)
-8. **Oracle health** (`cl_update_count`, `cl_gap_max_ms`, `sigma_samples`)
-9. **Arb metrics** (`yes_no_arb`, `convergence_speed`)
+10. **Cross-window** — `prev_outcome`, `streak_length`, `xw_bias`, `settlement_autocorrelation`
+11. **Oracle health** — `cl_update_count_in_window`, `cl_gap_max_ms`, `sigma_samples`
+12. **Time context** — `hour_utc`, `day_of_week`, `windows_active`
+13. **Microstructure** — `vpin`, `kyle_lambda`, `amihud_illiquidity`, `trade_arrival_rate`
 
-### P3 — Post-hoc computation (don't need in real-time, compute from JSONL)
-10. **Risk metrics** (Sharpe, Sortino, drawdown — compute from trade logs)
-11. **Execution quality** (adverse selection, implementation shortfall — needs live data)
-12. **Settlement patterns** (market prediction error, fair value path)
+### P3 — Post-hoc computation (compute from JSONL, don't need real-time)
+14. **Risk metrics** — Sharpe, Sortino, drawdown, Kelly, profit_factor, tail_ratio
+15. **Execution quality** — implementation_shortfall, edge_capture_ratio, adverse_selection, timing_risk
+16. **Settlement analysis** — fair_value_calibration, market_prediction_error, last_60s_flip_prob
+17. **Oracle integrity** — cl_settlement_vs_bn, cl_revert_post_settlement
 
 ---
 
@@ -310,15 +418,28 @@ after a CL move. If convergence takes 10s, you have a 10s window; if 500ms, you'
 **Where to add**: `oracle-scanner-v2` is the pure data capture tool — add all new fields to
 `SignalLog` in `main.rs` and compute them in the tick loop.
 
-**BN feed**: Need to add a Binance WebSocket connection to `feeds.rs` (currently only in Python
-`infra.py`). Subscribe to `btcusdt@aggTrade`, `ethusdt@aggTrade`, `solusdt@aggTrade`.
+**BN feed (CRITICAL — new WebSocket)**: Add Binance aggTrade WebSocket to `feeds.rs`.
+```
+URL: wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/ethusdt@aggTrade/solusdt@aggTrade
+```
+- Store in `BnPrices: Arc<DashMap<String, (f64, f64)>>` (same pattern as `ClPrices`)
+- Maintain `BnPriceHistory: Arc<DashMap<String, Vec<(f64, f64)>>>` (1000 cap, same as CL)
+- Log `BnTickLog` to `data/bn_ticks_{date}.jsonl` when price changes > 0.001
+- Reconnect with 5s backoff, ping every 5s (same as CL feed)
+- **NO REST FALLBACK** — aggTrade WS has no rate limits on read side
+
+**Feed integrity**: Every signal MUST carry staleness flags. If any feed is stale, the signal
+is marked `data_quality: "degraded"`. Analysis scripts filter on this to avoid contaminating
+results with stale-data artifacts.
 
 **Backward compatibility**: Add new fields as `Option<f64>` with `#[serde(skip_serializing_if = "Option::is_none")]`
 so old analysis scripts don't break on new JSONL format.
 
 **Storage impact**: Current ~50 fields per signal at 2 ticks/sec ≈ 170k signals/day ≈ 50MB/day.
-Adding ~60 more fields roughly doubles this to ~100MB/day. Acceptable for VPS with SSD.
+Adding ~120 more fields roughly triples to ~150MB/day. BnTickLog adds ~20MB/day (aggTrade is
+high frequency). Total ~170MB/day. Acceptable for VPS with SSD.
 
 **Compute impact**: Most new fields are cheap (arithmetic on existing data). BN feed is the
 biggest change (new WebSocket connection + price history). `convergence_speed` requires tracking
-CL move events and measuring book reaction time — slightly complex but valuable.
+CL move events and measuring book reaction time. `vpin` and `kyle_lambda` are P2 and can be
+computed post-hoc from tick logs — don't need real-time.
