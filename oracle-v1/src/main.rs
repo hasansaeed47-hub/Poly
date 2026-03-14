@@ -128,10 +128,18 @@ async fn main() -> Result<()> {
         cfg.strategy.partial_tp_pct * 100.0, cfg.strategy.stake,
         cfg.strategy.maker_chase_ticks);
 
-    // Validate wallet config
-    if cfg.wallet.private_key.is_empty() {
-        anyhow::bail!("private_key is empty in config.toml — set your wallet key before running");
-    }
+    // Wallet keys: config.toml first, then env vars as fallback
+    let private_key = if cfg.wallet.private_key.is_empty() {
+        std::env::var("POLY_PRIVATE_KEY")
+            .context("private_key empty in config.toml and POLY_PRIVATE_KEY env var not set")?
+    } else {
+        cfg.wallet.private_key.clone()
+    };
+    let funder_address = if cfg.wallet.funder_address.is_empty() {
+        std::env::var("POLY_FUNDER_ADDRESS").unwrap_or_default()
+    } else {
+        cfg.wallet.funder_address.clone()
+    };
 
     // Create log directory
     std::fs::create_dir_all("logs").context("cannot create logs/")?;
@@ -140,8 +148,8 @@ async fn main() -> Result<()> {
 
     info!("Initializing execution layer...");
     let exec = execution::ExecutionLayer::new(
-        &cfg.wallet.private_key,
-        &cfg.wallet.funder_address,
+        &private_key,
+        &funder_address,
     ).await.context("Execution layer init failed")?;
     let exec = Arc::new(exec);
 
