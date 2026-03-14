@@ -1,0 +1,1 @@
+/home/user/Poly/oracle-scanner-v2/target/release/oracle_scanner_v2: /home/user/Poly/oracle-scanner-v2/src/feeds.rs /home/user/Poly/oracle-scanner-v2/src/main.rs /home/user/Poly/oracle-scanner-v2/src/signal.rs

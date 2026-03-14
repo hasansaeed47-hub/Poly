@@ -1,0 +1,10 @@
+/home/user/Poly/oracle-scanner-v2/target/debug/build/openssl-sys-deea97c63c4245ec/build_script_main-deea97c63c4245ec.d: /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/main.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/cfgs.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/find_normal.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/run_bindgen.rs
+
+/home/user/Poly/oracle-scanner-v2/target/debug/build/openssl-sys-deea97c63c4245ec/build_script_main-deea97c63c4245ec: /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/main.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/cfgs.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/find_normal.rs /root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/run_bindgen.rs
+
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/main.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/cfgs.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/find_normal.rs:
+/root/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openssl-sys-0.9.112/build/run_bindgen.rs:
+
+# env-dep:CARGO_PKG_VERSION=0.9.112

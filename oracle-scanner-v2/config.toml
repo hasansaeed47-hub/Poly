@@ -1,0 +1,24 @@
+# Oracle Scanner V2 — Data Capture Only (No Trading)
+# No wallet needed. No execution. Pure observation.
+
+[feed]
+assets     = ["btc", "eth", "sol"]
+timeframes = [5, 15]
+
+clob_rest  = "https://clob.polymarket.com"
+live_ws    = "wss://ws-live-data.polymarket.com"
+gamma_api  = "https://gamma-api.polymarket.com"
+
+book_batch_size  = 20
+rest_throttle_ms = 500
+book_warmup_secs = 5
+book_stale_secs  = 3
+
+[scan]
+tick_ms            = 500     # signal capture every 500ms
+sigma_window_secs  = 300     # 5-min rolling vol window
+min_secs           = 30      # capture data down to 30s left (more data than v1's 60s)
+vwap_stake         = 5.0     # stake amount for VWAP fill calc
+
+[http]
+port = 8080   # GET /files, GET /download/{f}, GET /status
