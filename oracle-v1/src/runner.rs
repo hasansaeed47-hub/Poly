@@ -126,7 +126,7 @@ impl LiveRunner {
     pub fn new(config: StrategyConfig, exec: Arc<ExecutionLayer>, log_dir: &str) -> Self {
         let log_path = format!("{}/opt2_maker.jsonl", log_dir);
         let file = OpenOptions::new()
-            .create(true).write(true).append(true)
+            .create(true).append(true)
             .open(&log_path)
             .unwrap_or_else(|e| panic!("Cannot open log {}: {}", log_path, e));
 
@@ -305,7 +305,7 @@ impl LiveRunner {
                     );
                     // Cancel/sell the filled shares immediately
                     let shares = self.config.stake / actual_price;
-                    let _ = self.exec.sell_gtc(&token_id.to_string(), actual_price, shares).await;
+                    let _ = self.exec.sell_gtc(token_id, actual_price, shares).await;
                     return;
                 }
 
@@ -316,7 +316,7 @@ impl LiveRunner {
                         sig.slug, actual_price
                     );
                     let shares = self.config.stake / actual_price;
-                    let _ = self.exec.sell_gtc(&token_id.to_string(), actual_price, shares).await;
+                    let _ = self.exec.sell_gtc(token_id, actual_price, shares).await;
                     return;
                 }
 
@@ -579,8 +579,4 @@ impl LiveRunner {
         );
     }
 
-    #[allow(dead_code)]
-    pub fn open_position_count(&self) -> usize {
-        self.positions.len()
-    }
 }

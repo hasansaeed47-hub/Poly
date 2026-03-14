@@ -33,6 +33,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Misc
 anyhow   = "1"
-chrono   = { version = "0.4", features = ["serde"] }
 url      = "2"
-uuid     = "1"

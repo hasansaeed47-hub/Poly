@@ -39,8 +39,6 @@ pub struct Signal {
     pub fair_no:     f64,
     pub book_yes:    f64,
     pub book_no:     f64,
-    pub edge_yes:    f64,
-    pub edge_no:     f64,
     pub best_side:   Option<Side>,
     pub best_edge:   f64,
     pub best_book:   f64,
@@ -128,9 +126,6 @@ pub fn compute(
     let fy  = fair_yes(cl_price, open_price, sigma, secs_left);
     let fn_ = 1.0 - fy;
 
-    let edge_yes = fy  - book_yes.best_ask;
-    let edge_no  = fn_ - book_no.best_ask;
-
     let fill_yes_data = vwap_fill(&book_yes.asks, stake);
     let fill_no_data  = vwap_fill(&book_no.asks, stake);
 
@@ -164,10 +159,9 @@ pub fn compute(
 
     Some(Signal {
         slug: slug.to_string(), asset: asset.to_string(), tf,
-        open_price, cl_price: cl_price, sigma, secs_left,
+        open_price, cl_price, sigma, secs_left,
         fair_yes: fy, fair_no: fn_,
         book_yes: book_yes.best_ask, book_no: book_no.best_ask,
-        edge_yes, edge_no,
         best_side, best_edge, best_book, best_fair,
         fill_yes, fill_no,
         depth_yes, depth_no,
