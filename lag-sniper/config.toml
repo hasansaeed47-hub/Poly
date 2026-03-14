@@ -24,16 +24,16 @@ min_secs           = 60     # don't scan below T-60s
 
 # ── Lag Detection Thresholds ─────────────────────────────────────────────
 [lag]
-min_divergence_pct  = 0.03   # BN-CL must diverge by at least 0.03%
-min_edge            = 0.03   # fair_bn - fill_price >= 3 cents
-min_fair_gap        = 0.01   # |fair_bn - fair_cl| >= 1 cent
-min_bn_momentum     = 0.0002 # |BN 5s pct change| >= 0.02%
+min_divergence_pct  = 0.035  # BN-CL must diverge by at least 0.035% (was 0.03)
+min_edge            = 0.08   # fair_bn - fill_price >= 8 cents (was 0.03 — too thin)
+min_fair_gap        = 0.05   # |fair_bn - fair_cl| >= 5 cents (was 0.01 — noise)
+min_bn_momentum     = 0.0003 # |BN 5s pct change| >= 0.03% (was 0.0002)
 min_secs_left       = 60     # don't enter below T-60s
-max_secs_left       = 840    # don't enter above T-14min
+max_secs_left       = 600    # don't enter above T-10min (was 840 — too early is noise)
 max_sigma           = 0.80   # skip if sigma > 80% annualized
 min_depth_multiple  = 2.0    # book depth >= 2x stake
-min_entry_price     = 0.10   # no sub-10c lottery tickets
-max_entry_price     = 0.90   # no overpaying >90c
+min_entry_price     = 0.12   # no sub-12c lottery tickets (was 0.10)
+max_entry_price     = 0.88   # no overpaying >88c (was 0.90)
 min_bn_flow_confirm = 0.05   # BN flow imbalance must confirm direction
 
 # ── Strategy Parameters ──────────────────────────────────────────────────
