@@ -22,7 +22,7 @@ mod feeds;
 mod signal;
 mod tracker;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -101,7 +101,6 @@ struct FeedConfig {
     live_ws:          String,
     gamma_api:        String,
     #[serde(default = "default_batch_size")]
-    #[allow(dead_code)]
     book_batch_size:  usize,
     #[serde(default = "default_throttle")]
     rest_throttle_ms: u64,
@@ -317,6 +316,44 @@ fn top_n_levels(levels: &[feeds::PriceLevel], n: usize) -> Vec<[f64; 2]> {
     levels.iter().take(n).map(|l| [l.price, l.size]).collect()
 }
 
+/// Cached file handle pool — avoids reopening the same file every 500ms tick.
+/// Handles are keyed by path; on date rollover the old date's handle is dropped
+/// automatically when the new path is requested.
+struct FileCache {
+    handles: HashMap<String, std::fs::File>,
+}
+
+impl FileCache {
+    fn new() -> Self { Self { handles: HashMap::new() } }
+
+    fn get(&mut self, path: &str) -> std::io::Result<&mut std::fs::File> {
+        if !self.handles.contains_key(path) {
+            // Evict stale handles (old dates) when we open a new one
+            // Keep at most 12 handles (6 sections x 2 dates during rollover)
+            if self.handles.len() >= 12 {
+                let stale: Vec<String> = self.handles.keys()
+                    .filter(|k| *k != path)
+                    .take(self.handles.len() - 6)
+                    .cloned()
+                    .collect();
+                for k in stale { self.handles.remove(&k); }
+            }
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            self.handles.insert(path.to_string(), f);
+        }
+        Ok(self.handles.get_mut(path).unwrap())
+    }
+
+    /// Force close all handles (e.g. on date rollover)
+    fn flush_all(&mut self) {
+        self.handles.clear();
+    }
+}
+
+/// Simple open-append for spawned tasks that can't share FileCache
 fn open_or_create(path: &str) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .create(true)
@@ -569,6 +606,7 @@ async fn main() -> Result<()> {
     let bn_tick_count = Arc::new(AtomicU64::new(0));
     let whale_trade_count  = Arc::new(AtomicU64::new(0));
     let whale_wallet_count = Arc::new(AtomicU64::new(0));
+    let book_fetching      = Arc::new(AtomicBool::new(false));
 
     let http = Client::builder()
         .user_agent("oracle-scanner-v2/2")
@@ -656,7 +694,8 @@ async fn main() -> Result<()> {
                     if let Some(entry) = cl_for_log.get(asset.as_str()) {
                         let (ts, price) = *entry;
                         let prev = last_prices.get(asset).copied().unwrap_or(0.0);
-                        if (price - prev).abs() > 0.001 {
+                        // Relative threshold: log if price changed by >0.0001% (1 bp)
+                        if prev <= 0.0 || ((price - prev) / prev).abs() > 0.000001 {
                             let log = ClTickLog { ts, asset: asset.clone(), price };
                             if let Ok(line) = serde_json::to_string(&log) {
                                 if let Ok(mut f) = open_or_create(&path) {
@@ -764,9 +803,10 @@ async fn main() -> Result<()> {
     let mut last_stats_ts: f64 = now_secs();
     let mut last_discover: f64 = now_secs();
     let mut last_dash_ts:  f64 = now_secs();
-    let mut settled: HashMap<String, bool> = HashMap::new();
+    let mut settled: HashSet<String> = HashSet::new();
     let mut cl_close_snap: HashMap<String, f64> = HashMap::new();
     let mut current_date = today_str();
+    let mut file_cache = FileCache::new();
 
     let shutdown = Arc::new(AtomicBool::new(false));
     {
@@ -845,12 +885,31 @@ async fn main() -> Result<()> {
         if date != current_date {
             info!("[DATE] Rolled to {}", date);
             current_date = date;
+            file_cache.flush_all();
         }
 
         // -- Periodic market rediscovery (every 60s) --------------------------
 
         if now - last_discover > 60.0 {
             last_discover = now;
+
+            // Prune expired windows: remove markets settled >120s ago
+            let expired: Vec<String> = markets.iter()
+                .filter(|(_, m)| now_u > m.window_end + 120)
+                .map(|(s, _)| s.clone())
+                .collect();
+            for slug in &expired {
+                if let Some(meta) = markets.remove(slug) {
+                    token_ids.remove(&meta.token_yes);
+                    token_ids.remove(&meta.token_no);
+                }
+                settled.remove(slug);
+                cl_close_snap.remove(slug);
+            }
+            if !expired.is_empty() {
+                info!("[PRUNE] Removed {} expired markets", expired.len());
+            }
+
             for asset in &cfg.feed.assets {
                 for &tf in &cfg.feed.timeframes {
                     for window_start in current_window_starts(tf, now_u) {
@@ -868,13 +927,13 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            let active = markets.iter().filter(|(s, _)| !settled.contains_key(s.as_str())).count();
+            let active = markets.iter().filter(|(s, _)| !settled.contains(s.as_str())).count();
             market_count.store(active as u64, Ordering::Relaxed);
 
             // Update active markets for whale tracker
             if cfg.tracker.enabled {
                 let active_list: Vec<tracker::ActiveMarketInfo> = markets.iter()
-                    .filter(|(s, _)| !settled.contains_key(s.as_str()))
+                    .filter(|(s, _)| !settled.contains(s.as_str()))
                     .map(|(_, m)| tracker::ActiveMarketInfo {
                         slug: m.slug.clone(),
                         asset: m.asset.clone(),
@@ -888,26 +947,36 @@ async fn main() -> Result<()> {
             }
         }
 
-        // -- Batch book refresh (every other tick) ----------------------------
+        // -- Batch book refresh (every other tick, skip if previous still running)
 
-        if tick_count % 2 == 0 {
+        if tick_count % 2 == 0 && !book_fetching.load(Ordering::Relaxed) {
             let all_tokens: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
             if !all_tokens.is_empty() {
-                match fetch_books_batch(&http, &cfg.feed.clob_rest, &all_tokens, &limiter).await {
-                    Ok(books) => {
-                        for (tid, entry) in books {
-                            book_state.insert(tid, entry);
+                let http2 = http.clone();
+                let clob2 = cfg.feed.clob_rest.clone();
+                let lim2 = limiter.clone();
+                let bs2 = book_state.clone();
+                let flag2 = book_fetching.clone();
+                let batch_sz = cfg.feed.book_batch_size;
+                flag2.store(true, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    match fetch_books_batch(&http2, &clob2, &all_tokens, &lim2, batch_sz).await {
+                        Ok(books) => {
+                            for (tid, entry) in books {
+                                bs2.insert(tid, entry);
+                            }
                         }
+                        Err(e) => warn!("[BOOK] batch failed: {}", e),
                     }
-                    Err(e) => warn!("[BOOK] batch failed: {}", e),
-                }
+                    flag2.store(false, Ordering::Relaxed);
+                });
             }
         }
 
         // -- CL close snap ----------------------------------------------------
 
         for (slug, meta) in &markets {
-            if settled.get(slug.as_str()).copied().unwrap_or(false) { continue; }
+            if settled.contains(slug.as_str()) { continue; }
             if cl_close_snap.contains_key(slug.as_str()) { continue; }
             if now_u > meta.window_end {
                 let cl_now = cl_prices.get(&meta.asset).map(|v| v.1).unwrap_or(0.0);
@@ -921,7 +990,7 @@ async fn main() -> Result<()> {
         // -- Settlements ------------------------------------------------------
 
         for (slug, meta) in &markets {
-            if settled.get(slug.as_str()).copied().unwrap_or(false) { continue; }
+            if settled.contains(slug.as_str()) { continue; }
             if now_u >= meta.window_end + 5 {
                 let cl_settle = match cl_close_snap.get(slug.as_str()) {
                     Some(&p) => p,
@@ -958,13 +1027,13 @@ async fn main() -> Result<()> {
 
                 let path = format!("data/settlements_{}.jsonl", current_date);
                 if let Ok(line) = serde_json::to_string(&log) {
-                    if let Ok(mut f) = open_or_create(&path) {
+                    if let Ok(f) = file_cache.get(&path) {
                         let _ = writeln!(f, "{}", line);
                     }
                 }
 
                 settle_count.fetch_add(1, Ordering::Relaxed);
-                settled.insert(slug.clone(), true);
+                settled.insert(slug.clone());
             }
         }
 
@@ -979,7 +1048,7 @@ async fn main() -> Result<()> {
         let signal_path = format!("data/signals_{}.jsonl", current_date);
 
         for (slug, meta) in &mut markets {
-            if settled.get(slug.as_str()).copied().unwrap_or(false) { continue; }
+            if settled.contains(slug.as_str()) { continue; }
 
             let secs_left = meta.window_end as f64 - now;
             if secs_left < cfg.scan.min_secs { continue; }
@@ -990,11 +1059,22 @@ async fn main() -> Result<()> {
                 None    => continue,
             };
 
-            // Set open price at window start
+            // Set open price at window start.
+            // Only set if we're within the first 5s of the window — if we
+            // joined late (crash recovery), the CL price has drifted and using
+            // it as "open" corrupts fair value. Skip the market instead.
             if meta.open_price <= 0.0 {
                 if now_u >= meta.window_start {
-                    meta.open_price = cl;
-                    info!("[OPEN] {} open_price={:.2}", slug, cl);
+                    let window_age = now_u - meta.window_start;
+                    if window_age <= 5 {
+                        meta.open_price = cl;
+                        info!("[OPEN] {} open_price={:.2}", slug, cl);
+                    } else {
+                        // Joined too late — mark as settled so we don't keep retrying
+                        warn!("[OPEN] {} skipped: joined {}s late, CL has drifted",
+                            slug, window_age);
+                        settled.insert(slug.clone());
+                    }
                 }
                 continue;
             }
@@ -1026,50 +1106,44 @@ async fn main() -> Result<()> {
                 bids: book_no_entry.bids.clone(),
             };
 
+            // -- Fetch histories once, reuse for all derived metrics --
+            let cl_hist_ref = price_history.get(&meta.asset);
+            let bn_hist_key = format!("bn_{}", meta.asset);
+            let bn_hist_ref = bn_history.get(&bn_hist_key);
+
             // Sigma (300s)
-            let sigma = {
-                let hist = price_history.get(&meta.asset);
-                match hist {
-                    Some(h) => estimate_sigma(&h, cfg.scan.sigma_window_secs, now),
-                    None    => 0.50,
-                }
-            };
+            let sigma = cl_hist_ref.as_ref()
+                .map(|h| estimate_sigma(h.value(), cfg.scan.sigma_window_secs, now))
+                .unwrap_or(0.50);
 
             // Sigma (60s) for vol regime
-            let sigma_60s = {
-                let hist = price_history.get(&meta.asset);
-                match hist {
-                    Some(h) => {
-                        let s = estimate_sigma(&h, 60.0, now);
-                        Some(s)
-                    }
-                    None => None,
-                }
-            };
+            let sigma_60s = cl_hist_ref.as_ref()
+                .map(|h| estimate_sigma(h.value(), 60.0, now));
             let sigma_ratio = sigma_60s.map(|s60| if sigma > 0.0 { s60 / sigma } else { 1.0 });
 
             // CL momentum (30s -- original)
-            let cl_momentum = {
-                let hist = price_history.get(&meta.asset);
-                match hist {
-                    Some(h) => momentum_from_history(&h, now, 30.0).0,
-                    None => 0.0,
-                }
-            };
+            let cl_momentum = cl_hist_ref.as_ref()
+                .map(|h| momentum_from_history(h.value(), now, 30.0).0)
+                .unwrap_or(0.0);
 
             // Multi-timeframe CL momentum
-            let cl_momentum_5s = {
-                let hist = price_history.get(&meta.asset);
-                hist.map(|h| momentum_from_history(&h, now, 5.0).0)
-            };
-            let cl_momentum_60s = {
-                let hist = price_history.get(&meta.asset);
-                hist.map(|h| momentum_from_history(&h, now, 60.0).0)
-            };
+            let cl_momentum_5s = cl_hist_ref.as_ref()
+                .map(|h| momentum_from_history(h.value(), now, 5.0).0);
+            let cl_momentum_60s = cl_hist_ref.as_ref()
+                .map(|h| momentum_from_history(h.value(), now, 60.0).0);
             let cl_acceleration = match (cl_momentum_5s, Some(cl_momentum)) {
                 (Some(m5), Some(m30)) => Some(m5 - m30),
                 _ => None,
             };
+
+            // Oracle health
+            let cl_update_count = cl_hist_ref.as_ref()
+                .map(|h| count_updates_in_window(h.value(), meta.window_start as f64, now));
+            let cl_gap_max_ms = cl_hist_ref.as_ref()
+                .map(|h| max_gap_in_window(h.value(), meta.window_start as f64, now) * 1000.0);
+
+            // Drop CL history lock
+            drop(cl_hist_ref);
 
             // BN price + staleness
             let (bn_ts, bn_price) = bn_prices.get(&meta.asset)
@@ -1077,18 +1151,15 @@ async fn main() -> Result<()> {
                 .unwrap_or((0.0, 0.0));
             let bn_available = bn_price > 0.0;
 
-            let bn_momentum_5s = if bn_available {
-                let hist = bn_history.get(&format!("bn_{}", meta.asset));
-                hist.map(|h| momentum_from_history(&h, now, 5.0).0)
-            } else { None };
-            let bn_momentum_30s = if bn_available {
-                let hist = bn_history.get(&format!("bn_{}", meta.asset));
-                hist.map(|h| momentum_from_history(&h, now, 30.0).0)
-            } else { None };
-            let bn_momentum_60s = if bn_available {
-                let hist = bn_history.get(&format!("bn_{}", meta.asset));
-                hist.map(|h| momentum_from_history(&h, now, 60.0).0)
-            } else { None };
+            let (bn_momentum_5s, bn_momentum_30s, bn_momentum_60s) = if bn_available {
+                let m5  = bn_hist_ref.as_ref().map(|h| momentum_from_history(h.value(), now, 5.0).0);
+                let m30 = bn_hist_ref.as_ref().map(|h| momentum_from_history(h.value(), now, 30.0).0);
+                let m60 = bn_hist_ref.as_ref().map(|h| momentum_from_history(h.value(), now, 60.0).0);
+                (m5, m30, m60)
+            } else { (None, None, None) };
+
+            // Drop BN history lock
+            drop(bn_hist_ref);
 
             let cl_bn_spread = if bn_available && bn_price > 0.0 {
                 Some((cl - bn_price) / bn_price)
@@ -1111,16 +1182,6 @@ async fn main() -> Result<()> {
             } else {
                 "full"
             }.to_string();
-
-            // Oracle health
-            let cl_update_count = {
-                let hist = price_history.get(&meta.asset);
-                hist.map(|h| count_updates_in_window(&h, meta.window_start as f64, now))
-            };
-            let cl_gap_max_ms = {
-                let hist = price_history.get(&meta.asset);
-                hist.map(|h| max_gap_in_window(&h, meta.window_start as f64, now) * 1000.0)
-            };
 
             // Arb: YES+NO completeness
             let yes_no_arb = Some(1.0 - (book_yes_entry.best_ask + book_no_entry.best_ask));
@@ -1230,7 +1291,7 @@ async fn main() -> Result<()> {
             };
 
             if let Ok(line) = serde_json::to_string(&log) {
-                if let Ok(mut f) = open_or_create(&signal_path) {
+                if let Ok(f) = file_cache.get(&signal_path) {
                     let _ = writeln!(f, "{}", line);
                 }
             }
@@ -1245,7 +1306,7 @@ async fn main() -> Result<()> {
             let mut lines: Vec<String> = Vec::new();
 
             for (slug, meta) in &markets {
-                if settled.get(slug.as_str()).copied().unwrap_or(false) { continue; }
+                if settled.contains(slug.as_str()) { continue; }
                 let secs_left = meta.window_end as f64 - now;
                 if secs_left < 0.0 { continue; }
 
@@ -1267,23 +1328,16 @@ async fn main() -> Result<()> {
                     format!("{:+.4}%", (cl_val - meta.open_price) / meta.open_price * 100.0)
                 } else { "--".to_string() };
 
-                let sigma_str = {
-                    let hist = price_history.get(&meta.asset);
-                    match hist {
-                        Some(h) => {
-                            let sig = estimate_sigma(&h, cfg.scan.sigma_window_secs, now);
-                            format!("{:.1}%", sig * 100.0)
-                        }
-                        None => "--".to_string(),
-                    }
-                };
+                // Fetch history once for both sigma and fair_yes
+                let hist_ref = price_history.get(&meta.asset);
+                let sigma = hist_ref.as_ref()
+                    .map(|h| estimate_sigma(h.value(), cfg.scan.sigma_window_secs, now))
+                    .unwrap_or(0.50);
+                drop(hist_ref);
+
+                let sigma_str = format!("{:.1}%", sigma * 100.0);
 
                 let fy = if meta.open_price > 0.0 && cl_val > 0.0 {
-                    let hist = price_history.get(&meta.asset);
-                    let sigma = match hist {
-                        Some(h) => estimate_sigma(&h, cfg.scan.sigma_window_secs, now),
-                        None => 0.50,
-                    };
                     fair_yes(cl_val, meta.open_price, sigma, secs_left)
                 } else { 0.0 };
 
@@ -1322,7 +1376,7 @@ async fn main() -> Result<()> {
 
         if now - last_stats_ts >= 60.0 {
             last_stats_ts = now;
-            let active = markets.iter().filter(|(s, _)| !settled.contains_key(s.as_str())).count();
+            let active = markets.iter().filter(|(s, _)| !settled.contains(s.as_str())).count();
             info!(
                 "[SCANNER] signals={} settles={} cl={} bn={} whales={} markets={} books={} | http://0.0.0.0:{}",
                 signal_count.load(Ordering::Relaxed),

@@ -8,7 +8,7 @@
 ///   - whale_trades:  individual large trades by tracked wallets
 ///   - whale_wallets: the leaderboard snapshot (refreshed periodically)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -125,7 +125,8 @@ pub struct WhaleTracker {
     cfg:            TrackerConfig,
     client:         Client,
     wallets:        Vec<TrackedWallet>,
-    seen_trades:    HashSet<String>,        // dedup by trade_id
+    seen_set:       HashSet<String>,        // O(1) lookup for dedup
+    seen_queue:     VecDeque<String>,        // FIFO order for eviction
     trade_count:    Arc<AtomicU64>,
     wallet_count:   Arc<AtomicU64>,
     last_refresh:   f64,
@@ -142,11 +143,31 @@ impl WhaleTracker {
             cfg,
             client,
             wallets: Vec::new(),
-            seen_trades: HashSet::new(),
+            seen_set: HashSet::new(),
+            seen_queue: VecDeque::new(),
             trade_count,
             wallet_count,
             last_refresh: 0.0,
         }
+    }
+
+    /// Insert a trade ID into the dedup set with FIFO eviction.
+    fn mark_seen(&mut self, id: String) {
+        if self.seen_set.insert(id.clone()) {
+            self.seen_queue.push_back(id);
+        }
+        // FIFO eviction: remove oldest entries when over capacity
+        while self.seen_set.len() > 50_000 {
+            if let Some(old) = self.seen_queue.pop_front() {
+                self.seen_set.remove(&old);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn is_seen(&self, id: &str) -> bool {
+        self.seen_set.contains(id)
     }
 
     fn now_secs() -> f64 {
@@ -272,8 +293,8 @@ impl WhaleTracker {
         let now = Self::now_secs();
         let mut all_trades: Vec<WhaleTradeLog> = Vec::new();
 
-        let wallet_set: HashMap<String, &TrackedWallet> = self.wallets.iter()
-            .map(|w| (w.address.to_lowercase(), w))
+        let wallet_set: HashMap<String, TrackedWallet> = self.wallets.iter()
+            .map(|w| (w.address.to_lowercase(), w.clone()))
             .collect();
 
         // Deduplicate condition_ids (multiple slugs may share same condition)
@@ -299,7 +320,7 @@ impl WhaleTracker {
                     .unwrap_or_default()
                     .to_string();
                 if tx_hash.is_empty() { continue; }
-                if self.seen_trades.contains(&tx_hash) { continue; }
+                if self.is_seen(&tx_hash) { continue; }
 
                 // Extract user address from nested user object
                 let user_addr = event.get("user")
@@ -310,9 +331,9 @@ impl WhaleTracker {
 
                 // Check if this is a tracked wallet
                 let wallet = match wallet_set.get(&user_addr) {
-                    Some(w) => *w,
+                    Some(w) => w,
                     None => {
-                        self.seen_trades.insert(tx_hash);
+                        self.mark_seen(tx_hash);
                         continue;
                     }
                 };
@@ -322,7 +343,7 @@ impl WhaleTracker {
                 let usd_value = price * size;
 
                 // Always dedup, even if below threshold
-                self.seen_trades.insert(tx_hash.clone());
+                self.mark_seen(tx_hash.clone());
 
                 if usd_value < self.cfg.min_trade_usd { continue; }
 
@@ -382,17 +403,6 @@ impl WhaleTracker {
 
                 all_trades.push(log);
                 self.trade_count.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        // Cap seen_trades at 50k
-        if self.seen_trades.len() > 50_000 {
-            let to_remove: Vec<String> = self.seen_trades.iter()
-                .take(self.seen_trades.len() - 25_000)
-                .cloned()
-                .collect();
-            for id in to_remove {
-                self.seen_trades.remove(&id);
             }
         }
 
@@ -469,6 +479,9 @@ pub async fn run_whale_tracker(
     active_markets: Arc<tokio::sync::RwLock<Vec<ActiveMarketInfo>>>,
 ) {
     let mut tracker = WhaleTracker::new(cfg.clone(), client, trade_count, wallet_count);
+
+    // Ensure data dir exists (may run before main creates it)
+    let _ = std::fs::create_dir_all("data");
 
     info!("[WHALE] Starting whale tracker (poll={}ms, min=${}, top={})",
         cfg.poll_interval_ms, cfg.min_trade_usd, cfg.leaderboard_limit);

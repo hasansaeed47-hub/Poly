@@ -242,13 +242,15 @@ pub async fn fetch_books_batch(
     clob_rest: &str,
     token_ids: &[String],
     limiter:   &RateLimiter,
+    batch_size: usize,
 ) -> Result<HashMap<String, BookEntry>> {
     if token_ids.is_empty() { return Ok(HashMap::new()); }
     limiter.wait().await;
 
+    let batch = if batch_size > 0 { batch_size } else { BOOK_BATCH_SIZE };
     let mut result = HashMap::new();
 
-    for chunk in token_ids.chunks(BOOK_BATCH_SIZE) {
+    for chunk in token_ids.chunks(batch) {
         let url = format!("{}/books", clob_rest);
         let body: Vec<serde_json::Value> = chunk.iter()
             .map(|tid| serde_json::json!({"token_id": tid}))
@@ -309,7 +311,7 @@ pub async fn fetch_books_batch(
             }
         }
 
-        if token_ids.len() > BOOK_BATCH_SIZE {
+        if token_ids.len() > batch {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }

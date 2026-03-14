@@ -88,26 +88,36 @@ pub fn fair_yes(cl: f64, open: f64, sigma: f64, secs_left: f64) -> f64 {
 
 pub fn estimate_sigma(prices: &[(f64, f64)], window_secs: f64, now: f64) -> f64 {
     let cutoff = now - window_secs;
-    let window: Vec<f64> = prices.iter()
+    let window: Vec<(f64, f64)> = prices.iter()
         .filter(|(ts, _)| *ts >= cutoff)
-        .map(|(_, p)| *p)
+        .copied()
         .collect();
 
     if window.len() < MIN_SAMPLES { return 0.50; }
 
-    let returns: Vec<f64> = window.windows(2)
-        .filter(|w| w[0] > 0.0 && w[1] > 0.0)
-        .map(|w| (w[1] / w[0]).ln())
-        .collect();
+    // Compute log-returns normalized by time interval.
+    // Each return is scaled to per-second variance so annualization is correct
+    // regardless of irregular tick spacing.
+    let mut sum_var = 0.0_f64;
+    let mut count = 0u32;
 
-    if returns.len() < 2 { return MIN_SIGMA; }
+    for pair in window.windows(2) {
+        let (t0, p0) = pair[0];
+        let (t1, p1) = pair[1];
+        if p0 <= 0.0 || p1 <= 0.0 { continue; }
+        let dt = t1 - t0;
+        if dt < 0.01 { continue; } // skip duplicate timestamps
+        let log_ret = (p1 / p0).ln();
+        // Variance per second: (log_ret^2) / dt
+        sum_var += (log_ret * log_ret) / dt;
+        count += 1;
+    }
 
-    let n    = returns.len() as f64;
-    let mean = returns.iter().sum::<f64>() / n;
-    let var  = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / (n - 1.0).max(1.0);
-    let std  = var.sqrt();
+    if count < 2 { return MIN_SIGMA; }
 
-    let annualised = std * SECS_PER_YEAR.sqrt();
+    // Average per-second variance, then annualize
+    let var_per_sec = sum_var / count as f64;
+    let annualised = (var_per_sec * SECS_PER_YEAR).sqrt();
     if annualised.is_nan() || annualised.is_infinite() { return MIN_SIGMA; }
     annualised.clamp(MIN_SIGMA, 5.0)
 }
@@ -208,9 +218,31 @@ mod tests {
     }
 
     #[test]
-    fn sigma_estimation_basic() {
+    fn sigma_estimation_flat_prices() {
+        // 60 ticks 1s apart, all at 100.0 — zero variance → MIN_SIGMA
         let prices: Vec<(f64, f64)> = (0..60).map(|i| (i as f64, 100.0)).collect();
         let s = estimate_sigma(&prices, 300.0, 59.0);
-        assert!(s <= MIN_SIGMA + 0.01, "flat prices should give min sigma, got {}", s);
+        assert!((s - MIN_SIGMA).abs() < 0.01, "flat prices should give min sigma, got {}", s);
+    }
+
+    #[test]
+    fn sigma_estimation_irregular_ticks() {
+        // Same total move over different tick spacings should give similar sigma
+        let mut prices_dense: Vec<(f64, f64)> = Vec::new();
+        let mut prices_sparse: Vec<(f64, f64)> = Vec::new();
+        for i in 0..100 {
+            let t = i as f64;
+            let p = 100.0 + 0.01 * (t * 0.1).sin(); // small oscillation
+            prices_dense.push((t, p));
+            if i % 5 == 0 {
+                prices_sparse.push((t, p));
+            }
+        }
+        let s_dense  = estimate_sigma(&prices_dense, 300.0, 99.0);
+        let s_sparse = estimate_sigma(&prices_sparse, 300.0, 99.0);
+        // Should be within 50% of each other (time-normalized)
+        let ratio = s_dense / s_sparse;
+        assert!(ratio > 0.5 && ratio < 2.0,
+            "dense={:.4} sparse={:.4} ratio={:.2} should be similar", s_dense, s_sparse, ratio);
     }
 }
