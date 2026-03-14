@@ -80,6 +80,7 @@ struct StrategyConfigFile {
     min_edge:          f64,
     max_secs_left:     f64,
     min_entry_price:   f64,
+    max_sigma:         f64,
     stop_loss:         bool,
     take_profit:       bool,
     partial_tp_pct:    f64,
@@ -123,10 +124,10 @@ async fn main() -> Result<()> {
     info!("═══════════════════════════════════════════════════════════");
     info!("Assets: {:?}", cfg.feed.assets);
     info!("Timeframes: {:?}m", cfg.feed.timeframes);
-    info!("Strategy: edge>={} SL={} TP={}({}%) stake=${} chase={}ticks",
+    info!("Strategy: edge>={} SL={} TP={}({}%) stake=${} chase={}ticks max_sigma={}",
         cfg.strategy.min_edge, cfg.strategy.stop_loss, cfg.strategy.take_profit,
         cfg.strategy.partial_tp_pct * 100.0, cfg.strategy.stake,
-        cfg.strategy.maker_chase_ticks);
+        cfg.strategy.maker_chase_ticks, cfg.strategy.max_sigma);
 
     // Wallet keys: config.toml first, then env vars as fallback
     let private_key = if cfg.wallet.private_key.is_empty() {
@@ -217,6 +218,7 @@ async fn main() -> Result<()> {
         min_edge:          cfg.strategy.min_edge,
         max_secs_left:     cfg.strategy.max_secs_left,
         min_entry_price:   cfg.strategy.min_entry_price,
+        max_sigma:         cfg.strategy.max_sigma,
         stop_loss:         cfg.strategy.stop_loss,
         take_profit:       cfg.strategy.take_profit,
         partial_tp_pct:    cfg.strategy.partial_tp_pct,

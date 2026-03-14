@@ -33,6 +33,7 @@ pub struct LivePosition {
     pub token_id:      String,     // the token we bought
     pub entry_price:   f64,
     pub fair_at_entry: f64,
+    pub sigma:         f64,
     pub stake:         f64,
     pub shares:        f64,        // actual shares held
     pub secs_left:     f64,
@@ -54,6 +55,7 @@ pub struct TradeLog {
     pub entry_price:   f64,
     pub fair_at_entry: f64,
     pub edge_at_entry: f64,
+    pub sigma:         f64,
     pub secs_left:     f64,
     pub stake:         f64,
     pub shares:        f64,
@@ -99,6 +101,7 @@ pub struct StrategyConfig {
     pub min_edge:         f64,
     pub max_secs_left:    f64,
     pub min_entry_price:  f64,
+    pub max_sigma:        f64,
     pub stop_loss:        bool,
     pub take_profit:      bool,
     pub partial_tp_pct:   f64,
@@ -199,6 +202,11 @@ impl LiveRunner {
             _ => return,
         };
 
+        // Sigma filter: skip high-vol markets where BS edge is unreliable
+        if sig.sigma > self.config.max_sigma {
+            return;
+        }
+
         // Min entry price (no lottery tickets)
         if fill_price < self.config.min_entry_price {
             return;
@@ -279,6 +287,7 @@ impl LiveRunner {
                     token_id: token_id.to_string(),
                     entry_price: actual_price,
                     fair_at_entry: sig.best_fair,
+                    sigma: sig.sigma,
                     stake: self.config.stake,
                     shares,
                     secs_left: sig.secs_left,
@@ -391,6 +400,7 @@ impl LiveRunner {
                                 entry_price: pos.entry_price,
                                 fair_at_entry: pos.fair_at_entry,
                                 edge_at_entry: pos.fair_at_entry - pos.entry_price,
+                                sigma: pos.sigma,
                                 secs_left: pos.secs_left,
                                 stake: tp_shares * pos.entry_price,
                                 shares: tp_shares,
@@ -456,6 +466,7 @@ impl LiveRunner {
             entry_price: pos.entry_price,
             fair_at_entry: pos.fair_at_entry,
             edge_at_entry: pos.fair_at_entry - pos.entry_price,
+            sigma: pos.sigma,
             secs_left: pos.secs_left,
             stake: pos.stake,
             shares: pos.shares,

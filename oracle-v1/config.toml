@@ -30,6 +30,7 @@ stake              = 5.0
 min_edge           = 0.20
 max_secs_left      = 840
 min_entry_price    = 0.30
+max_sigma          = 2.0
 stop_loss          = true
 take_profit        = true
 partial_tp_pct     = 0.50
