@@ -273,18 +273,28 @@ async fn main() -> Result<()> {
         let shutdown = shutdown.clone();
         let exec = exec.clone();
         tokio::spawn(async move {
-            // Listen for both SIGINT (Ctrl+C) and SIGTERM (systemctl stop)
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate()
-            ).expect("failed to register SIGTERM handler");
+            // Cross-platform: ctrl_c works on both Windows and Unix
+            // On Unix, also listen for SIGTERM (systemctl stop / kill)
+            #[cfg(unix)]
+            {
+                let mut sigterm = tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate()
+                ).expect("failed to register SIGTERM handler");
 
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    warn!("SIGINT received — cancelling all orders...");
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        warn!("SIGINT received — cancelling all orders...");
+                    }
+                    _ = sigterm.recv() => {
+                        warn!("SIGTERM received — cancelling all orders...");
+                    }
                 }
-                _ = sigterm.recv() => {
-                    warn!("SIGTERM received — cancelling all orders...");
-                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+                warn!("SIGINT received — cancelling all orders...");
             }
 
             shutdown.store(true, Ordering::SeqCst);
