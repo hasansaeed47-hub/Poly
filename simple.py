@@ -74,37 +74,43 @@ UPDATE_INTERVAL = 300  # seconds between forecast updates (5 min)
 
 # ── Cities ──
 # Polymarket weather markets — city name, NOAA grid point, Open-Meteo coords
+# PM settles on Weather Underground AIRPORT stations (ICAO codes)
+# NOT personal weather stations — this is critical for accuracy
 CITIES = {
     "NYC": {
         "noaa_office": "OKX", "noaa_grid": "33,37",
         "lat": 40.7128, "lon": -74.0060,
-        "wu_station": "KNYNEWYO1167",  # WU station PM settles on
+        "wu_station": "KLGA",  # LaGuardia Airport — PM settlement source
+        "unit": "F",
     },
     "Atlanta": {
         "noaa_office": "FFC", "noaa_grid": "50,87",
         "lat": 33.7490, "lon": -84.3880,
-        "wu_station": "KGAATLAN523",
+        "wu_station": "KATL",  # Hartsfield-Jackson
+        "unit": "F",
     },
     "Chicago": {
         "noaa_office": "LOT", "noaa_grid": "76,73",
         "lat": 41.8781, "lon": -87.6298,
-        "wu_station": "KILCHICA575",
+        "wu_station": "KORD",  # O'Hare Intl
+        "unit": "F",
     },
     "Miami": {
         "noaa_office": "MFL", "noaa_grid": "76,50",
         "lat": 25.7617, "lon": -80.1918,
-        "wu_station": "KFLMIAMI390",
+        "wu_station": "KMIA",  # Miami Intl
+        "unit": "F",
     },
     "Seoul": {
         "noaa_office": None,  # international — NOAA won't work
         "lat": 37.5665, "lon": 126.9780,
-        "wu_station": "IICNSE2",
+        "wu_station": "RKSS",  # Gimpo Airport
         "unit": "C",
     },
     "Shanghai": {
         "noaa_office": None,
         "lat": 31.2304, "lon": 121.4737,
-        "wu_station": "ISHANGH40",
+        "wu_station": "ZSSS",  # Shanghai Hongqiao
         "unit": "C",
     },
 }
@@ -299,26 +305,28 @@ def fetch_wunderground(city: str, info: dict) -> Optional[Forecast]:
         return None
 
     try:
-        # WU current conditions from PWS
+        # WU airport station observations — this is what PM settles on
+        # Uses ICAO codes (KLGA, KORD, etc.)
+        lat, lon = info["lat"], info["lon"]
+
+        # Try current conditions via airport station
         r = S.get(
             f"https://api.weather.com/v2/pws/observations/current",
             params={
                 "stationId": station,
                 "format": "json",
-                "units": "e",  # imperial
+                "units": "e",  # imperial (°F)
                 "apiKey": api_key,
             },
             timeout=10,
         )
-        if r.status_code != 200:
-            return None
+        current_temp_f = 0
+        if r.status_code == 200:
+            obs = r.json().get("observations", [{}])[0]
+            imperial = obs.get("imperial", {})
+            current_temp_f = imperial.get("temp", 0)
 
-        obs = r.json().get("observations", [{}])[0]
-        imperial = obs.get("imperial", {})
-        current_temp_f = imperial.get("temp", 0)
-
-        # WU forecast
-        lat, lon = info["lat"], info["lon"]
+        # WU forecast for high temp
         fr = S.get(
             f"https://api.weather.com/v3/wx/forecast/daily/5day",
             params={
@@ -387,11 +395,15 @@ def get_forecast(city: str, info: dict) -> Optional[Forecast]:
 def gamma_find_weather_events() -> List[dict]:
     """Find active weather/temperature events on Polymarket."""
     events = []
-    for tag in ["weather", "temperature"]:
+    # Use both tag and tag_slug — PM uses tag_slug=temperature for weather markets
+    for params in [
+        {"tag_slug": "temperature", "active": "true", "limit": 50},
+        {"tag": "weather", "closed": "false", "limit": 50},
+    ]:
         try:
             r = S.get(
                 f"{GAMMA}/events",
-                params={"tag": tag, "closed": "false", "limit": 50},
+                params=params,
                 timeout=10,
             )
             if r.status_code == 200:
@@ -402,7 +414,7 @@ def gamma_find_weather_events() -> List[dict]:
                         if eid and not any(e.get("id") == eid for e in events):
                             events.append(ev)
         except Exception as e:
-            log.debug(f"[GAMMA] tag={tag} failed: {e}")
+            log.debug(f"[GAMMA] search failed: {e}")
         time.sleep(0.3)
 
     log.info(f"[GAMMA] Found {len(events)} weather events")
