@@ -251,13 +251,12 @@ impl LiveRunner {
             return;
         }
 
-        // Max $5 (one stake) per asset per window — block if any open position on same asset
+        // Max 2 positions per asset (e.g. one 5m + one 15m)
         let asset_lower = sig.asset.to_lowercase();
-        let asset_exposure: f64 = self.positions.values()
+        let asset_count = self.positions.values()
             .filter(|p| p.asset.to_lowercase() == asset_lower)
-            .map(|p| p.stake)
-            .sum();
-        if asset_exposure >= self.config.stake {
+            .count();
+        if asset_count >= 2 {
             return;
         }
 

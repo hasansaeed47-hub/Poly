@@ -263,7 +263,7 @@ async fn main() -> Result<()> {
     let mut tick_count:    u64 = 0;
     let mut last_stats_ts: f64 = now_secs();
     let mut last_discover: f64 = now_secs();
-    let mut last_dash_ts:  f64 = 0.0;
+    let mut last_dash_ts:  f64 = now_secs();
     let mut settled: HashMap<String, bool> = HashMap::new();
     let mut cl_close_snap: HashMap<String, f64> = HashMap::new(); // V6 FIX #3
 
