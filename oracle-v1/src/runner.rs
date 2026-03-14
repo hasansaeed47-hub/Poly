@@ -109,6 +109,7 @@ pub struct StrategyConfig {
     pub maker_fee_rate:   f64,
     pub maker_chase_ticks: u32,
     pub chase_interval_ms: u64,
+    pub max_concurrent:    usize,
 }
 
 // ── Runner ──────────────────────────────────────────────────────────────────
@@ -218,6 +219,11 @@ impl LiveRunner {
             Side::No  => sig.depth_no,
         };
         if depth < self.config.stake * 2.0 {
+            return;
+        }
+
+        // Max concurrent positions cap
+        if self.positions.len() >= self.config.max_concurrent {
             return;
         }
 

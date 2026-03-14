@@ -38,6 +38,9 @@ partial_tp_pct     = 0.50
 taker_fee_rate     = 0.015
 maker_fee_rate     = 0.0
 
+# Max concurrent open positions (V6 had 6)
+max_concurrent     = 6
+
 # Maker chase: post GTC, chase N ticks at 500ms, then taker fill
 maker_chase_ticks  = 2
 chase_interval_ms  = 500

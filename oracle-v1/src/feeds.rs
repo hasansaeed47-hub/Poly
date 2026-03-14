@@ -349,7 +349,22 @@ async fn connect_cl_feed(
 
     info!("[CL] Feed connected");
 
-    while let Some(msg) = ws.next().await {
+    // Proactive ping every 5s to detect silent disconnects (V6 pattern)
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
+    ping_interval.tick().await; // consume the first immediate tick
+
+    loop {
+        let msg = tokio::select! {
+            msg = ws.next() => match msg {
+                Some(m) => m,
+                None => break,
+            },
+            _ = ping_interval.tick() => {
+                let _ = ws.send(Message::Ping(vec![].into())).await;
+                continue;
+            }
+        };
+
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
@@ -360,7 +375,7 @@ async fn connect_cl_feed(
             Ok(_) => {}
             Err(e) => { error!("[CL] WebSocket error: {}", e); break; }
         }
-    }
+    } // end loop
 
     Ok(())
 }

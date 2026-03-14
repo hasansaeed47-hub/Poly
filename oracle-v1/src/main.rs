@@ -21,13 +21,14 @@ mod runner;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 use tracing_subscriber::EnvFilter;
 
 use feeds::{
@@ -87,9 +88,13 @@ struct StrategyConfigFile {
     partial_tp_pct:    f64,
     taker_fee_rate:    f64,
     maker_fee_rate:    f64,
-    maker_chase_ticks: u32,
-    chase_interval_ms: u64,
+    maker_chase_ticks:  u32,
+    chase_interval_ms:  u64,
+    #[serde(default = "default_max_concurrent")]
+    max_concurrent:     usize,
 }
+
+fn default_max_concurrent() -> usize { 6 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -125,10 +130,10 @@ async fn main() -> Result<()> {
     info!("═══════════════════════════════════════════════════════════");
     info!("Assets: {:?}", cfg.feed.assets);
     info!("Timeframes: {:?}m", cfg.feed.timeframes);
-    info!("Strategy: edge>={} SL={} TP={}({}%) stake=${} chase={}ticks max_sigma={}",
+    info!("Strategy: edge>={} SL={} TP={}({}%) stake=${} chase={}ticks max_sigma={} max_pos={}",
         cfg.strategy.min_edge, cfg.strategy.stop_loss, cfg.strategy.take_profit,
         cfg.strategy.partial_tp_pct * 100.0, cfg.strategy.stake,
-        cfg.strategy.maker_chase_ticks, cfg.strategy.max_sigma);
+        cfg.strategy.maker_chase_ticks, cfg.strategy.max_sigma, cfg.strategy.max_concurrent);
 
     // Wallet keys: config.toml first, then env vars as fallback
     let private_key = if cfg.wallet.private_key.is_empty() {
@@ -154,6 +159,13 @@ async fn main() -> Result<()> {
         &funder_address,
     ).await.context("Execution layer init failed")?;
     let exec = Arc::new(exec);
+
+    // ── Cancel stale orders on startup (V6 pattern) ───────────────────────
+    info!("Cancelling any stale orders from previous run...");
+    match exec.cancel_all().await {
+        Ok(_)  => info!("[EXEC] All stale orders cancelled"),
+        Err(e) => warn!("[EXEC] Cancel all on startup failed (may be clean): {}", e),
+    }
 
     // ── Shared state ────────────────────────────────────────────────────────
 
@@ -227,6 +239,7 @@ async fn main() -> Result<()> {
         maker_fee_rate:    cfg.strategy.maker_fee_rate,
         maker_chase_ticks: cfg.strategy.maker_chase_ticks,
         chase_interval_ms: cfg.strategy.chase_interval_ms,
+        max_concurrent:    cfg.strategy.max_concurrent,
     };
 
     let mut runner = LiveRunner::new(strat_config, exec.clone(), "logs");
@@ -240,6 +253,22 @@ async fn main() -> Result<()> {
     let mut last_dash_ts:  f64 = 0.0;
     let mut settled: HashMap<String, bool> = HashMap::new();
     let mut cl_close_snap: HashMap<String, f64> = HashMap::new(); // V6 FIX #3
+
+    // ── Graceful shutdown handler ──────────────────────────────────────────
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        let exec = exec.clone();
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            warn!("SIGINT/SIGTERM received — cancelling all orders and shutting down...");
+            shutdown.store(true, Ordering::SeqCst);
+            match exec.cancel_all().await {
+                Ok(_)  => info!("[SHUTDOWN] All orders cancelled"),
+                Err(e) => error!("[SHUTDOWN] Cancel all failed: {}", e),
+            }
+        });
+    }
 
     info!("Starting scan loop ({}ms tick, {}s warmup)...",
         cfg.scan.tick_ms, cfg.feed.book_warmup_secs);
@@ -261,6 +290,13 @@ async fn main() -> Result<()> {
 
     loop {
         tokio::time::sleep(tick).await;
+
+        if shutdown.load(Ordering::SeqCst) {
+            info!("Shutdown flag set — exiting scan loop");
+            runner.print_stats();
+            break;
+        }
+
         tick_count += 1;
 
         let now = now_secs();
@@ -490,4 +526,6 @@ async fn main() -> Result<()> {
             info!("markets={} settled={} books={}", markets.len(), settled.len(), book_state.len());
         }
     }
+
+    Ok(())
 }
