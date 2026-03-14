@@ -1,0 +1,43 @@
+# Arb Final v1.0 — Pair Arbitrage Configuration
+#
+# Strategy: Buy matched YES+NO sets on updown markets.
+# Profit = $1.00 - (avg_yes + avg_no) per matched share.
+# Maker only. Sequential. $10 max exposure per window.
+
+[feed]
+assets     = ["btc", "eth", "sol", "xrp"]
+timeframes = [15, 60]    # 15m + 60m only (no 5m — too little time)
+clob_rest  = "https://clob.polymarket.com"
+clob_ws    = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+live_ws    = "wss://live-data-ws.polymarket.com/ws"
+gamma_api  = "https://gamma-api.polymarket.com"
+bn_ws      = "wss://stream.binance.com:9443/ws"
+rest_throttle_ms = 500
+book_warmup_secs = 5
+max_open_delay   = 5.0
+
+[scan]
+tick_ms = 500
+
+[arb]
+unit_size          = 2.0    # $ per buy unit
+max_exposure       = 10.0   # $ max net-at-risk per window (merged pairs free capital)
+max_pair_cost      = 0.98   # stop if avg YES + avg NO > this
+max_ask            = 0.50   # never buy asks above 50c
+min_ask            = 0.03   # skip near-zero illiquid tokens
+maker_timeout_secs = 30.0   # cancel unfilled maker order after this
+
+# Trend filter: |CL delta from open| > threshold = trending market
+# BTC base value, auto-scaled by asset stdev (ETH 1.16x, SOL 1.48x, XRP 2.63x)
+trend_threshold_pct = 0.08
+
+# Phase timing (seconds)
+observe_secs_15m  = 120.0   # 2 min warmup before entries (15m windows)
+observe_secs_60m  = 300.0   # 5 min warmup before entries (60m windows)
+lockdown_secs_15m = 90.0    # stop new units with 90s left (15m)
+lockdown_secs_60m = 300.0   # stop new units with 5 min left (60m)
+
+# Wallet (optional — omit for paper mode)
+# [wallet]
+# private_key = "0x..."
+# api_url = "https://clob.polymarket.com"
