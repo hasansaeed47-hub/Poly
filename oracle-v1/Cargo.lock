@@ -2743,7 +2743,6 @@ version = "1.0.0"
 dependencies = [
  "alloy",
  "anyhow",
- "chrono",
  "dashmap",
  "futures-util",
  "polymarket-client-sdk",
@@ -2759,7 +2758,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
- "uuid",
 ]
 
 [[package]]
