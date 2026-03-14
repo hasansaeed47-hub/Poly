@@ -17,7 +17,7 @@ use anyhow::{Context, Result, anyhow};
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::clob::types::{
-    Amount, OrderType, Side as ClobSide, SignatureType,
+    Amount, OrderType, OrderStatusType, Side as ClobSide, SignatureType,
 };
 use polymarket_client_sdk::clob::{Client as ClobClient, Config as ClobConfig};
 use polymarket_client_sdk::types::{Decimal, U256};
@@ -141,11 +141,20 @@ impl ExecutionLayer {
                     }
                 }
 
-                let filled = resp.status == polymarket_client_sdk::clob::types::OrderStatusType::Matched;
+                // Matched = immediately filled; Live = posted on book (maker)
+                let filled = resp.status == OrderStatusType::Matched;
+
+                // Compute actual fill price from response amounts when filled
+                let actual_price = if filled {
+                    self.fill_price_from_resp(&resp, price)
+                } else {
+                    price
+                };
+
                 Ok(FillResult {
                     order_id: resp.order_id.clone(),
                     filled,
-                    price,
+                    price: actual_price,
                     status: format!("{:?}", resp.status),
                 })
             }
@@ -181,7 +190,7 @@ impl ExecutionLayer {
         let tid = U256::from_str(token_id)
             .map_err(|e| anyhow!("Invalid token_id: {}", e))?;
 
-        let dec_amount = Decimal::from_str(&format!("{:.2}", stake))
+        let dec_amount = Decimal::from_str(&format!("{:.6}", stake))
             .map_err(|e| anyhow!("Invalid stake decimal: {}", e))?;
         let amount = Amount::usdc(dec_amount)
             .map_err(|e| anyhow!("Invalid USDC amount: {}", e))?;
@@ -201,11 +210,15 @@ impl ExecutionLayer {
         match self.client.post_order(signed).await {
             Ok(resp) => {
                 self.record_success().await;
-                let filled = resp.status == polymarket_client_sdk::clob::types::OrderStatusType::Matched;
+                let filled = resp.status == OrderStatusType::Matched;
+
+                // Compute actual fill price from response amounts
+                let actual_price = self.fill_price_from_resp(&resp, price);
+
                 Ok(FillResult {
                     order_id: resp.order_id.clone(),
                     filled,
-                    price,
+                    price: actual_price,
                     status: format!("{:?}", resp.status),
                 })
             }
@@ -223,7 +236,7 @@ impl ExecutionLayer {
         price: f64,
         shares: f64,
     ) -> Result<FillResult> {
-        if price <= 0.0 || shares <= 0.0 {
+        if price <= 0.0 || price >= 1.0 || shares <= 0.0 {
             return Err(anyhow!("Invalid sell params: price={} shares={}", price, shares));
         }
 
@@ -253,11 +266,12 @@ impl ExecutionLayer {
         match self.client.post_order(signed).await {
             Ok(resp) => {
                 self.record_success().await;
-                let filled = resp.status == polymarket_client_sdk::clob::types::OrderStatusType::Matched;
+                let filled = resp.status == OrderStatusType::Matched;
+                let actual_price = self.fill_price_from_resp(&resp, price);
                 Ok(FillResult {
                     order_id: resp.order_id.clone(),
                     filled,
-                    price,
+                    price: actual_price,
                     status: format!("{:?}", resp.status),
                 })
             }
@@ -307,14 +321,14 @@ impl ExecutionLayer {
                     return Ok(result);
                 }
                 // Order is live but not filled — need to chase
-                let pending_oid = result.order_id.clone();
+                let mut last_oid = result.order_id.clone();
 
                 // Step 2: Chase N ticks
                 for tick_num in 1..=max_chase_ticks {
                     tokio::time::sleep(tokio::time::Duration::from_millis(chase_interval_ms)).await;
 
                     // Cancel previous order
-                    if let Err(e) = self.cancel_order(&pending_oid).await {
+                    if let Err(e) = self.cancel_order(&last_oid).await {
                         warn!("[EXEC] Cancel chase order failed: {}", e);
                     }
 
@@ -331,8 +345,9 @@ impl ExecutionLayer {
                             info!("[EXEC] Maker fill at {:.2} (chase tick {})", current_price, tick_num);
                             return Ok(r);
                         }
-                        Ok(_) => {
-                            // Still not filled, continue chasing
+                        Ok(r) => {
+                            // Still not filled — update tracked order ID for next cancel
+                            last_oid = r.order_id.clone();
                         }
                         Err(e) => {
                             let err_str = e.to_string();
@@ -346,8 +361,8 @@ impl ExecutionLayer {
                     }
                 }
 
-                // Cancel any remaining maker order before taker attempt
-                let _ = self.cancel_order(&pending_oid).await;
+                // Cancel the last outstanding maker order before taker attempt
+                let _ = self.cancel_order(&last_oid).await;
 
                 // Step 3: Fall through to taker
                 info!("[EXEC] Maker chase exhausted, taker fill at ask={:.2}", best_ask);
@@ -363,6 +378,36 @@ impl ExecutionLayer {
                     Err(e)
                 }
             }
+        }
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /// Extract actual fill price from PostOrderResponse amounts.
+    /// making_amount = USDC spent (6 decimals), taking_amount = shares received.
+    /// For sells: making_amount = shares given, taking_amount = USDC received.
+    /// Falls back to `fallback` if amounts are zero.
+    fn fill_price_from_resp(
+        &self,
+        resp: &polymarket_client_sdk::clob::types::response::PostOrderResponse,
+        fallback: f64,
+    ) -> f64 {
+        let making = resp.making_amount.to_string().parse::<f64>().unwrap_or(0.0);
+        let taking = resp.taking_amount.to_string().parse::<f64>().unwrap_or(0.0);
+        if making > 0.0 && taking > 0.0 {
+            // For buy: price = USDC / shares = making / taking
+            // For sell: price = USDC / shares = taking / making
+            // We use the smaller/larger ratio to get a price in (0, 1)
+            let ratio = making / taking;
+            if ratio > 0.0 && ratio < 1.0 {
+                ratio
+            } else if taking / making > 0.0 && taking / making < 1.0 {
+                taking / making
+            } else {
+                fallback
+            }
+        } else {
+            fallback
         }
     }
 
