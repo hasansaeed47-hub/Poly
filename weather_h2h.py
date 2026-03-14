@@ -2,8 +2,10 @@
 """
 WEATHER HEAD-TO-HEAD: $10/stake vs gopfan2 $1/stake
 =====================================================
-Both use the SAME NO-on-dead-buckets strategy.
-5 real cities from Polymarket screenshots, March 15 2026.
+3 Strategies compared on same 5 real cities (March 15 2026):
+  A) NO-only on dead buckets
+  B) YES-only on forecast-aligned buckets
+  C) HYBRID: NO on dead + YES on forecast center
 """
 
 import random
@@ -26,7 +28,6 @@ CITIES = {
             "11°C+": {"yes": 0.400, "no": 0.630},
         },
         "forecast": "10°C",
-        # Real prob distribution centered on 10°C
         "real_prob": {
             "≤3°C": 0.001, "4°C": 0.002, "5°C": 0.005, "6°C": 0.01,
             "7°C": 0.03, "8°C": 0.08, "9°C": 0.20, "10°C": 0.33,
@@ -110,13 +111,13 @@ CITIES = {
 }
 
 
-# ─── CORE LOGIC ──────────────────────────────────────────────────────────────
+# ─── CORE ────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Trade:
     city: str
     bucket: str
-    side: str       # "NO"
+    side: str       # "YES" or "NO"
     price: float
     size: float
     shares: float
@@ -130,262 +131,326 @@ class Trade:
         return self.size
 
 
-def pick_no_trades(city_name: str, city_data: dict, stake: float) -> List[Trade]:
-    """
-    Both strategies use the SAME logic: buy NO on dead buckets.
-    Dead bucket = far from forecast center AND NO price offers real profit.
-    Skip buckets where NO costs 99.8¢+ (no profit) or near forecast (risky).
-    """
-    trades = []
-    forecast = city_data["forecast"]
-    buckets = city_data["buckets"]
-    bucket_names = list(buckets.keys())
-    forecast_idx = bucket_names.index(forecast)
-
-    for i, (bucket, data) in enumerate(buckets.items()):
-        no_price = data["no"]
-        distance = abs(i - forecast_idx)
-
-        # Skip: too close to forecast (distance < 2)
-        if distance < 2:
-            continue
-        # Skip: no liquidity (NO price is 0 or effectively 1.00)
-        if no_price <= 0.001 or no_price >= 0.999:
-            continue
-        # Skip: profit too thin (NO costs 99.8¢+ = <0.2% return)
-        if no_price >= 0.998:
-            continue
-
-        shares = stake / no_price
-        trades.append(Trade(city_name, bucket, "NO", no_price, stake, shares))
-
-    return trades
-
-
 def pnl_for_outcome(trades: List[Trade], city: str, winning_bucket: str) -> float:
-    """P&L for trades in a specific city given the winning bucket."""
     pnl = 0.0
     for t in trades:
         if t.city != city:
             continue
-        if t.bucket == winning_bucket:
-            pnl -= t.loss_if_lose   # NO loses when that bucket wins
-        else:
-            pnl += t.profit_if_win  # NO wins when that bucket doesn't win
+        if t.side == "NO":
+            if t.bucket == winning_bucket:
+                pnl -= t.loss_if_lose
+            else:
+                pnl += t.profit_if_win
+        else:  # YES
+            if t.bucket == winning_bucket:
+                pnl += t.profit_if_win
+            else:
+                pnl -= t.loss_if_lose
     return pnl
+
+
+def pnl_all_cities(trades: List[Trade], outcomes: Dict[str, str]) -> float:
+    total = 0.0
+    for city, winner in outcomes.items():
+        total += pnl_for_outcome(trades, city, winner)
+    return total
+
+
+# ─── STRATEGY BUILDERS ──────────────────────────────────────────────────────
+
+def build_no_only(stake: float) -> List[Trade]:
+    """Strategy A: NO on dead buckets (2+ away from forecast, NO < 99.8¢)."""
+    trades = []
+    for city_name, cd in CITIES.items():
+        bucket_names = list(cd["buckets"].keys())
+        fc_idx = bucket_names.index(cd["forecast"])
+        for i, (bucket, data) in enumerate(cd["buckets"].items()):
+            no_price = data["no"]
+            if abs(i - fc_idx) < 2:
+                continue
+            if no_price <= 0.001 or no_price >= 0.998:
+                continue
+            trades.append(Trade(city_name, bucket, "NO", no_price, stake, stake / no_price))
+    return trades
+
+
+def build_yes_only(stake: float) -> List[Trade]:
+    """Strategy B: YES on forecast center + adjacent buckets where market underprices."""
+    trades = []
+    for city_name, cd in CITIES.items():
+        bucket_names = list(cd["buckets"].keys())
+        fc_idx = bucket_names.index(cd["forecast"])
+        for i, (bucket, data) in enumerate(cd["buckets"].items()):
+            yes_price = data["yes"]
+            real_prob = cd["real_prob"][bucket]
+            distance = abs(i - fc_idx)
+            # Only bet on forecast center and ±1 adjacent
+            if distance > 1:
+                continue
+            # Only if real prob > market price (any positive edge)
+            edge = real_prob - yes_price
+            if edge < 0.0:
+                continue
+            # Skip if YES price is too high (>90¢ = overpaying)
+            if yes_price > 0.90:
+                continue
+            trades.append(Trade(city_name, bucket, "YES", yes_price, stake, stake / yes_price))
+    return trades
+
+
+def build_hybrid(stake: float) -> List[Trade]:
+    """Strategy C: NO on dead buckets + YES on forecast center."""
+    trades = []
+    for city_name, cd in CITIES.items():
+        bucket_names = list(cd["buckets"].keys())
+        fc_idx = bucket_names.index(cd["forecast"])
+        for i, (bucket, data) in enumerate(cd["buckets"].items()):
+            distance = abs(i - fc_idx)
+            real_prob = cd["real_prob"][bucket]
+
+            # NO on dead buckets (far from forecast)
+            if distance >= 2:
+                no_price = data["no"]
+                if 0.001 < no_price < 0.998:
+                    trades.append(Trade(city_name, bucket, "NO", no_price, stake, stake / no_price))
+
+            # YES on forecast center + adjacent (where edge exists)
+            if distance <= 1:
+                yes_price = data["yes"]
+                edge = real_prob - yes_price
+                if edge >= 0.0 and yes_price <= 0.90:
+                    trades.append(Trade(city_name, bucket, "YES", yes_price, stake, stake / yes_price))
+    return trades
 
 
 # ─── SIMULATION ──────────────────────────────────────────────────────────────
 
+def calc_ev(trades: List[Trade]) -> float:
+    ev = 0.0
+    for city_name, cd in CITIES.items():
+        for bucket, prob in cd["real_prob"].items():
+            ev += prob * pnl_for_outcome(trades, city_name, bucket)
+    return ev
+
+
+def monte_carlo_day(trades: List[Trade], sims: int = 50000) -> List[float]:
+    results = []
+    for _ in range(sims):
+        day_pnl = 0.0
+        for city_name, cd in CITIES.items():
+            buckets = list(cd["real_prob"].keys())
+            probs = list(cd["real_prob"].values())
+            outcome = random.choices(buckets, weights=probs, k=1)[0]
+            day_pnl += pnl_for_outcome(trades, city_name, outcome)
+        results.append(day_pnl)
+    return results
+
+
+def monte_carlo_30d(trades: List[Trade], bankroll: float, sims: int = 20000) -> List[float]:
+    results = []
+    for _ in range(sims):
+        bank = bankroll
+        for _ in range(30):
+            for city_name, cd in CITIES.items():
+                buckets = list(cd["real_prob"].keys())
+                probs = list(cd["real_prob"].values())
+                outcome = random.choices(buckets, weights=probs, k=1)[0]
+                bank += pnl_for_outcome(trades, city_name, outcome)
+        results.append(bank)
+    return results
+
+
+def print_trades_table(name: str, trades: List[Trade]):
+    print(f"\n  {name}")
+    for city_name in CITIES:
+        ct = [t for t in trades if t.city == city_name]
+        if not ct:
+            continue
+        fc = CITIES[city_name]["forecast"]
+        print(f"    {city_name} (fc: {fc})")
+        for t in ct:
+            pct = (t.profit_if_win / t.size * 100) if t.size > 0 else 0
+            print(f"      {t.side:<3} {t.bucket:<12} @{t.price:.3f}  ${t.size:.0f}  edge:{pct:>+.1f}%")
+    deployed = sum(t.size for t in trades)
+    print(f"    Total deployed: ${deployed:.0f}")
+
+
+def stats_block(label: str, daily: List[float], monthly: List[float],
+                deployed: float, bankroll: float):
+    avg_d = sum(daily) / len(daily)
+    med_d = sorted(daily)[len(daily) // 2]
+    best_d = max(daily)
+    worst_d = min(daily)
+    win_rate = sum(1 for x in daily if x > 0) / len(daily)
+    p5_d = sorted(daily)[int(len(daily) * 0.05)]
+    p95_d = sorted(daily)[int(len(daily) * 0.95)]
+
+    avg_m = sum(monthly) / len(monthly)
+    med_m = sorted(monthly)[len(monthly) // 2]
+    p5_m = sorted(monthly)[int(len(monthly) * 0.05)]
+    p95_m = sorted(monthly)[int(len(monthly) * 0.95)]
+    bust = sum(1 for x in monthly if x <= 0) / len(monthly)
+
+    return {
+        "label": label, "deployed": deployed,
+        "avg_d": avg_d, "med_d": med_d, "best_d": best_d, "worst_d": worst_d,
+        "win_rate": win_rate, "p5_d": p5_d, "p95_d": p95_d,
+        "roi_d": avg_d / deployed * 100 if deployed > 0 else 0,
+        "avg_m": avg_m, "med_m": med_m, "p5_m": p5_m, "p95_m": p95_m,
+        "bust": bust, "profit_30": avg_m - bankroll,
+        "roi_30": (avg_m - bankroll) / bankroll * 100,
+    }
+
+
 def main():
-    BANKROLL = 147.45  # From screenshots
-    YOU_STAKE = 10.0
-    GOP_STAKE = 1.0
+    BANKROLL = 147.45
+    W = 82
 
-    W = 78
+    # Build all 6 strategy variants (3 strategies × 2 stake sizes)
+    strategies = {
+        "A) NO-only $10":    build_no_only(10.0),
+        "A) NO-only $1":     build_no_only(1.0),
+        "B) YES-only $10":   build_yes_only(10.0),
+        "B) YES-only $1":    build_yes_only(1.0),
+        "C) HYBRID $10":     build_hybrid(10.0),
+        "C) HYBRID $1":      build_hybrid(1.0),
+    }
 
-    # Build trades for both
-    you_trades: List[Trade] = []
-    gop_trades: List[Trade] = []
-
-    for city_name, city_data in CITIES.items():
-        you_trades.extend(pick_no_trades(city_name, city_data, YOU_STAKE))
-        gop_trades.extend(pick_no_trades(city_name, city_data, GOP_STAKE))
-
-    you_deployed = sum(t.size for t in you_trades)
-    gop_deployed = sum(t.size for t in gop_trades)
-
-    # ── TRADE TABLE ──────────────────────────────────────────────────────
     print(f"\n{'='*W}")
-    print(f"  HEAD-TO-HEAD: $10/stake YOU vs $1/stake gopfan2")
-    print(f"  Same NO-on-dead-buckets strategy, 5 real cities, March 15")
+    print(f"  WEATHER H2H: 3 Strategies × 2 Stake Sizes — 5 Real Cities")
+    print(f"  Seoul | Shanghai | Wellington | NYC | Atlanta — March 15, 2026")
     print(f"  Bankroll: ${BANKROLL:.2f}")
     print(f"{'='*W}")
 
-    for city_name in CITIES:
-        city_you = [t for t in you_trades if t.city == city_name]
-        city_gop = [t for t in gop_trades if t.city == city_name]
-        fc = CITIES[city_name]["forecast"]
-        print(f"\n  {city_name} (forecast: {fc})")
-        print(f"  {'Bucket':<12} {'NO Price':>8} {'YOU $10':>10} {'gop $1':>10} {'Profit/share':>13}")
-        print(f"  {'-'*12} {'-'*8} {'-'*10} {'-'*10} {'-'*13}")
-        # Merge both lists (same buckets)
-        done = set()
-        for t in city_you:
-            gt = [g for g in city_gop if g.bucket == t.bucket]
-            profit_pct = (t.profit_if_win / t.size) * 100 if t.size > 0 else 0
-            gop_size = f"${gt[0].size:.0f}" if gt else "—"
-            print(f"  {t.bucket:<12} {t.price:>7.3f}¢ {'$10':>10} {gop_size:>10} {profit_pct:>11.1f}%")
-            done.add(t.bucket)
-        for t in city_gop:
-            if t.bucket not in done:
-                profit_pct = (t.profit_if_win / t.size) * 100 if t.size > 0 else 0
-                print(f"  {t.bucket:<12} {t.price:>7.3f}¢ {'—':>10} {'$1':>10} {profit_pct:>11.1f}%")
-        you_city_total = sum(t.size for t in city_you)
-        gop_city_total = sum(t.size for t in city_gop)
-        print(f"  {'TOTAL':<12} {'':>8} {'$'+str(int(you_city_total)):>10} {'$'+str(int(gop_city_total)):>10}")
+    # ── Show trades for each strategy ────────────────────────────────────
+    for name, trades in strategies.items():
+        print_trades_table(name, trades)
 
-    print(f"\n  {'─'*W}")
-    print(f"  ALL CITIES DEPLOYED:  YOU=${you_deployed:.0f}   gopfan2=${gop_deployed:.0f}")
-    print(f"  Bankroll usage:       YOU={you_deployed/BANKROLL*100:.0f}%    gopfan2={gop_deployed/BANKROLL*100:.0f}%")
-
-    # ── OUTCOME TABLE PER CITY ───────────────────────────────────────────
+    # ── Expected Value per city ──────────────────────────────────────────
     print(f"\n{'='*W}")
-    print(f"  P&L BY OUTCOME — EVERY CITY")
+    print(f"  EXPECTED VALUE PER CITY (analytical)")
     print(f"{'='*W}")
 
-    total_you_ev = 0.0
-    total_gop_ev = 0.0
+    strat_names = list(strategies.keys())
+    header = f"  {'City':<12}" + "".join(f"{s:>13}" for s in strat_names)
+    print(f"\n{header}")
+    print(f"  {'-'*12}" + "".join(f" {'-'*12}" for _ in strat_names))
 
-    for city_name, city_data in CITIES.items():
-        fc = city_data["forecast"]
-        print(f"\n  {city_name} (forecast: {fc})")
-        print(f"  {'Outcome':<12} {'Prob':>6} {'YOU P&L':>10} {'gop P&L':>10} {'Winner':>8}")
-        print(f"  {'-'*12} {'-'*6} {'-'*10} {'-'*10} {'-'*8}")
+    for city_name, cd in CITIES.items():
+        row = f"  {city_name:<12}"
+        for sname, trades in strategies.items():
+            ev = 0.0
+            for bucket, prob in cd["real_prob"].items():
+                ev += prob * pnl_for_outcome(trades, city_name, bucket)
+            row += f" ${ev:>+10.2f} "
+        print(row)
 
-        city_you_ev = 0.0
-        city_gop_ev = 0.0
+    # Totals
+    row = f"  {'TOTAL':<12}"
+    for sname, trades in strategies.items():
+        ev = calc_ev(trades)
+        row += f" ${ev:>+10.2f} "
+    print(f"  {'─'*12}" + "".join(f" {'─'*12}" for _ in strat_names))
+    print(row)
 
-        for bucket in city_data["buckets"]:
-            prob = city_data["real_prob"][bucket]
-            y_pnl = pnl_for_outcome(you_trades, city_name, bucket)
-            g_pnl = pnl_for_outcome(gop_trades, city_name, bucket)
-            city_you_ev += prob * y_pnl
-            city_gop_ev += prob * g_pnl
-
-            winner = "YOU" if y_pnl > g_pnl else "gop" if g_pnl > y_pnl else "tie"
-            ys = "+" if y_pnl >= 0 else ""
-            gs = "+" if g_pnl >= 0 else ""
-            print(f"  {bucket:<12} {prob:>5.1%} {ys}${y_pnl:>8.2f} {gs}${g_pnl:>8.2f} {winner:>8}")
-
-        total_you_ev += city_you_ev
-        total_gop_ev += city_gop_ev
-        print(f"  {'EV':.<12} {'':>6} ${city_you_ev:>+8.2f} ${city_gop_ev:>+8.2f}")
-
-    # ── DAILY SUMMARY ────────────────────────────────────────────────────
+    # ── Monte Carlo ──────────────────────────────────────────────────────
     print(f"\n{'='*W}")
-    print(f"  DAILY SUMMARY — ALL 5 CITIES COMBINED")
+    print(f"  MONTE CARLO SIMULATION")
     print(f"{'='*W}")
+    print(f"  Running 50k daily sims + 20k 30-day sims per strategy...")
 
-    # Simulate all possible daily combos via Monte Carlo
-    SIMS = 50000
-    you_daily_pnls = []
-    gop_daily_pnls = []
+    all_stats = {}
+    for sname, trades in strategies.items():
+        deployed = sum(t.size for t in trades)
+        daily = monte_carlo_day(trades, 50000)
+        monthly = monte_carlo_30d(trades, BANKROLL, 20000)
+        all_stats[sname] = stats_block(sname, daily, monthly, deployed, BANKROLL)
 
-    for _ in range(SIMS):
-        day_you = 0.0
-        day_gop = 0.0
-        for city_name, city_data in CITIES.items():
-            buckets = list(city_data["real_prob"].keys())
-            probs = list(city_data["real_prob"].values())
-            outcome = random.choices(buckets, weights=probs, k=1)[0]
-            day_you += pnl_for_outcome(you_trades, city_name, outcome)
-            day_gop += pnl_for_outcome(gop_trades, city_name, outcome)
-        you_daily_pnls.append(day_you)
-        gop_daily_pnls.append(day_gop)
+    # ── Daily comparison ─────────────────────────────────────────────────
+    print(f"\n  {'DAILY P&L':─<{W}}")
+    print(f"\n  {'':.<24}" + "".join(f"{s:>13}" for s in strat_names))
+    print(f"  {'─'*24}" + "".join(f" {'─'*12}" for _ in strat_names))
 
-    you_avg = sum(you_daily_pnls) / SIMS
-    gop_avg = sum(gop_daily_pnls) / SIMS
-    you_med = sorted(you_daily_pnls)[SIMS // 2]
-    gop_med = sorted(gop_daily_pnls)[SIMS // 2]
-    you_best = max(you_daily_pnls)
-    you_worst = min(you_daily_pnls)
-    gop_best = max(gop_daily_pnls)
-    gop_worst = min(gop_daily_pnls)
-    you_win_rate = sum(1 for x in you_daily_pnls if x > 0) / SIMS
-    gop_win_rate = sum(1 for x in gop_daily_pnls if x > 0) / SIMS
-    you_beats_gop = sum(1 for y, g in zip(you_daily_pnls, gop_daily_pnls) if y > g) / SIMS
-    you_p5 = sorted(you_daily_pnls)[int(SIMS * 0.05)]
-    you_p95 = sorted(you_daily_pnls)[int(SIMS * 0.95)]
-    gop_p5 = sorted(gop_daily_pnls)[int(SIMS * 0.05)]
-    gop_p95 = sorted(gop_daily_pnls)[int(SIMS * 0.95)]
+    fields_d = [
+        ("Deployed/day", "deployed", "${:>.0f}"),
+        ("Avg daily P&L", "avg_d", "${:>+.2f}"),
+        ("Median daily", "med_d", "${:>+.2f}"),
+        ("Best day", "best_d", "${:>+.2f}"),
+        ("Worst day", "worst_d", "${:>+.2f}"),
+        ("5th pctl", "p5_d", "${:>+.2f}"),
+        ("95th pctl", "p95_d", "${:>+.2f}"),
+        ("Win rate", "win_rate", "{:>.0%}"),
+        ("Daily ROI", "roi_d", "{:>+.1f}%"),
+    ]
 
-    print(f"\n  {'':.<28} {'YOU ($10)':>12} {'gopfan2 ($1)':>14}")
-    print(f"  {'─'*28} {'─'*12} {'─'*14}")
-    print(f"  {'Deployed per day':<28} ${you_deployed:>10.0f} ${gop_deployed:>12.0f}")
-    print(f"  {'Expected daily P&L':<28} ${you_avg:>+10.2f} ${gop_avg:>+12.2f}")
-    print(f"  {'Median daily P&L':<28} ${you_med:>+10.2f} ${gop_med:>+12.2f}")
-    print(f"  {'Best day':<28} ${you_best:>+10.2f} ${gop_best:>+12.2f}")
-    print(f"  {'Worst day':<28} ${you_worst:>+10.2f} ${gop_worst:>+12.2f}")
-    print(f"  {'5th percentile':<28} ${you_p5:>+10.2f} ${gop_p5:>+12.2f}")
-    print(f"  {'95th percentile':<28} ${you_p95:>+10.2f} ${gop_p95:>+12.2f}")
-    print(f"  {'Win rate (profit day)':<28} {you_win_rate:>10.0%} {gop_win_rate:>12.0%}")
-    print(f"  {'Daily ROI':<28} {you_avg/you_deployed*100:>+9.1f}% {gop_avg/gop_deployed*100:>+11.1f}%")
+    for label, key, fmt in fields_d:
+        row = f"  {label:<24}"
+        for sname in strat_names:
+            val = all_stats[sname][key]
+            if fmt.startswith("$"):
+                cell = fmt.replace("$", "$").format(val)
+            else:
+                cell = fmt.format(val)
+            row += f" {cell:>12}"
+        print(row)
 
-    # ── 30-DAY PROJECTION ────────────────────────────────────────────────
-    print(f"\n{'='*W}")
-    print(f"  30-DAY PROJECTION (Monte Carlo, {SIMS:,} sims)")
-    print(f"{'='*W}")
+    # ── 30-day comparison ────────────────────────────────────────────────
+    print(f"\n  {'30-DAY PROJECTION':─<{W}}")
+    print(f"\n  {'':.<24}" + "".join(f"{s:>13}" for s in strat_names))
+    print(f"  {'─'*24}" + "".join(f" {'─'*12}" for _ in strat_names))
 
-    DAYS = 30
-    SIMS_30 = 20000
-    you_30 = []
-    gop_30 = []
+    fields_m = [
+        ("Avg final", "avg_m", "${:>.2f}"),
+        ("Median final", "med_m", "${:>.2f}"),
+        ("5th pctl", "p5_m", "${:>.2f}"),
+        ("95th pctl", "p95_m", "${:>.2f}"),
+        ("Bust rate", "bust", "{:>.1%}"),
+        ("30d profit", "profit_30", "${:>+.2f}"),
+        ("30d ROI", "roi_30", "{:>+.1f}%"),
+    ]
 
-    for _ in range(SIMS_30):
-        yb = BANKROLL
-        gb = BANKROLL
-        for _ in range(DAYS):
-            for city_name, city_data in CITIES.items():
-                buckets = list(city_data["real_prob"].keys())
-                probs = list(city_data["real_prob"].values())
-                outcome = random.choices(buckets, weights=probs, k=1)[0]
-                yb += pnl_for_outcome(you_trades, city_name, outcome)
-                gb += pnl_for_outcome(gop_trades, city_name, outcome)
-        you_30.append(yb)
-        gop_30.append(gb)
-
-    y30_avg = sum(you_30) / SIMS_30
-    g30_avg = sum(gop_30) / SIMS_30
-    y30_med = sorted(you_30)[SIMS_30 // 2]
-    g30_med = sorted(gop_30)[SIMS_30 // 2]
-    y30_bust = sum(1 for x in you_30 if x <= 0) / SIMS_30
-    g30_bust = sum(1 for x in gop_30 if x <= 0) / SIMS_30
-    y30_p5 = sorted(you_30)[int(SIMS_30 * 0.05)]
-    y30_p95 = sorted(you_30)[int(SIMS_30 * 0.95)]
-    g30_p5 = sorted(gop_30)[int(SIMS_30 * 0.05)]
-    g30_p95 = sorted(gop_30)[int(SIMS_30 * 0.95)]
-    y30_best = max(you_30)
-    g30_best = max(gop_30)
-    y_beats_g_30 = sum(1 for y, g in zip(you_30, gop_30) if y > g) / SIMS_30
-
-    print(f"\n  {'':.<28} {'YOU ($10)':>12} {'gopfan2 ($1)':>14}")
-    print(f"  {'─'*28} {'─'*12} {'─'*14}")
-    print(f"  {'Start':<28} ${BANKROLL:>10.2f} ${BANKROLL:>12.2f}")
-    print(f"  {'Avg final (30d)':<28} ${y30_avg:>10.2f} ${g30_avg:>12.2f}")
-    print(f"  {'Median final (30d)':<28} ${y30_med:>10.2f} ${g30_med:>12.2f}")
-    print(f"  {'5th pctl (bad luck)':<28} ${y30_p5:>10.2f} ${g30_p5:>12.2f}")
-    print(f"  {'95th pctl (good luck)':<28} ${y30_p95:>10.2f} ${g30_p95:>12.2f}")
-    print(f"  {'Best 30d run':<28} ${y30_best:>10.2f} ${g30_best:>12.2f}")
-    print(f"  {'Bust rate (<$0)':<28} {y30_bust:>10.1%} {g30_bust:>12.1%}")
-    print(f"  {'30d ROI':<28} {(y30_avg-BANKROLL)/BANKROLL*100:>+9.1f}% {(g30_avg-BANKROLL)/BANKROLL*100:>+11.1f}%")
-    print(f"  {'30d total profit':<28} ${y30_avg-BANKROLL:>+10.2f} ${g30_avg-BANKROLL:>+12.2f}")
-    print(f"\n  YOU beats gopfan2 in {y_beats_g_30:.0%} of 30-day runs")
+    for label, key, fmt in fields_m:
+        row = f"  {label:<24}"
+        for sname in strat_names:
+            val = all_stats[sname][key]
+            if fmt.startswith("$"):
+                cell = fmt.replace("$", "$").format(val)
+            else:
+                cell = fmt.format(val)
+            row += f" {cell:>12}"
+        print(row)
 
     # ── VERDICT ──────────────────────────────────────────────────────────
     print(f"\n{'='*W}")
     print(f"  VERDICT")
     print(f"{'='*W}")
 
-    you_daily_ev = total_you_ev
-    gop_daily_ev = total_gop_ev
+    # Find best strategy
+    best_name = max(all_stats, key=lambda s: all_stats[s]["avg_d"])
+    best = all_stats[best_name]
+    best_roi_name = max(all_stats, key=lambda s: all_stats[s]["roi_d"])
+    best_roi = all_stats[best_roi_name]
+    safest_name = min(all_stats, key=lambda s: all_stats[s]["bust"])
+    safest = all_stats[safest_name]
 
     print(f"""
-  Expected daily P&L:  YOU ${you_daily_ev:>+.2f}   gopfan2 ${gop_daily_ev:>+.2f}
-  Expected 30d profit: YOU ${you_daily_ev*30:>+.2f}  gopfan2 ${gop_daily_ev*30:>+.2f}
+  HIGHEST DAILY PROFIT:  {best_name}
+    ${best['avg_d']:+.2f}/day on ${best['deployed']:.0f} deployed
 
-  Same strategy. Same buckets. Same edge.
-  Only difference: stake size.
+  BEST ROI:              {best_roi_name}
+    {best_roi['roi_d']:+.1f}% daily on ${best_roi['deployed']:.0f} deployed
 
-  $10/stake = 10x the profit, 10x the risk, 10x the capital needed.
-  $1/stake  = survives anything, but needs volume to matter.
+  SAFEST (lowest bust):  {safest_name}
+    {safest['bust']:.1%} bust rate over 30 days
 
-  At 5 cities/day:
-    YOU makes ${you_daily_ev:.2f}/day on ${you_deployed:.0f} deployed
-    gopfan2 makes ${gop_daily_ev:.2f}/day on ${gop_deployed:.0f} deployed
+  COMPARISON — NO-only vs YES-only vs HYBRID:
+    NO-only:  grinds thin margins, loses to tail risk on these markets
+    YES-only: high variance, big wins when forecast hits, big loss when not
+    HYBRID:   NO income cushions YES losses → smoother equity curve
 
-  gopfan2 would need {int(you_daily_ev / gop_daily_ev) if gop_daily_ev > 0 else '∞'} cities at $1
-  to match YOUR 5-city $10 income.
+  COMPARISON — $10 vs $1 stake:
+    $10: 10x profit AND 10x risk. Works if you pick cities with fat edges.
+    $1:  nearly unkillable. Needs 10+ cities to generate real income.
 """)
 
 
