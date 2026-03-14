@@ -1,8 +1,8 @@
-/// feeds.rs — External data feeds (CL prices + PM book)
+/// feeds.rs -- External data feeds (CL + BN prices + PM book)
 ///
-/// Reused from oracle-scanner with minor cleanups.
 /// 1. CL price feed: WebSocket from Polymarket live-data (chainlink topic)
-/// 2. Book data: Batched REST via CLOB /books endpoint
+/// 2. BN price feed: WebSocket from Binance aggTrade (unthrottled, no rate limit)
+/// 3. Book data: Batched REST via CLOB /books endpoint
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,16 +18,17 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 use url::Url;
 
-// ── Constants ────────────────────────────────────────────────────────────────
+// -- Constants ----------------------------------------------------------------
 
 const BOOK_BATCH_SIZE: usize = 20;
 const WS_RECONNECT_SECS: u64 = 5;
 
-// ── Shared state types ──────────────────────────────────────────────────────
+// -- Shared state types -------------------------------------------------------
 
-pub type ClPrices     = Arc<DashMap<String, (f64, f64)>>;
+pub type ClPrices     = Arc<DashMap<String, (f64, f64)>>;   // asset -> (ts, price)
+pub type BnPrices     = Arc<DashMap<String, (f64, f64)>>;   // asset -> (ts, price)
 pub type BookState    = Arc<DashMap<String, BookEntry>>;
-pub type PriceHistory = Arc<DashMap<String, Vec<(f64, f64)>>>;
+pub type PriceHistory = Arc<DashMap<String, Vec<(f64, f64)>>>; // key -> [(ts, price)]
 
 #[derive(Debug, Clone)]
 pub struct PriceLevel {
@@ -67,7 +68,7 @@ pub fn vwap_fill(levels: &[PriceLevel], stake: f64) -> Option<(f64, f64)> {
     Some((total_cost / total_shares, total_shares))
 }
 
-// ── Market metadata ─────────────────────────────────────────────────────────
+// -- Market metadata ----------------------------------------------------------
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -83,7 +84,7 @@ pub struct MarketMeta {
     pub condition_id: String,
 }
 
-// ── Rate limiter ────────────────────────────────────────────────────────────
+// -- Rate limiter -------------------------------------------------------------
 
 pub struct RateLimiter {
     last_call: Mutex<Instant>,
@@ -108,7 +109,7 @@ impl RateLimiter {
     }
 }
 
-// ── Gamma API types ─────────────────────────────────────────────────────────
+// -- Gamma API types ----------------------------------------------------------
 
 #[derive(Deserialize, Debug)]
 struct GammaEvent {
@@ -150,7 +151,7 @@ where D: serde::Deserializer<'de>,
     }
 }
 
-// ── Slug helpers ────────────────────────────────────────────────────────────
+// -- Slug helpers -------------------------------------------------------------
 
 pub fn build_slug(asset: &str, tf_mins: u32, window_start: u64) -> String {
     format!("{}-updown-{}m-{}", asset, tf_mins, window_start)
@@ -159,11 +160,10 @@ pub fn build_slug(asset: &str, tf_mins: u32, window_start: u64) -> String {
 pub fn current_window_starts(tf_mins: u32, now_secs: u64) -> Vec<u64> {
     let interval = (tf_mins as u64) * 60;
     let current  = (now_secs / interval) * interval;
-    // Only return current window — entering the NEXT window early caused duplicate positions
     vec![current]
 }
 
-// ── Market discovery ────────────────────────────────────────────────────────
+// -- Market discovery ---------------------------------------------------------
 
 pub async fn fetch_market_meta(
     client:    &Client,
@@ -235,7 +235,7 @@ pub async fn fetch_market_meta(
     }))
 }
 
-// ── Batch book fetcher ──────────────────────────────────────────────────────
+// -- Batch book fetcher -------------------------------------------------------
 
 pub async fn fetch_books_batch(
     client:    &Client,
@@ -317,7 +317,7 @@ pub async fn fetch_books_batch(
     Ok(result)
 }
 
-// ── CL price WebSocket feed ─────────────────────────────────────────────────
+// -- CL price WebSocket feed --------------------------------------------------
 
 pub async fn run_cl_feed(
     live_ws:       String,
@@ -356,9 +356,8 @@ async fn connect_cl_feed(
 
     info!("[CL] Feed connected");
 
-    // Proactive ping every 5s to detect silent disconnects (V6 pattern)
     let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
-    ping_interval.tick().await; // consume the first immediate tick
+    ping_interval.tick().await;
 
     loop {
         let msg = tokio::select! {
@@ -382,7 +381,7 @@ async fn connect_cl_feed(
             Ok(_) => {}
             Err(e) => { error!("[CL] WebSocket error: {}", e); break; }
         }
-    } // end loop
+    }
 
     Ok(())
 }
@@ -433,7 +432,155 @@ fn process_cl_message(
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
+// -- Binance aggTrade WebSocket feed ------------------------------------------
+
+fn bn_stream_url(assets: &[String]) -> String {
+    let streams: Vec<String> = assets.iter()
+        .map(|a| format!("{}usdt@aggTrade", a))
+        .collect();
+    format!("wss://stream.binance.com:9443/stream?streams={}", streams.join("/"))
+}
+
+fn bn_symbol_to_asset(symbol: &str) -> Option<String> {
+    let s = symbol.to_lowercase();
+    s.strip_suffix("usdt").map(|a| a.to_string())
+}
+
+pub async fn run_bn_feed(
+    assets:     Vec<String>,
+    bn_prices:  BnPrices,
+    bn_history: PriceHistory,
+) {
+    let url = bn_stream_url(&assets);
+    loop {
+        info!("[BN] Connecting to {}", url);
+        match connect_bn_feed(&url, &bn_prices, &bn_history).await {
+            Ok(_)  => warn!("[BN] Feed closed, reconnecting..."),
+            Err(e) => error!("[BN] Feed error: {}, reconnecting in {}s", e, WS_RECONNECT_SECS),
+        }
+        tokio::time::sleep(Duration::from_secs(WS_RECONNECT_SECS)).await;
+    }
+}
+
+async fn connect_bn_feed(
+    url:        &str,
+    bn_prices:  &BnPrices,
+    bn_history: &PriceHistory,
+) -> Result<()> {
+    let parsed = Url::parse(url).context("invalid BN WS URL")?;
+    let (mut ws, _) = connect_async(parsed.to_string()).await.context("BN WS connect failed")?;
+
+    info!("[BN] Feed connected");
+
+    let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
+    ping_interval.tick().await;
+
+    loop {
+        let msg = tokio::select! {
+            msg = ws.next() => match msg {
+                Some(m) => m,
+                None => break,
+            },
+            _ = ping_interval.tick() => {
+                let _ = ws.send(Message::Ping(vec![].into())).await;
+                continue;
+            }
+        };
+
+        match msg {
+            Ok(Message::Text(text)) => {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    process_bn_message(&v, bn_prices, bn_history);
+                }
+            }
+            Ok(Message::Ping(data)) => { let _ = ws.send(Message::Pong(data)).await; }
+            Ok(_) => {}
+            Err(e) => { error!("[BN] WebSocket error: {}", e); break; }
+        }
+    }
+
+    Ok(())
+}
+
+fn process_bn_message(
+    v:          &serde_json::Value,
+    bn_prices:  &BnPrices,
+    bn_history: &PriceHistory,
+) {
+    // Combined stream: {"stream":"btcusdt@aggTrade","data":{"s":"BTCUSDT","p":"...","T":...}}
+    let data = match v.get("data") {
+        Some(d) => d,
+        None => v,
+    };
+
+    let symbol = match data.get("s").and_then(|s| s.as_str()) {
+        Some(s) => s,
+        None => return,
+    };
+
+    let asset = match bn_symbol_to_asset(symbol) {
+        Some(a) => a,
+        None => return,
+    };
+
+    let price: f64 = data.get("p")
+        .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_f64()))
+        .unwrap_or(0.0);
+    if price <= 0.0 { return; }
+
+    let ts_ms = data.get("T")
+        .and_then(|t| t.as_f64().or_else(|| t.as_i64().map(|i| i as f64)))
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default().as_millis() as f64
+        });
+    let ts = if ts_ms > 1e12 { ts_ms / 1000.0 } else { ts_ms };
+
+    bn_prices.insert(asset.clone(), (ts, price));
+
+    let hist_key = format!("bn_{}", asset);
+    let mut hist = bn_history.entry(hist_key).or_default();
+    hist.push((ts, price));
+    if hist.len() > 1000 {
+        let drain_to = hist.len() - 1000;
+        hist.drain(0..drain_to);
+    }
+}
+
+// -- Helpers for momentum/lag computation (used by main.rs) -------------------
+
+/// Compute momentum: price change over last N seconds from a history vec.
+/// Returns (pct_change, abs_change) or (0.0, 0.0) if insufficient data.
+pub fn momentum_from_history(hist: &[(f64, f64)], now: f64, lookback_secs: f64) -> (f64, f64) {
+    let cutoff = now - lookback_secs;
+    let old = hist.iter()
+        .filter(|(ts, _)| *ts <= cutoff)
+        .last()
+        .map(|(_, p)| *p);
+    let current = hist.last().map(|(_, p)| *p);
+    match (old, current) {
+        (Some(o), Some(c)) if o > 0.0 => ((c - o) / o, c - o),
+        _ => (0.0, 0.0),
+    }
+}
+
+/// Count CL updates in a time window (for cl_update_count metric)
+pub fn count_updates_in_window(hist: &[(f64, f64)], start: f64, end: f64) -> u32 {
+    hist.iter().filter(|(ts, _)| *ts >= start && *ts <= end).count() as u32
+}
+
+/// Max gap between consecutive updates in a time window
+pub fn max_gap_in_window(hist: &[(f64, f64)], start: f64, end: f64) -> f64 {
+    let window: Vec<f64> = hist.iter()
+        .filter(|(ts, _)| *ts >= start && *ts <= end)
+        .map(|(ts, _)| *ts)
+        .collect();
+    if window.len() < 2 { return 0.0; }
+    window.windows(2).map(|w| w[1] - w[0]).fold(0.0_f64, f64::max)
+}
+
+// -- Tests --------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -457,5 +604,26 @@ mod tests {
         let (price, shares) = vwap_fill(&levels, 5.0).unwrap();
         assert!((price - 0.50).abs() < 0.001);
         assert!((shares - 10.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn bn_stream_url_correct() {
+        let url = bn_stream_url(&["btc".to_string(), "eth".to_string()]);
+        assert!(url.contains("btcusdt@aggTrade"));
+        assert!(url.contains("ethusdt@aggTrade"));
+    }
+
+    #[test]
+    fn bn_symbol_to_asset_works() {
+        assert_eq!(bn_symbol_to_asset("BTCUSDT"), Some("btc".to_string()));
+        assert_eq!(bn_symbol_to_asset("ETHUSDT"), Some("eth".to_string()));
+        assert_eq!(bn_symbol_to_asset("INVALID"), None);
+    }
+
+    #[test]
+    fn momentum_basic() {
+        let hist = vec![(1.0, 100.0), (2.0, 101.0), (3.0, 102.0)];
+        let (pct, _) = momentum_from_history(&hist, 3.0, 2.0);
+        assert!((pct - 0.02).abs() < 0.001);
     }
 }

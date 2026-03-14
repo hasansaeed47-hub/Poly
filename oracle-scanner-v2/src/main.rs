@@ -1,17 +1,20 @@
-/// Oracle Scanner V2 — Pure Data Capture (No Trading)
+/// Oracle Scanner V2 -- Clean Fast Data Capture (No Trading)
 ///
-/// Captures ALL market data for offline analysis:
-///   - Every signal tick (500ms) → data/signals_YYYY-MM-DD.jsonl
-///   - Full order book snapshots → data/books_YYYY-MM-DD.jsonl
-///   - Settlement outcomes      → data/settlements_YYYY-MM-DD.jsonl
-///   - Raw CL price ticks       → data/cl_ticks_YYYY-MM-DD.jsonl
+/// Captures ALL market data with unthrottled live feeds:
+///   - Every signal tick (500ms)  -> data/signals_YYYY-MM-DD.jsonl
+///   - Settlement outcomes        -> data/settlements_YYYY-MM-DD.jsonl
+///   - Raw CL price ticks         -> data/cl_ticks_YYYY-MM-DD.jsonl
+///   - Raw BN price ticks         -> data/bn_ticks_YYYY-MM-DD.jsonl
 ///
-/// HTTP server on :8080 for file downloads:
-///   GET /files          → list data files (JSON)
-///   GET /download/{f}   → download a file
-///   GET /status         → scanner health check
+/// HTTP server on :8080 for section-wise downloads:
+///   GET /files                -> list all data files
+///   GET /download/{f}         -> download a single file
+///   GET /sections             -> list available data sections
+///   GET /section/{name}       -> download all files for a section (tar)
+///   GET /status               -> scanner health + feed staleness
 ///
-/// No wallet. No execution. No SDK. Pure observation.
+/// Feeds: CL (Chainlink RTDS WS) + BN (Binance aggTrade WS) + PM Book (REST)
+/// No wallet. No execution. No throttling on WS reads.
 
 mod feeds;
 mod signal;
@@ -32,13 +35,14 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 use feeds::{
-    BookState, ClPrices, MarketMeta, PriceHistory, RateLimiter,
+    BnPrices, BookState, ClPrices, MarketMeta, PriceHistory, RateLimiter,
     build_slug, current_window_starts, fetch_books_batch, fetch_market_meta,
-    run_cl_feed,
+    run_cl_feed, run_bn_feed, momentum_from_history, count_updates_in_window,
+    max_gap_in_window,
 };
 use signal::{compute, estimate_sigma, fair_yes, BookData};
 
-// ── Config ──────────────────────────────────────────────────────────────────
+// -- Config -------------------------------------------------------------------
 
 #[derive(Deserialize, Debug)]
 struct AppConfig {
@@ -90,11 +94,11 @@ fn default_warmup() -> u64 { 5 }
 fn default_stale() -> f64 { 3.0 }
 fn default_tick() -> u64 { 500 }
 fn default_sigma_window() -> f64 { 300.0 }
-fn default_min_secs() -> f64 { 30.0 } // lower than v1's 60 — capture more data
+fn default_min_secs() -> f64 { 30.0 }
 fn default_stake() -> f64 { 5.0 }
 fn default_port() -> u16 { 8080 }
 
-// ── Log entry types ─────────────────────────────────────────────────────────
+// -- Log entry types ----------------------------------------------------------
 
 #[derive(Serialize)]
 struct SignalLog {
@@ -107,35 +111,118 @@ struct SignalLog {
     pct_move:     f64,
     sigma:        f64,
     secs_left:    f64,
+
     // Fair values
     fair_yes:     f64,
     fair_no:      f64,
+
     // Book state
     bid_yes:      f64,
     ask_yes:      f64,
     bid_no:       f64,
     ask_no:       f64,
+
     // VWAP fills
     fill_yes:     f64,
     fill_no:      f64,
+
     // Edge
     edge_yes:     f64,
     edge_no:      f64,
     best_side:    String,
     best_edge:    f64,
+
     // Depth
     depth_yes:    f64,
     depth_no:     f64,
-    // Microstructure
+
+    // Microstructure (original)
     cl_momentum:  f64,
     book_imbal:   f64,
     spread_yes:   f64,
     spread_no:    f64,
+
     // Book levels (top 5)
     asks_yes_5:   Vec<[f64; 2]>,
     bids_yes_5:   Vec<[f64; 2]>,
     asks_no_5:    Vec<[f64; 2]>,
     bids_no_5:    Vec<[f64; 2]>,
+
+    // --- NEW: Binance parallel capture ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_price:         Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_momentum_5s:   Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_momentum_30s:  Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_momentum_60s:  Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cl_bn_spread:     Option<f64>,  // (cl - bn) / bn
+
+    // --- NEW: Multi-timeframe CL momentum ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cl_momentum_5s:   Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cl_momentum_60s:  Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cl_acceleration:  Option<f64>,  // momentum_5s - momentum_30s (positive = accelerating)
+
+    // --- NEW: Latency / staleness ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cl_feed_age_ms:   Option<f64>,  // now - cl_timestamp (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_feed_age_ms:   Option<f64>,  // now - bn_timestamp (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    book_age_ms:      Option<f64>,  // now - book_timestamp (ms)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cl_bn_lag_ms:     Option<f64>,  // cl_timestamp - bn_timestamp (ms)
+
+    // --- NEW: Data quality flags ---
+    cl_stale:         bool,   // cl_feed_age > 10s
+    bn_stale:         bool,   // bn_feed_age > 5s
+    book_stale:       bool,   // book_age > 3s
+    data_quality:     String, // "full", "degraded", "stale"
+
+    // --- NEW: Vol regime ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sigma_60s:        Option<f64>,  // 60s rolling sigma
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sigma_ratio:      Option<f64>,  // sigma_60s / sigma_300s (>1 = vol expanding)
+
+    // --- NEW: Oracle health ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cl_update_count:  Option<u32>,  // CL ticks in current window
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cl_gap_max_ms:    Option<f64>,  // max gap between CL updates in window
+
+    // --- NEW: Arb ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    yes_no_arb:       Option<f64>,  // 1.0 - (best_ask_yes + best_ask_no), positive = arb exists
+
+    // --- NEW: Book dynamics ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    midpoint_yes:     Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    midpoint_no:      Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_spread_yes: Option<f64>,  // 2 * |fill - midpoint|
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effective_spread_no:  Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_ask_size_yes: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_bid_size_yes: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_ask_size_no:  Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_bid_size_no:  Option<f64>,
+
+    // --- NEW: Time context ---
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hour_utc:         Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    window_elapsed_pct: Option<f64>, // how far through the window (0.0 = start, 1.0 = end)
 }
 
 #[derive(Serialize)]
@@ -147,9 +234,14 @@ struct SettlementLog {
     open_price:   f64,
     cl_close:     f64,
     pct_move:     f64,
-    outcome:      String,  // "YES" or "NO"
+    outcome:      String,
     window_start: u64,
     window_end:   u64,
+    // NEW: BN price at settlement for oracle integrity check
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bn_close:     Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cl_bn_divergence: Option<f64>,  // |cl - bn| / bn at settlement
 }
 
 #[derive(Serialize)]
@@ -159,7 +251,14 @@ struct ClTickLog {
     price: f64,
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────────
+#[derive(Serialize)]
+struct BnTickLog {
+    ts:    f64,
+    asset: String,
+    price: f64,
+}
+
+// -- Helpers ------------------------------------------------------------------
 
 fn now_secs() -> f64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
@@ -173,19 +272,29 @@ fn today_str() -> String {
     Utc::now().format("%Y-%m-%d").to_string()
 }
 
-
 fn top_n_levels(levels: &[feeds::PriceLevel], n: usize) -> Vec<[f64; 2]> {
     levels.iter().take(n).map(|l| [l.price, l.size]).collect()
 }
 
-// ── HTTP server ─────────────────────────────────────────────────────────────
+fn open_or_create(path: &str) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+// -- HTTP server --------------------------------------------------------------
 
 #[derive(Clone)]
 struct AppState {
     signal_count: Arc<AtomicU64>,
     settle_count: Arc<AtomicU64>,
     market_count: Arc<AtomicU64>,
+    cl_tick_count: Arc<AtomicU64>,
+    bn_tick_count: Arc<AtomicU64>,
     start_ts:     f64,
+    cl_prices:    ClPrices,
+    bn_prices:    BnPrices,
 }
 
 async fn list_files() -> impl IntoResponse {
@@ -215,7 +324,6 @@ async fn list_files() -> impl IntoResponse {
 }
 
 async fn download_file(AxumPath(filename): AxumPath<String>) -> impl IntoResponse {
-    // Sanitize: only allow alphanumeric, dash, underscore, dot
     let safe: String = filename.chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_' || *c == '.')
         .collect();
@@ -238,21 +346,137 @@ async fn download_file(AxumPath(filename): AxumPath<String>) -> impl IntoRespons
     }
 }
 
+/// List available data sections with their files
+async fn list_sections() -> impl IntoResponse {
+    let sections = vec!["signals", "settlements", "cl_ticks", "bn_ticks"];
+    let mut result: HashMap<String, Vec<serde_json::Value>> = HashMap::new();
+
+    if let Ok(entries) = std::fs::read_dir("data") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".jsonl") { continue; }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            for section in &sections {
+                if name.starts_with(section) {
+                    result.entry(section.to_string()).or_default().push(
+                        serde_json::json!({ "name": name, "size_bytes": size })
+                    );
+                }
+            }
+        }
+    }
+
+    // Sort files within each section
+    for files in result.values_mut() {
+        files.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    }
+
+    Json(serde_json::json!({
+        "sections": sections,
+        "files": result,
+    }))
+}
+
+/// Download all files for a section, concatenated as JSONL
+async fn download_section(AxumPath(section): AxumPath<String>) -> impl IntoResponse {
+    let valid = ["signals", "settlements", "cl_ticks", "bn_ticks"];
+    if !valid.contains(&section.as_str()) {
+        return axum::http::Response::builder()
+            .status(400)
+            .body(axum::body::Body::from(
+                format!("Invalid section '{}'. Valid: {:?}", section, valid)
+            ))
+            .unwrap();
+    }
+
+    let mut all_data = Vec::new();
+    let mut file_names: Vec<String> = Vec::new();
+
+    if let Ok(entries) = std::fs::read_dir("data") {
+        let mut paths: Vec<_> = entries.flatten()
+            .filter(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                name.starts_with(&section) && name.ends_with(".jsonl")
+            })
+            .collect();
+        paths.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
+
+        for entry in paths {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Ok(data) = std::fs::read(entry.path()) {
+                all_data.extend_from_slice(&data);
+                file_names.push(name);
+            }
+        }
+    }
+
+    let filename = format!("{}_all.jsonl", section);
+    axum::http::Response::builder()
+        .header("content-type", "application/x-ndjson")
+        .header("content-disposition", format!("attachment; filename=\"{}\"", filename))
+        .header("x-files-included", file_names.join(","))
+        .header("x-total-bytes", all_data.len().to_string())
+        .body(axum::body::Body::from(all_data))
+        .unwrap()
+}
+
 async fn status(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> impl IntoResponse {
-    let uptime = now_secs() - state.start_ts;
+    let now = now_secs();
+    let uptime = now - state.start_ts;
+
+    // Feed freshness
+    let mut feed_status: HashMap<String, serde_json::Value> = HashMap::new();
+    for entry in state.cl_prices.iter() {
+        let (ts, price) = *entry.value();
+        let age_ms = (now - ts) * 1000.0;
+        feed_status.insert(format!("cl_{}", entry.key()), serde_json::json!({
+            "price": price,
+            "age_ms": age_ms as u64,
+            "stale": age_ms > 10_000.0,
+        }));
+    }
+    for entry in state.bn_prices.iter() {
+        let (ts, price) = *entry.value();
+        let age_ms = (now - ts) * 1000.0;
+        feed_status.insert(format!("bn_{}", entry.key()), serde_json::json!({
+            "price": price,
+            "age_ms": age_ms as u64,
+            "stale": age_ms > 5_000.0,
+        }));
+    }
+
+    // Data files summary
+    let mut total_bytes: u64 = 0;
+    let mut file_count: u32 = 0;
+    if let Ok(entries) = std::fs::read_dir("data") {
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                if entry.file_name().to_string_lossy().ends_with(".jsonl") {
+                    total_bytes += meta.len();
+                    file_count += 1;
+                }
+            }
+        }
+    }
+
     Json(serde_json::json!({
         "status": "running",
         "uptime_secs": uptime as u64,
         "uptime_hours": format!("{:.1}", uptime / 3600.0),
         "signals_logged": state.signal_count.load(Ordering::Relaxed),
         "settlements_logged": state.settle_count.load(Ordering::Relaxed),
+        "cl_ticks_logged": state.cl_tick_count.load(Ordering::Relaxed),
+        "bn_ticks_logged": state.bn_tick_count.load(Ordering::Relaxed),
         "active_markets": state.market_count.load(Ordering::Relaxed),
+        "feeds": feed_status,
+        "data_files": file_count,
+        "data_size_mb": total_bytes as f64 / 1_048_576.0,
     }))
 }
 
-// ── Main ────────────────────────────────────────────────────────────────────
+// -- Main ---------------------------------------------------------------------
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -269,49 +493,59 @@ async fn main() -> Result<()> {
     let cfg: AppConfig = toml::from_str(&cfg_text)
         .context("invalid config.toml")?;
 
-    info!("═══════════════════════════════════════════════════════════");
-    info!("  Oracle Scanner V2 — Data Capture Only (No Trading)");
-    info!("═══════════════════════════════════════════════════════════");
+    info!("================================================================");
+    info!("  Oracle Scanner V2 -- Clean Fast Data Capture (No Trading)");
+    info!("================================================================");
     info!("Assets: {:?}", cfg.feed.assets);
     info!("Timeframes: {:?}m", cfg.feed.timeframes);
+    info!("Feeds: CL (RTDS WS) + BN (aggTrade WS) + Book (REST)");
     info!("VWAP stake: ${}", cfg.scan.vwap_stake);
     info!("HTTP server: :{}", cfg.http.port);
     info!("Data dir: data/");
 
-    // Create data directory
     std::fs::create_dir_all("data").context("cannot create data/")?;
 
-    // ── Shared state ──────────────────────────────────────────────────────
+    // -- Shared state ---------------------------------------------------------
 
     let cl_prices:     ClPrices     = Arc::new(DashMap::new());
+    let bn_prices:     BnPrices     = Arc::new(DashMap::new());
     let book_state:    BookState    = Arc::new(DashMap::new());
     let price_history: PriceHistory = Arc::new(DashMap::new());
+    let bn_history:    PriceHistory = Arc::new(DashMap::new());
     let token_ids:     Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
 
-    let signal_count = Arc::new(AtomicU64::new(0));
-    let settle_count = Arc::new(AtomicU64::new(0));
-    let market_count = Arc::new(AtomicU64::new(0));
+    let signal_count  = Arc::new(AtomicU64::new(0));
+    let settle_count  = Arc::new(AtomicU64::new(0));
+    let market_count  = Arc::new(AtomicU64::new(0));
+    let cl_tick_count = Arc::new(AtomicU64::new(0));
+    let bn_tick_count = Arc::new(AtomicU64::new(0));
 
     let http = Client::builder()
-        .user_agent("oracle-scanner-v2/1")
+        .user_agent("oracle-scanner-v2/2")
         .timeout(Duration::from_secs(10))
         .build()
         .context("HTTP client build failed")?;
 
     let limiter = Arc::new(RateLimiter::new(cfg.feed.rest_throttle_ms));
 
-    // ── Start HTTP server ─────────────────────────────────────────────────
+    // -- Start HTTP server ----------------------------------------------------
 
     let app_state = AppState {
         signal_count: signal_count.clone(),
         settle_count: settle_count.clone(),
         market_count: market_count.clone(),
+        cl_tick_count: cl_tick_count.clone(),
+        bn_tick_count: bn_tick_count.clone(),
         start_ts: now_secs(),
+        cl_prices: cl_prices.clone(),
+        bn_prices: bn_prices.clone(),
     };
 
     let app = Router::new()
         .route("/files", axum::routing::get(list_files))
         .route("/download/{filename}", axum::routing::get(download_file))
+        .route("/sections", axum::routing::get(list_sections))
+        .route("/section/{name}", axum::routing::get(download_section))
         .route("/status", axum::routing::get(status))
         .with_state(app_state);
 
@@ -324,7 +558,7 @@ async fn main() -> Result<()> {
         axum::serve(listener, app).await.expect("HTTP server failed");
     });
 
-    // ── Discover markets ──────────────────────────────────────────────────
+    // -- Discover markets -----------------------------------------------------
 
     info!("Discovering active markets...");
     let mut markets: HashMap<String, MarketMeta> = HashMap::new();
@@ -353,36 +587,75 @@ async fn main() -> Result<()> {
     info!("Discovered {} active markets", markets.len());
     market_count.store(markets.len() as u64, Ordering::Relaxed);
 
-    // ── Start CL WebSocket feed ───────────────────────────────────────────
+    // -- Start CL tick logger -------------------------------------------------
 
-    // Also log raw CL ticks
-    let cl_for_log = cl_prices.clone();
-    let assets_for_log = cfg.feed.assets.clone();
-    tokio::spawn(async move {
-        let mut last_prices: HashMap<String, f64> = HashMap::new();
-        loop {
-            tokio::time::sleep(Duration::from_millis(1000)).await;
-            let date = today_str();
-            let path = format!("data/cl_ticks_{}.jsonl", date);
+    {
+        let cl_for_log = cl_prices.clone();
+        let assets_for_log = cfg.feed.assets.clone();
+        let counter = cl_tick_count.clone();
+        tokio::spawn(async move {
+            let mut last_prices: HashMap<String, f64> = HashMap::new();
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let date = today_str();
+                let path = format!("data/cl_ticks_{}.jsonl", date);
 
-            for asset in &assets_for_log {
-                if let Some(entry) = cl_for_log.get(asset.as_str()) {
-                    let (ts, price) = *entry;
-                    let prev = last_prices.get(asset).copied().unwrap_or(0.0);
-                    if (price - prev).abs() > 0.001 {
-                        let log = ClTickLog { ts, asset: asset.clone(), price };
+                for asset in &assets_for_log {
+                    if let Some(entry) = cl_for_log.get(asset.as_str()) {
+                        let (ts, price) = *entry;
+                        let prev = last_prices.get(asset).copied().unwrap_or(0.0);
+                        if (price - prev).abs() > 0.001 {
+                            let log = ClTickLog { ts, asset: asset.clone(), price };
+                            if let Ok(line) = serde_json::to_string(&log) {
+                                if let Ok(mut f) = open_or_create(&path) {
+                                    let _ = writeln!(f, "{}", line);
+                                }
+                            }
+                            last_prices.insert(asset.clone(), price);
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // -- Start BN tick logger -------------------------------------------------
+
+    {
+        let bn_for_log = bn_prices.clone();
+        let assets_for_log = cfg.feed.assets.clone();
+        let counter = bn_tick_count.clone();
+        tokio::spawn(async move {
+            let mut last_prices: HashMap<String, f64> = HashMap::new();
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let date = today_str();
+                let path = format!("data/bn_ticks_{}.jsonl", date);
+
+                for asset in &assets_for_log {
+                    if let Some(entry) = bn_for_log.get(asset.as_str()) {
+                        let (ts, price) = *entry;
+                        let prev = last_prices.get(asset).copied().unwrap_or(0.0);
+                        // Log every meaningful change (>0.01 for BTC, scales with price)
+                        if prev > 0.0 && ((price - prev) / prev).abs() < 0.000001 {
+                            continue;
+                        }
+                        let log = BnTickLog { ts, asset: asset.clone(), price };
                         if let Ok(line) = serde_json::to_string(&log) {
-                            if let Ok(mut f) = std::fs::OpenOptions::new()
-                                .create(true).append(true).open(&path) {
+                            if let Ok(mut f) = open_or_create(&path) {
                                 let _ = writeln!(f, "{}", line);
                             }
                         }
                         last_prices.insert(asset.clone(), price);
+                        counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
-        }
-    });
+        });
+    }
+
+    // -- Start CL WebSocket feed ----------------------------------------------
 
     {
         let cp = cl_prices.clone();
@@ -394,7 +667,18 @@ async fn main() -> Result<()> {
         });
     }
 
-    // ── Main scan loop ──────────────────────────────────────────────────
+    // -- Start BN WebSocket feed (unthrottled aggTrade) -----------------------
+
+    {
+        let bp = bn_prices.clone();
+        let bh = bn_history.clone();
+        let assets = cfg.feed.assets.clone();
+        tokio::spawn(async move {
+            run_bn_feed(assets, bp, bh).await;
+        });
+    }
+
+    // -- Main scan loop -------------------------------------------------------
 
     let tick = Duration::from_millis(cfg.scan.tick_ms);
     let mut tick_count:    u64 = 0;
@@ -415,26 +699,40 @@ async fn main() -> Result<()> {
                     tokio::signal::unix::SignalKind::terminate()
                 ).expect("failed to register SIGTERM handler");
                 tokio::select! {
-                    _ = tokio::signal::ctrl_c() => { warn!("SIGINT received — shutting down..."); }
-                    _ = sigterm.recv() => { warn!("SIGTERM received — shutting down..."); }
+                    _ = tokio::signal::ctrl_c() => { warn!("SIGINT received -- shutting down..."); }
+                    _ = sigterm.recv() => { warn!("SIGTERM received -- shutting down..."); }
                 }
             }
             #[cfg(not(unix))]
             {
                 let _ = tokio::signal::ctrl_c().await;
-                warn!("SIGINT received — shutting down...");
+                warn!("SIGINT received -- shutting down...");
             }
             shutdown.store(true, Ordering::SeqCst);
         });
     }
 
-    // ── CL feed warmup ──────────────────────────────────────────────────
+    // -- Feed warmup ----------------------------------------------------------
 
-    info!("Waiting for CL feed...");
+    info!("Waiting for CL + BN feeds...");
     for _ in 0..40u32 {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let all_have = cfg.feed.assets.iter().all(|a| cl_prices.contains_key(a.as_str()));
-        if all_have {
+        let cl_ready = cfg.feed.assets.iter().all(|a| cl_prices.contains_key(a.as_str()));
+        let bn_ready = cfg.feed.assets.iter().all(|a| bn_prices.contains_key(a.as_str()));
+        if cl_ready && bn_ready {
+            for asset in &cfg.feed.assets {
+                let cl_val = cl_prices.get(asset.as_str()).map(|v| v.1).unwrap_or(0.0);
+                let bn_val = bn_prices.get(asset.as_str()).map(|v| v.1).unwrap_or(0.0);
+                info!("[FEED] {} CL={:.2} BN={:.2} spread={:+.4}%",
+                    asset.to_uppercase(), cl_val, bn_val,
+                    if bn_val > 0.0 { (cl_val - bn_val) / bn_val * 100.0 } else { 0.0 }
+                );
+            }
+            break;
+        }
+        if cl_ready && !bn_ready {
+            // Don't block on BN -- it's supplementary
+            info!("[FEED] CL ready, BN still connecting (will continue without blocking)");
             for asset in &cfg.feed.assets {
                 if let Some(v) = cl_prices.get(asset.as_str()) {
                     info!("[CL] {} = {:.2}", asset.to_uppercase(), v.1);
@@ -450,9 +748,11 @@ async fn main() -> Result<()> {
         tokio::time::sleep(tick).await;
 
         if shutdown.load(Ordering::SeqCst) {
-            info!("Shutdown — signals={} settlements={}",
+            info!("Shutdown -- signals={} settlements={} cl_ticks={} bn_ticks={}",
                 signal_count.load(Ordering::Relaxed),
-                settle_count.load(Ordering::Relaxed));
+                settle_count.load(Ordering::Relaxed),
+                cl_tick_count.load(Ordering::Relaxed),
+                bn_tick_count.load(Ordering::Relaxed));
             break;
         }
 
@@ -460,14 +760,14 @@ async fn main() -> Result<()> {
         let now = now_secs();
         let now_u = now as u64;
 
-        // Date rollover check
+        // Date rollover
         let date = today_str();
         if date != current_date {
             info!("[DATE] Rolled to {}", date);
             current_date = date;
         }
 
-        // ── Periodic market rediscovery (every 60s) ─────────────────────
+        // -- Periodic market rediscovery (every 60s) --------------------------
 
         if now - last_discover > 60.0 {
             last_discover = now;
@@ -492,7 +792,7 @@ async fn main() -> Result<()> {
             market_count.store(active as u64, Ordering::Relaxed);
         }
 
-        // ── Batch book refresh (every other tick) ───────────────────────
+        // -- Batch book refresh (every other tick) ----------------------------
 
         if tick_count % 2 == 0 {
             let all_tokens: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
@@ -508,7 +808,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── CL close snap — first CL after window end ──────────────────
+        // -- CL close snap ----------------------------------------------------
 
         for (slug, meta) in &markets {
             if settled.get(slug.as_str()).copied().unwrap_or(false) { continue; }
@@ -522,7 +822,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── Settlements ────────────────────────────────────────────────
+        // -- Settlements ------------------------------------------------------
 
         for (slug, meta) in &markets {
             if settled.get(slug.as_str()).copied().unwrap_or(false) { continue; }
@@ -536,8 +836,14 @@ async fn main() -> Result<()> {
                 let outcome = if cl_settle > meta.open_price { "YES" } else { "NO" };
                 let pct_move = ((cl_settle / meta.open_price) - 1.0) * 100.0;
 
-                info!("[SETTLE] {} cl={:.2} open={:.2} d={:+.4}% → {}",
-                    slug, cl_settle, meta.open_price, pct_move, outcome);
+                // BN price at settlement for oracle integrity
+                let bn_close = bn_prices.get(&meta.asset).map(|v| v.1);
+                let cl_bn_divergence = bn_close.map(|bn| {
+                    if bn > 0.0 { ((cl_settle - bn) / bn).abs() } else { 0.0 }
+                });
+
+                info!("[SETTLE] {} cl={:.2} bn={:.2} open={:.2} d={:+.4}% -> {}",
+                    slug, cl_settle, bn_close.unwrap_or(0.0), meta.open_price, pct_move, outcome);
 
                 let log = SettlementLog {
                     ts: now,
@@ -550,6 +856,8 @@ async fn main() -> Result<()> {
                     outcome: outcome.to_string(),
                     window_start: meta.window_start,
                     window_end: meta.window_end,
+                    bn_close,
+                    cl_bn_divergence,
                 };
 
                 let path = format!("data/settlements_{}.jsonl", current_date);
@@ -564,13 +872,13 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── Warmup gate ─────────────────────────────────────────────────
+        // -- Warmup gate ------------------------------------------------------
 
         if tick_count < (cfg.feed.book_warmup_secs * 1000 / cfg.scan.tick_ms) {
             continue;
         }
 
-        // ── Signal computation + logging (EVERY tick, EVERY market) ───
+        // -- Signal computation + logging (EVERY tick, EVERY market) ----------
 
         let signal_path = format!("data/signals_{}.jsonl", current_date);
 
@@ -580,8 +888,9 @@ async fn main() -> Result<()> {
             let secs_left = meta.window_end as f64 - now;
             if secs_left < cfg.scan.min_secs { continue; }
 
-            let cl = match cl_prices.get(&meta.asset) {
-                Some(v) => v.1,
+            // CL price + timestamp
+            let (cl_ts, cl) = match cl_prices.get(&meta.asset) {
+                Some(v) => *v.value(),
                 None    => continue,
             };
 
@@ -604,11 +913,9 @@ async fn main() -> Result<()> {
                 _ => continue,
             };
 
-            // Skip stale books
-            if now - book_yes_entry.ts > cfg.feed.book_stale_secs
-                || now - book_no_entry.ts > cfg.feed.book_stale_secs {
-                continue;
-            }
+            // Book staleness (but DON'T skip -- log with flag)
+            let book_age_s = (now - book_yes_entry.ts).max(now - book_no_entry.ts);
+            let book_is_stale = book_age_s > cfg.feed.book_stale_secs;
 
             let bd_yes = BookData {
                 best_ask: book_yes_entry.best_ask,
@@ -623,6 +930,7 @@ async fn main() -> Result<()> {
                 bids: book_no_entry.bids.clone(),
             };
 
+            // Sigma (300s)
             let sigma = {
                 let hist = price_history.get(&meta.asset);
                 match hist {
@@ -631,24 +939,105 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let cl_momentum = {
+            // Sigma (60s) for vol regime
+            let sigma_60s = {
                 let hist = price_history.get(&meta.asset);
                 match hist {
                     Some(h) => {
-                        let cutoff = now - 30.0;
-                        let old_price = h.iter()
-                            .filter(|(ts, _)| *ts <= cutoff)
-                            .last()
-                            .map(|(_, p)| *p);
-                        match old_price {
-                            Some(old) if old > 0.0 => (cl - old) / old,
-                            _ => 0.0,
-                        }
+                        let s = estimate_sigma(&h, 60.0, now);
+                        Some(s)
                     }
+                    None => None,
+                }
+            };
+            let sigma_ratio = sigma_60s.map(|s60| if sigma > 0.0 { s60 / sigma } else { 1.0 });
+
+            // CL momentum (30s -- original)
+            let cl_momentum = {
+                let hist = price_history.get(&meta.asset);
+                match hist {
+                    Some(h) => momentum_from_history(&h, now, 30.0).0,
                     None => 0.0,
                 }
             };
 
+            // Multi-timeframe CL momentum
+            let cl_momentum_5s = {
+                let hist = price_history.get(&meta.asset);
+                hist.map(|h| momentum_from_history(&h, now, 5.0).0)
+            };
+            let cl_momentum_60s = {
+                let hist = price_history.get(&meta.asset);
+                hist.map(|h| momentum_from_history(&h, now, 60.0).0)
+            };
+            let cl_acceleration = match (cl_momentum_5s, Some(cl_momentum)) {
+                (Some(m5), Some(m30)) => Some(m5 - m30),
+                _ => None,
+            };
+
+            // BN price + staleness
+            let (bn_ts, bn_price) = bn_prices.get(&meta.asset)
+                .map(|v| *v.value())
+                .unwrap_or((0.0, 0.0));
+            let bn_available = bn_price > 0.0;
+
+            let bn_momentum_5s = if bn_available {
+                let hist = bn_history.get(&format!("bn_{}", meta.asset));
+                hist.map(|h| momentum_from_history(&h, now, 5.0).0)
+            } else { None };
+            let bn_momentum_30s = if bn_available {
+                let hist = bn_history.get(&format!("bn_{}", meta.asset));
+                hist.map(|h| momentum_from_history(&h, now, 30.0).0)
+            } else { None };
+            let bn_momentum_60s = if bn_available {
+                let hist = bn_history.get(&format!("bn_{}", meta.asset));
+                hist.map(|h| momentum_from_history(&h, now, 60.0).0)
+            } else { None };
+
+            let cl_bn_spread = if bn_available && bn_price > 0.0 {
+                Some((cl - bn_price) / bn_price)
+            } else { None };
+
+            // Latency
+            let cl_feed_age_ms = Some((now - cl_ts) * 1000.0);
+            let bn_feed_age_ms = if bn_available { Some((now - bn_ts) * 1000.0) } else { None };
+            let book_age_ms = Some(book_age_s * 1000.0);
+            let cl_bn_lag_ms = if bn_available { Some((cl_ts - bn_ts) * 1000.0) } else { None };
+
+            // Staleness flags
+            let cl_is_stale = (now - cl_ts) > 10.0;
+            let bn_is_stale = !bn_available || (now - bn_ts) > 5.0;
+
+            let data_quality = if cl_is_stale || book_is_stale {
+                "stale"
+            } else if bn_is_stale {
+                "degraded"
+            } else {
+                "full"
+            }.to_string();
+
+            // Oracle health
+            let cl_update_count = {
+                let hist = price_history.get(&meta.asset);
+                hist.map(|h| count_updates_in_window(&h, meta.window_start as f64, now))
+            };
+            let cl_gap_max_ms = {
+                let hist = price_history.get(&meta.asset);
+                hist.map(|h| max_gap_in_window(&h, meta.window_start as f64, now) * 1000.0)
+            };
+
+            // Arb: YES+NO completeness
+            let yes_no_arb = Some(1.0 - (book_yes_entry.best_ask + book_no_entry.best_ask));
+
+            // Midpoints
+            let mid_yes = if book_yes_entry.best_bid > 0.0 && book_yes_entry.best_ask > 0.0 {
+                Some((book_yes_entry.best_bid + book_yes_entry.best_ask) / 2.0)
+            } else { None };
+            let mid_no = if book_no_entry.best_bid > 0.0 && book_no_entry.best_ask > 0.0 {
+                Some((book_no_entry.best_bid + book_no_entry.best_ask) / 2.0)
+            } else { None };
+
+            // Signal compute
             let sig = match compute(
                 slug, &meta.asset, meta.tf,
                 meta.open_price, cl, sigma, secs_left,
@@ -660,7 +1049,24 @@ async fn main() -> Result<()> {
 
             let pct_move = ((cl / meta.open_price) - 1.0) * 100.0;
 
-            // Log signal (EVERY tick)
+            // Effective spread
+            let effective_spread_yes = match (sig.fill_yes, mid_yes) {
+                (Some(fill), Some(mid)) => Some(2.0 * (fill - mid).abs()),
+                _ => None,
+            };
+            let effective_spread_no = match (sig.fill_no, mid_no) {
+                (Some(fill), Some(mid)) => Some(2.0 * (fill - mid).abs()),
+                _ => None,
+            };
+
+            // Window progress
+            let window_duration = (meta.tf as f64) * 60.0;
+            let elapsed = now - meta.window_start as f64;
+            let window_elapsed_pct = Some((elapsed / window_duration).clamp(0.0, 1.0));
+
+            let hour_utc = Some(Utc::now().format("%H").to_string().parse::<u32>().unwrap_or(0));
+
+            // Log signal
             let log = SignalLog {
                 ts: now,
                 slug: slug.clone(),
@@ -693,6 +1099,38 @@ async fn main() -> Result<()> {
                 bids_yes_5: top_n_levels(&book_yes_entry.bids, 5),
                 asks_no_5: top_n_levels(&book_no_entry.asks, 5),
                 bids_no_5: top_n_levels(&book_no_entry.bids, 5),
+                // New fields
+                bn_price: if bn_available { Some(bn_price) } else { None },
+                bn_momentum_5s,
+                bn_momentum_30s,
+                bn_momentum_60s,
+                cl_bn_spread,
+                cl_momentum_5s,
+                cl_momentum_60s,
+                cl_acceleration,
+                cl_feed_age_ms,
+                bn_feed_age_ms,
+                book_age_ms,
+                cl_bn_lag_ms,
+                cl_stale: cl_is_stale,
+                bn_stale: bn_is_stale,
+                book_stale: book_is_stale,
+                data_quality,
+                sigma_60s,
+                sigma_ratio,
+                cl_update_count,
+                cl_gap_max_ms,
+                yes_no_arb,
+                midpoint_yes: mid_yes,
+                midpoint_no: mid_no,
+                effective_spread_yes,
+                effective_spread_no,
+                top_ask_size_yes: book_yes_entry.asks.first().map(|l| l.size),
+                top_bid_size_yes: book_yes_entry.bids.first().map(|l| l.size),
+                top_ask_size_no: book_no_entry.asks.first().map(|l| l.size),
+                top_bid_size_no: book_no_entry.bids.first().map(|l| l.size),
+                hour_utc,
+                window_elapsed_pct,
             };
 
             if let Ok(line) = serde_json::to_string(&log) {
@@ -704,7 +1142,7 @@ async fn main() -> Result<()> {
             signal_count.fetch_add(1, Ordering::Relaxed);
         }
 
-        // ── Dashboard (every 60s) ────────────────────────────────────────
+        // -- Dashboard (every 60s) --------------------------------------------
 
         if now - last_dash_ts >= 60.0 {
             last_dash_ts = now;
@@ -722,6 +1160,11 @@ async fn main() -> Result<()> {
                 let (cl_str, cl_val) = match cl_prices.get(&meta.asset) {
                     Some(v) => (format!("{:.2}", v.1), v.1),
                     None    => ("--".to_string(), 0.0),
+                };
+
+                let bn_str = match bn_prices.get(&meta.asset) {
+                    Some(v) => format!("{:.2}", v.1),
+                    None    => "--".to_string(),
                 };
 
                 let delta_str = if meta.open_price > 0.0 && cl_val > 0.0 {
@@ -763,43 +1206,38 @@ async fn main() -> Result<()> {
                 };
 
                 lines.push(format!(
-                    "  {} | open={} cl={} d={} | σ={} fy={:.2} | YES={} NO={} | T-{:.0}s",
-                    slug, open_str, cl_str, delta_str, sigma_str, fy,
+                    "  {} | open={} cl={} bn={} d={} | s={} fy={:.2} | YES={} NO={} | T-{:.0}s",
+                    slug, open_str, cl_str, bn_str, delta_str, sigma_str, fy,
                     pm_yes_str, pm_no_str, secs_left
                 ));
             }
 
             if !lines.is_empty() {
                 lines.sort();
-                info!("─── SCAN ─────────────────────────────────────────────────────");
+                info!("--- SCAN ----------------------------------------------------------");
                 for line in &lines {
                     info!("{}", line);
                 }
-                info!("══════════════════════════════════════════════════════════════");
+                info!("===================================================================");
             }
         }
 
-        // ── Stats (every 60s) ────────────────────────────────────────────
+        // -- Stats (every 60s) ------------------------------------------------
 
         if now - last_stats_ts >= 60.0 {
             last_stats_ts = now;
             let active = markets.iter().filter(|(s, _)| !settled.contains_key(s.as_str())).count();
             info!(
-                "[SCANNER] signals={} settlements={} markets={} settled={} books={} | http://0.0.0.0:{}",
+                "[SCANNER] signals={} settles={} cl_ticks={} bn_ticks={} markets={} books={} | http://0.0.0.0:{}",
                 signal_count.load(Ordering::Relaxed),
                 settle_count.load(Ordering::Relaxed),
-                active, settled.len(), book_state.len(),
+                cl_tick_count.load(Ordering::Relaxed),
+                bn_tick_count.load(Ordering::Relaxed),
+                active, book_state.len(),
                 cfg.http.port
             );
         }
     }
 
     Ok(())
-}
-
-fn open_or_create(path: &str) -> std::io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
 }
