@@ -484,7 +484,11 @@ async fn connect_cl_feed(
     cl_prices:    &ClPrices,
     cl_snapshots: &ClSnapshots,
 ) -> Result<()> {
-    let (mut ws, _) = connect_async(live_ws).await.context("CL WS connect failed")?;
+    // Connect with 10s timeout to avoid hanging forever
+    let (mut ws, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_async(live_ws),
+    ).await.context("CL WS connect timed out")?.context("CL WS connect failed")?;
 
     let sub = serde_json::json!({
         "action": "subscribe",
@@ -502,9 +506,18 @@ async fn connect_cl_feed(
     let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    let mut last_data = tokio::time::Instant::now();
+    const STALE_TIMEOUT: Duration = Duration::from_secs(30);
+
     loop {
         tokio::select! {
             _ = ping_interval.tick() => {
+                // Check for stale feed — no price data in 30s means silent disconnect
+                if last_data.elapsed() > STALE_TIMEOUT {
+                    warn!("[CL] Feed stale — no price data for {:.0}s, forcing reconnect",
+                        last_data.elapsed().as_secs_f64());
+                    break;
+                }
                 ws.send(Message::Text(
                     serde_json::json!({"action":"ping"}).to_string().into()
                 )).await?;
@@ -518,6 +531,7 @@ async fn connect_cl_feed(
                         if text.contains("payload") {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                                 process_cl_message(&v, cl_prices, cl_snapshots);
+                                last_data = tokio::time::Instant::now();
                             }
                         }
                     }
@@ -846,10 +860,22 @@ async fn connect_bn_feed(
         .map(|a| format!("{}@aggTrade", bn_symbol(a)))
         .collect();
     let url = format!("{}/{}", bn_ws, streams.join("/"));
-    let (mut ws, _) = connect_async(&url).await.context("BN WS connect failed")?;
+    let (mut ws, _) = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_async(&url),
+    ).await.context("BN WS connect timed out")?.context("BN WS connect failed")?;
     info!("[BN] Connected, watching {} assets", assets.len());
 
+    let mut last_data = tokio::time::Instant::now();
+    const STALE_TIMEOUT: Duration = Duration::from_secs(30);
+
     while let Some(msg) = ws.next().await {
+        // Check for stale feed
+        if last_data.elapsed() > STALE_TIMEOUT {
+            warn!("[BN] Feed stale — no trade data for {:.0}s, forcing reconnect",
+                last_data.elapsed().as_secs_f64());
+            break;
+        }
         match msg {
             Ok(Message::Text(t)) => {
                 let d: serde_json::Value = match serde_json::from_str(&t) {
@@ -866,6 +892,7 @@ async fn connect_bn_feed(
 
                 if let (Some(asset), Some(price)) = (bn_asset(&sym), px) {
                     if price > 0.0 {
+                        last_data = tokio::time::Instant::now();
                         let is_new = !bn_prices.contains_key(asset);
                         bn_prices.insert(asset.to_string(), price);
                         if is_new {
