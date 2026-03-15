@@ -1,0 +1,22 @@
+[Unit]
+Description=Oracle Scanner V2 — Polymarket Data Capture
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/home/user/Poly/oracle-scanner-v2
+ExecStart=/home/user/Poly/oracle-scanner-v2/target/release/oracle_scanner_v2
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=oracle_scanner_v2=info
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/user/Poly/oracle-scanner-v2/data
+ProtectHome=false
+
+[Install]
+WantedBy=multi-user.target
