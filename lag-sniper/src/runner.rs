@@ -205,14 +205,26 @@ impl LagRunner {
 
             // ── Exit 2: TRAILING STOP ──────────────────────────────────
             // Activate once bid is 3c above entry. Trail by 1.5c.
+            // Also: if trail is active and we're near time exit, take profit now.
             let trail_activated = trail_high >= pos.entry_price + 0.03;
-            if trail_activated && exit_bid <= trail_high - 0.015 {
-                info!(
-                    "[LAG_RUNNER] TRAIL_STOP {} bid={:.3} high={:.3} drop={:.3} hold={:.1}s",
-                    pos.slug, exit_bid, trail_high, trail_high - exit_bid, hold_secs
-                );
-                self.exit_position(&trade_id, exit_bid, "TRAIL_STOP", now).await;
-                continue;
+            if trail_activated {
+                if exit_bid <= trail_high - 0.015 {
+                    info!(
+                        "[LAG_RUNNER] TRAIL_STOP {} bid={:.3} high={:.3} drop={:.3} hold={:.1}s",
+                        pos.slug, exit_bid, trail_high, trail_high - exit_bid, hold_secs
+                    );
+                    self.exit_position(&trade_id, exit_bid, "TRAIL_STOP", now).await;
+                    continue;
+                }
+                // Near time limit with active trail — don't let it time out, take profit
+                if hold_secs > self.config.max_hold_secs - 5.0 {
+                    info!(
+                        "[LAG_RUNNER] TRAIL_TIME {} bid={:.3} high={:.3} hold={:.1}s — taking profit before timeout",
+                        pos.slug, exit_bid, trail_high, hold_secs
+                    );
+                    self.exit_position(&trade_id, exit_bid, "TRAIL_STOP", now).await;
+                    continue;
+                }
             }
 
             // ── Exit 3: REVERSAL (with confirmation delay) ─────────────
