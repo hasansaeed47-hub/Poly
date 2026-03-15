@@ -408,7 +408,9 @@ impl ExecutionLayer {
     /// Maker chase entry: try GTC, chase N ticks at interval, then FAK taker.
     /// Returns the fill result from whichever method succeeds.
     ///
-    /// V6 FIX #7: Verify cancel before reposting to prevent double-fills.
+    /// Entry flow: maker chase 2 ticks → taker buy.
+    /// Try GTC maker at initial_price, chase up 2 ticks. If no maker fill,
+    /// cancel and take at current_price + 1 tick. Simple and fast.
     pub async fn maker_chase_entry(
         &self,
         token_id: &str,
@@ -416,122 +418,83 @@ impl ExecutionLayer {
         stake: f64,
         max_chase_ticks: u32,
         chase_interval_ms: u64,
-        best_ask: f64,
+        _best_ask: f64,          // unused — taker uses chase price + tick
     ) -> Result<FillResult> {
         let tick = 0.01_f64;
         let mut current_price = initial_price;
+        let mut last_oid: Option<String> = None;
 
-        // Step 1: Try GTC maker at initial price
-        match self.buy_gtc(token_id, current_price, stake).await {
-            Ok(result) => {
-                if result.filled {
-                    info!("[EXEC] Maker fill at {:.2} (immediate)", current_price);
-                    return Ok(result);
-                }
-                // Order is live but not filled — need to chase
-                let mut last_oid = result.order_id.clone();
-                let mut cancel_failed = false;
+        // ── Phase 1: Maker chase (up to max_chase_ticks) ─────────────────
+        for attempt in 0..=max_chase_ticks {
+            if current_price <= 0.0 || current_price >= 0.90 {
+                break;
+            }
 
-                // Step 2: Chase N ticks
-                for tick_num in 1..=max_chase_ticks {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(chase_interval_ms)).await;
-
-                    // V6 FIX #7: Verify cancel succeeded before reposting
-                    match self.cancel_order(&last_oid).await {
-                        Ok(_) => {
-                            // Cancel confirmed — safe to repost at new price
-                        }
-                        Err(e) => {
-                            // Cancel failed — order may have been filled already.
-                            // Do NOT repost and do NOT fall through to taker.
-                            warn!("[EXEC] Cancel failed for {}: {} — order may be filled", last_oid, e);
-                            cancel_failed = true;
-                            break;
-                        }
-                    }
-
-                    // Chase up by one tick (but stay below best ask to remain maker)
-                    current_price = (current_price + tick).min(best_ask - tick);
-                    if current_price <= 0.0 || current_price >= 1.0 {
-                        break;
-                    }
-
-                    info!("[EXEC] Chase tick {}/{}: price={:.2}", tick_num, max_chase_ticks, current_price);
-
-                    match self.buy_gtc(token_id, current_price, stake).await {
-                        Ok(r) if r.filled => {
-                            info!("[EXEC] Maker fill at {:.2} (chase tick {})", current_price, tick_num);
-                            return Ok(r);
-                        }
-                        Ok(r) => {
-                            // Still not filled — update tracked order ID for next cancel
-                            last_oid = r.order_id.clone();
-                        }
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            if err_str.starts_with("CROSS:") {
-                                // We've caught up to the ask — fall through to taker
-                                break;
-                            }
-                            warn!("[EXEC] Chase order error: {}", err_str);
-                            break;
-                        }
-                    }
-                }
-
-                // If cancel failed, the order may already be filled — do NOT place taker
-                if cancel_failed {
-                    return Err(anyhow!("Chase aborted: cancel failed, order may be filled"));
-                }
-
-                // Cancel the last outstanding maker order before taker attempt
-                match self.cancel_order(&last_oid).await {
+            // Cancel previous maker order before reposting
+            if let Some(ref oid) = last_oid {
+                match self.cancel_order(oid).await {
                     Ok(_) => {}
                     Err(e) => {
-                        // Last cancel failed — order may have filled during chase.
-                        // Do NOT proceed to taker to avoid double position.
-                        warn!("[EXEC] Final chase cancel failed: {} — aborting taker", e);
-                        return Err(anyhow!("Chase aborted: final cancel failed, order may be filled"));
+                        // Cancel failed — previous order may have filled
+                        warn!("[EXEC] Cancel failed for {}: {} — may be filled", oid, e);
+                        return Err(anyhow!("Chase cancel failed: order may be filled"));
                     }
                 }
+            }
 
-                // Step 3: Fall through to taker using current chase price + 1 tick
-                // (best_ask passed from runner may be stale after chase loop)
-                let taker_price = (current_price + tick).min(0.90);
-                if taker_price <= current_price || taker_price > 0.90 {
-                    return Err(anyhow!("Taker price {:.2} out of range after chase, aborting", taker_price));
+            if attempt > 0 {
+                info!("[EXEC] Chase tick {}/{}: price={:.2}", attempt, max_chase_ticks, current_price);
+            }
+
+            match self.buy_gtc(token_id, current_price, stake).await {
+                Ok(r) if r.filled => {
+                    info!("[EXEC] Maker fill at {:.2} (attempt {})", current_price, attempt);
+                    return Ok(r);
                 }
-                info!("[EXEC] Maker chase exhausted, taker fill at {:.2} (chase was {:.2})", taker_price, current_price);
-                match self.buy_fak(token_id, taker_price, stake).await {
-                    Ok(r) => Ok(r),
-                    Err(e) if e.to_string().contains("no orders found to match") => {
-                        // Ask-side liquidity pulled — retry once at +1 more tick
-                        let retry_price = (taker_price + tick).min(0.90);
-                        warn!("[EXEC] FAK no match at {:.2}, retry at {:.2}", taker_price, retry_price);
-                        self.buy_fak(token_id, retry_price, stake).await
+                Ok(r) => {
+                    last_oid = Some(r.order_id.clone());
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.starts_with("CROSS:") {
+                        // Crossed the spread — go straight to taker
+                        break;
                     }
-                    Err(e) => Err(e),
+                    return Err(e);
                 }
             }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.starts_with("CROSS:") {
-                    // Price already at/above ask — taker at initial_price (freshest)
-                    let taker_price = initial_price.min(0.90);
-                    info!("[EXEC] Cross on first try, taker at {:.2}", taker_price);
-                    match self.buy_fak(token_id, taker_price, stake).await {
-                        Ok(r) => Ok(r),
-                        Err(e2) if e2.to_string().contains("no orders found to match") => {
-                            let retry_price = (taker_price + tick).min(0.90);
-                            warn!("[EXEC] FAK no match at {:.2}, retry at {:.2}", taker_price, retry_price);
-                            self.buy_fak(token_id, retry_price, stake).await
-                        }
-                        Err(e2) => Err(e2),
-                    }
-                } else {
-                    Err(e)
+
+            // Wait before next chase tick (skip wait on last tick — we'll taker next)
+            if attempt < max_chase_ticks {
+                tokio::time::sleep(tokio::time::Duration::from_millis(chase_interval_ms)).await;
+                current_price += tick;
+            }
+        }
+
+        // ── Phase 2: Cancel remaining maker, switch to taker ─────────────
+        if let Some(ref oid) = last_oid {
+            match self.cancel_order(oid).await {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!("[EXEC] Final cancel failed: {} — may be filled", e);
+                    return Err(anyhow!("Taker aborted: final cancel failed, order may be filled"));
                 }
             }
+        }
+
+        // Taker at chase price + 1 tick (sweep one level above last maker)
+        let taker_price = (current_price + tick).min(0.90);
+        info!("[EXEC] Taker buy at {:.2} (maker chase ended at {:.2})", taker_price, current_price);
+
+        match self.buy_fak(token_id, taker_price, stake).await {
+            Ok(r) => Ok(r),
+            Err(e) if e.to_string().contains("no orders found to match") => {
+                // Ask pulled — retry once at +1 more tick
+                let retry_price = (taker_price + tick).min(0.90);
+                warn!("[EXEC] No match at {:.2}, retry taker at {:.2}", taker_price, retry_price);
+                self.buy_fak(token_id, retry_price, stake).await
+            }
+            Err(e) => Err(e),
         }
     }
 
