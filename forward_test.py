@@ -1,135 +1,120 @@
 #!/usr/bin/env python3
 """
-Forward Test: Oracle Scanner V2 Settlements → CL Sniper 5-Engine Simulation
+CL Sniper Forward Test — Full Production Config on 15-Mar Data
 
-Reads settlements_2026-03-15.jsonl (actual market outcomes from scanner v2 data capture)
-and simulates what the 5-engine sniper would have traded and earned.
+Replays the exact production system (all 5 engines, exact parameters from
+cl-sniper-strategy-final.md / build-sniper-10mar.md) against captured data.
 
-Runs THREE scenarios:
-  1. ORIGINAL: Production config (B=0.15%, E=0.95-0.975)
-  2. TUNED:    B=0.12%, E=0.93-0.98
-  3. REALISTIC: Tuned + maker fill probability + taker slippage + fees
+Data sources:
+  - settlements_2026-03-15.jsonl: 69 settlement outcomes
+  - scanner.log: ~765 book snapshots (CL + BN + book prices, ~60s cadence)
 
-Fill model (REALISTIC):
-  - Maker fill probability: 60% (from Hydra paper trading data)
-  - Failed maker → taker fallback at ask + SLIP (0.5%)
-  - Taker fee: pm_fee(fill_px) per share (maker = 0%)
-  - Book depth: require ask size >= STAKE / ask_px (approximated)
+Engine config (production):
+  A: 5m sniper,  δ≥0.04%, cont=4, entry [0.88,0.98], T-57..44
+  B: 5m D1,      δ≥0.15%, cont=0, entry [0.88,0.98], T-57..44
+  C: 15m sniper, δ≥0.04%, cont=4, entry [0.88,0.98], T-57..44
+  D: 15m D1,     δ≥0.15%, cont=0, entry [0.88,0.98], T-57..44
+  E: late scalp, book 0.95-0.975, T-25..3
 
-Also parses scanner.log for book snapshots to get real book prices at entry time.
+Limitations with 60s-cadence scanner data:
+  - Continuity (500ms ticks) cannot be measured → simulate with delta persistence
+  - Late scalper (T-25..3) has no snapshots → skip Engine E
+  - BN contra / CL fade filters need 10-15s trend → approximate from consecutive snaps
+  - One snapshot per entry window (sometimes 2) → use what we have
+
+The test uses ENTRY-TIME direction (not final outcome) to simulate what the
+bot would actually see and decide at trade time.
 """
 
 import json
 import re
 import sys
 from collections import defaultdict
-from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional
 
-# ── Engine Parameters (matching config.toml / cl-sniper-10mar) ──────────────
+# ── Constants ─────────────────────────────────────────────────────────────────
 
 STAKE = 5.0
-MAX_DD = 50.0
-SLIP = 0.005  # taker slippage
-MAKER_FILL_PROB = 0.60  # from Hydra paper trading
+SLIP = 0.005
+MAKER_DISCOUNT = 0.01  # maker posts at ask - 0.01
 
 STDEV = {"btc": 0.167, "eth": 0.194, "sol": 0.247, "xrp": 0.440}
 STDEV_BASE = 0.167
 
-MIN_DELTA = {"btc": 0.015, "eth": 0.020, "sol": 0.030, "xrp": 0.050}
+MIN_DELTA_FLOOR = {"btc": 0.015, "eth": 0.020, "sol": 0.030, "xrp": 0.050}
 
 
-def stdev_scale(asset: str) -> float:
+def stdev_scale(asset):
     return STDEV.get(asset, STDEV_BASE) / STDEV_BASE
 
 
-def pm_fee(px: float) -> float:
+def pm_fee(px):
+    """Polymarket taker fee: px * (1-px) * 0.0625"""
     return px * (1.0 - px) * 0.0625
 
+
+# ── Engine Config ─────────────────────────────────────────────────────────────
 
 @dataclass
 class EngineConfig:
     id: str
-    tf: int  # 5, 15, or 0 (both)
-    delta: float  # % threshold (pre-scaling)
-    continuity: int
-    bn_contra: bool
-    cl_fade: bool
-    regime: bool
-    is_late_scalper: bool
-    entry_start: int  # max secs_left
-    taker_deadline: int  # min secs_left
-    min_entry: float
-    max_entry: float
-
-    def scaled_delta(self, asset: str) -> float:
-        return self.delta * stdev_scale(asset)
+    name: str
+    tf: int              # 5 or 15 (0 = both, for E)
+    delta: float         # min delta threshold (base, before stdev scaling)
+    continuity: int      # ticks of sustained delta (4 = 2s in production)
+    min_entry: float     # min ask to enter
+    max_entry: float     # max ask to enter
+    entry_start: int     # secs_left earliest (57)
+    entry_end: int       # secs_left latest (44)
+    bn_contra: bool      # BN trend filter
+    cl_fade: bool        # CL trend filter
+    regime_check: bool   # hourly vol filter
+    is_late_scalper: bool = False
 
 
-def make_engines_original():
-    return [
-        EngineConfig("A", 5, 0.04, 4, True, True, True, False, 57, 44, 0.88, 0.98),
-        EngineConfig("B", 5, 0.15, 0, True, True, True, False, 57, 44, 0.88, 0.98),
-        EngineConfig("C", 15, 0.04, 4, True, True, True, False, 57, 44, 0.88, 0.98),
-        EngineConfig("D", 15, 0.15, 0, True, True, True, False, 57, 44, 0.88, 0.98),
-        EngineConfig("E", 0, 0.0, 0, False, False, False, True, 25, 3, 0.95, 0.975),
-    ]
+PRODUCTION_ENGINES = [
+    EngineConfig("A", "5M_SNIPER",    5,  0.04, 4, 0.88, 0.98, 57, 44, True, True, True),
+    EngineConfig("B", "5M_D1",        5,  0.15, 0, 0.88, 0.98, 57, 44, True, True, True),
+    EngineConfig("C", "15M_SNIPER",  15,  0.04, 4, 0.88, 0.98, 57, 44, True, True, True),
+    EngineConfig("D", "15M_D1",      15,  0.15, 0, 0.88, 0.98, 57, 44, True, True, True),
+    EngineConfig("E", "LATE_SCALPER", 0,  0.00, 0, 0.95, 0.975, 25, 3, False, False, False,
+                 is_late_scalper=True),
+]
 
 
-def make_engines_tuned():
-    return [
-        EngineConfig("A", 5, 0.04, 4, True, True, True, False, 57, 44, 0.88, 0.98),
-        EngineConfig("B", 5, 0.12, 0, True, True, True, False, 57, 44, 0.88, 0.98),  # 0.15 → 0.12
-        EngineConfig("C", 15, 0.04, 4, True, True, True, False, 57, 44, 0.88, 0.98),
-        EngineConfig("D", 15, 0.15, 0, True, True, True, False, 57, 44, 0.88, 0.98),
-        EngineConfig("E", 0, 0.0, 0, False, False, False, True, 25, 3, 0.93, 0.98),  # 0.95-0.975 → 0.93-0.98
-    ]
-
+# ── Parse scanner.log ─────────────────────────────────────────────────────────
 
 @dataclass
-class Trade:
-    engine: str
+class Snapshot:
     slug: str
     asset: str
     tf: int
-    direction: str
-    fill_px: float
-    shares: float
-    entry_fee: float
-    outcome: str  # YES or NO
-    pnl: float
-    exit_reason: str  # WIN, LOSS
-    fill_type: str = "maker"  # maker or taker
+    secs_left: int
+    cl_open: float
+    cl_now: float
+    bn_now: float
+    delta_pct: float
+    sigma_pct: float
+    fy: float
+    yes_bid: float
+    yes_ask: float
+    no_bid: float
+    no_ask: float
+    timestamp: str = ""
 
 
-@dataclass
-class EngineStats:
-    wins: int = 0
-    losses: int = 0
-    sl_count: int = 0
-    pnl: float = 0.0
-    trades: list = field(default_factory=list)
-    maker_fills: int = 0
-    taker_fills: int = 0
+def parse_scanner_log(log_path):
+    """Parse scanner.log into per-slug snapshot lists."""
+    snapshots = defaultdict(list)
 
-    @property
-    def total(self):
-        return self.wins + self.losses + self.sl_count
-
-    @property
-    def wr(self):
-        return (self.wins / self.total * 100.0) if self.total > 0 else 0.0
-
-
-# ── Parse scanner.log for book prices ───────────────────────────────────────
-
-def parse_scanner_log(log_path: str) -> dict:
-    """Extract book snapshots from scanner.log."""
-    books = defaultdict(list)
+    # Strip ANSI escape codes
+    ansi_re = re.compile(r'\x1b\[[0-9;]*m')
 
     scan_re = re.compile(
-        r'\s+(\S+-updown-\d+m-\d+)\s+\|'
+        r'(\d{4}-\d{2}-\d{2}T[\d:.]+Z)\s+\w+\s+'
+        r'(\S+-updown-(\d+)m-\d+)\s+\|'
         r'\s+open=([\d.]+)\s+cl=([\d.]+)\s+bn=([\d.]+)'
         r'\s+d=([+-]?[\d.]+)%'
         r'\s+\|\s+s=([\d.]+)%\s+fy=([\d.]+)'
@@ -137,466 +122,758 @@ def parse_scanner_log(log_path: str) -> dict:
         r'\s+\|\s+T-(\d+)s'
     )
 
-    path = Path(log_path)
-    if not path.exists():
-        return books
-
-    with open(path, 'r') as f:
+    with open(log_path) as f:
         for line in f:
+            line = ansi_re.sub('', line)
             m = scan_re.search(line)
-            if m:
-                slug = m.group(1)
-                secs_left = int(m.group(12))
-
-                def parse_px(s):
-                    try:
-                        return float(s)
-                    except ValueError:
-                        return 0.0
-
-                books[slug].append({
-                    "secs_left": secs_left,
-                    "cl_now": float(m.group(3)),
-                    "delta_pct": float(m.group(5)),
-                    "fy": float(m.group(7)),
-                    "yes_bid": parse_px(m.group(8)),
-                    "yes_ask": parse_px(m.group(9)),
-                    "no_bid": parse_px(m.group(10)),
-                    "no_ask": parse_px(m.group(11)),
-                })
-
-    return books
-
-
-def get_entry_snapshot(book_data: list, entry_start: int, taker_deadline: int):
-    """Find best book snapshot in the entry window."""
-    candidates = [
-        snap for snap in book_data
-        if taker_deadline <= snap["secs_left"] <= entry_start
-    ]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda s: abs(s["secs_left"] - entry_start))
-
-
-# ── Deterministic fill seed (reproducible "randomness" per trade) ───────────
-
-def fill_hash(slug: str, engine_id: str) -> float:
-    """Deterministic 0.0-1.0 value per (slug, engine) for fill simulation."""
-    h = hash((slug, engine_id)) & 0xFFFFFFFF
-    return (h % 1000) / 1000.0
-
-
-# ── Forward test logic ──────────────────────────────────────────────────────
-
-def simulate_engine(
-    eng: EngineConfig,
-    settlement: dict,
-    book_data: list,
-    realistic: bool = False,
-) -> Trade | None:
-    """Simulate whether an engine would have entered and what the P&L would be."""
-
-    asset = settlement["asset"]
-    tf = settlement["tf"]
-    pct_move = abs(settlement["pct_move"])
-    outcome = settlement["outcome"]
-
-    # Skip stale-CL windows (0% move = CL feed was dead)
-    if settlement["pct_move"] == 0.0:
-        return None
-
-    # Timeframe filter
-    if eng.tf != 0 and tf != eng.tf:
-        return None
-
-    snap = get_entry_snapshot(book_data, eng.entry_start, eng.taker_deadline)
-
-    if eng.is_late_scalper:
-        snap = get_entry_snapshot(book_data, eng.entry_start, eng.taker_deadline)
-        if snap is None:
-            return None
-
-        if pct_move < MIN_DELTA.get(asset, 0.020):
-            return None
-
-        direction = "UP" if settlement["pct_move"] > 0 else "DOWN"
-        best_ask = snap["yes_ask"] if direction == "UP" else snap["no_ask"]
-
-        if best_ask < eng.min_entry or best_ask > eng.max_entry or best_ask <= 0:
-            return None
-
-    else:
-        # Engines A-D: delta-based
-        if snap is None:
-            if pct_move < eng.scaled_delta(asset):
-                return None
-            if pct_move < MIN_DELTA.get(asset, 0.020):
-                return None
-            snap = None
-        else:
-            delta = abs(snap["delta_pct"])
-            if delta < eng.scaled_delta(asset):
-                return None
-            if delta < MIN_DELTA.get(asset, 0.020):
-                return None
-
-        direction = "UP" if settlement["pct_move"] > 0 else "DOWN"
-
-        if snap:
-            best_ask = snap["yes_ask"] if direction == "UP" else snap["no_ask"]
-            if best_ask < eng.min_entry or best_ask > eng.max_entry or best_ask <= 0:
-                return None
-        else:
-            estimated_fair = min(0.50 + pct_move * 5.0, 0.98)
-            best_ask = max(estimated_fair - 0.02, eng.min_entry)
-            if best_ask > eng.max_entry:
-                return None
-
-    # ── Fill simulation ─────────────────────────────────────────────────────
-
-    maker_px = max(round((best_ask - 0.01) * 100) / 100, eng.min_entry)
-
-    if realistic:
-        # Deterministic fill simulation
-        roll = fill_hash(settlement["slug"], eng.id)
-        if roll < MAKER_FILL_PROB:
-            # Maker fill — 0% fee
-            fill_px = maker_px
-            fill_type = "maker"
-            entry_fee = 0.0
-        else:
-            # Taker fallback — pay fee + slippage
-            taker_px = min(best_ask + SLIP, 0.99)
-            if taker_px > eng.max_entry:
-                return None
-            fill_px = taker_px
-            fill_type = "taker"
-            shares_pre = STAKE / fill_px
-            entry_fee = pm_fee(fill_px) * shares_pre
-    else:
-        # Optimistic: assume maker fill always
-        fill_px = maker_px
-        fill_type = "maker"
-        entry_fee = 0.0
-
-    shares = STAKE / fill_px
-
-    # ── P&L calculation ─────────────────────────────────────────────────────
-
-    won = (direction == "UP" and outcome == "YES") or (direction == "DOWN" and outcome == "NO")
-
-    if won:
-        # WIN: shares settle at $1.00 each, minus stake, minus entry fee
-        pnl = shares * 1.0 - STAKE - entry_fee
-        exit_reason = "WIN"
-    else:
-        # LOSS: lose stake + entry fee
-        pnl = -STAKE - entry_fee
-        exit_reason = "LOSS"
-
-    return Trade(
-        engine=eng.id,
-        slug=settlement["slug"],
-        asset=asset,
-        tf=tf,
-        direction=direction,
-        fill_px=fill_px,
-        shares=shares,
-        entry_fee=entry_fee,
-        outcome=outcome,
-        pnl=pnl,
-        exit_reason=exit_reason,
-        fill_type=fill_type,
-    )
-
-
-def run_scenario(
-    name: str,
-    engines: list[EngineConfig],
-    settlements: list[dict],
-    book_data: dict,
-    realistic: bool = False,
-) -> tuple[float, list[Trade]]:
-    """Run one scenario and print results."""
-
-    print(f"\n{'=' * 72}")
-    print(f"  SCENARIO: {name}")
-    if realistic:
-        print(f"  Fill model: {MAKER_FILL_PROB*100:.0f}% maker (0% fee), "
-              f"{(1-MAKER_FILL_PROB)*100:.0f}% taker (+{SLIP*100:.1f}% slip + PM fee)")
-    else:
-        print(f"  Fill model: 100% maker assumed (0% fee, no slippage)")
-    print("=" * 72)
-
-    engine_stats: dict[str, EngineStats] = {e.id: EngineStats() for e in engines}
-    all_trades: list[Trade] = []
-    cum_pnl = 0.0
-    halted = False
-
-    for settlement in settlements:
-        slug = settlement["slug"]
-        books = book_data.get(slug, [])
-
-        for eng in engines:
-            if halted:
-                break
-
-            stats = engine_stats[eng.id]
-            trade = simulate_engine(eng, settlement, books, realistic=realistic)
-
-            if trade is None:
+            if not m:
                 continue
 
-            stats.trades.append(trade)
-            if trade.exit_reason == "WIN":
-                stats.wins += 1
+            def px(s):
+                try:
+                    return float(s)
+                except:
+                    return 0.0
+
+            slug = m.group(2)
+            asset = slug.split("-")[0]
+            tf = int(m.group(3))
+
+            snap = Snapshot(
+                slug=slug, asset=asset, tf=tf,
+                secs_left=int(m.group(14)),
+                cl_open=float(m.group(4)),
+                cl_now=float(m.group(5)),
+                bn_now=float(m.group(6)),
+                delta_pct=float(m.group(7)),
+                sigma_pct=float(m.group(8)),
+                fy=float(m.group(9)),
+                yes_bid=px(m.group(10)),
+                yes_ask=px(m.group(11)),
+                no_bid=px(m.group(12)),
+                no_ask=px(m.group(13)),
+                timestamp=m.group(1),
+            )
+            snapshots[slug].append(snap)
+
+    # Sort each slug's snapshots by secs_left descending (earlier → later)
+    for slug in snapshots:
+        snapshots[slug].sort(key=lambda s: -s.secs_left)
+
+    return snapshots
+
+
+# ── Parse settlements ─────────────────────────────────────────────────────────
+
+@dataclass
+class Settlement:
+    slug: str
+    asset: str
+    tf: int
+    pct_move: float
+    outcome: str  # YES or NO
+    cl_open: float
+    cl_close: float
+    bn_close: float
+    window_start: int
+    window_end: int
+
+
+def parse_settlements(path):
+    settlements = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            settlements.append(Settlement(
+                slug=d["slug"],
+                asset=d["asset"],
+                tf=d["tf"],
+                pct_move=d["pct_move"],
+                outcome=d["outcome"],
+                cl_open=d["open_price"],
+                cl_close=d["cl_close"],
+                bn_close=d["bn_close"],
+                window_start=d["window_start"],
+                window_end=d["window_end"],
+            ))
+    return settlements
+
+
+# ── Trade Decision Engine ─────────────────────────────────────────────────────
+
+@dataclass
+class Trade:
+    engine_id: str
+    engine_name: str
+    slug: str
+    asset: str
+    tf: int
+    direction: str       # UP or DOWN at entry time
+    fill_px: float
+    fill_method: str     # maker or taker
+    shares: float
+    fee: float
+    outcome: str         # YES or NO (settlement)
+    won: bool
+    pnl: float           # net P&L including fees
+    delta_at_entry: float
+    ask_at_entry: float
+    secs_left: int
+    reason: str = ""     # why this trade fired
+
+
+@dataclass
+class Skip:
+    engine_id: str
+    slug: str
+    reason: str
+    delta: float = 0.0
+    ask: float = 0.0
+    secs_left: int = 0
+
+
+def evaluate_engine(engine: EngineConfig, settlement: Settlement,
+                    snaps: list, all_snaps_map: dict = None) -> tuple:
+    """Evaluate whether an engine would trade this window, and the result."""
+
+    skips = []
+    slug = settlement.slug
+    asset = settlement.asset
+
+    # ── Timeframe filter ──────────────────────────────────────────────────
+    if engine.tf != 0 and settlement.tf != engine.tf:
+        return None, []
+
+    # ── Get snapshots in entry window ─────────────────────────────────────
+    entry_snaps = [s for s in snaps if engine.entry_end <= s.secs_left <= engine.entry_start]
+
+    if not entry_snaps:
+        skips.append(Skip(engine.id, slug, "NO_ENTRY_SNAP"))
+        return None, skips
+
+    # ── Late scalper: pure book-price engine ──────────────────────────────
+    if engine.is_late_scalper:
+        # E enters based on which side has ask ≥ 0.95
+        for snap in entry_snaps:
+            if snap.yes_ask >= 0.95 and snap.yes_ask <= engine.max_entry:
+                direction = "UP"
+                ask = snap.yes_ask
+            elif snap.no_ask >= 0.95 and snap.no_ask <= engine.max_entry:
+                direction = "DOWN"
+                ask = snap.no_ask
             else:
-                stats.losses += 1
-            if trade.fill_type == "maker":
-                stats.maker_fills += 1
+                skips.append(Skip(engine.id, slug,
+                    f"E_NO_SIDE_0.95 yes_ask={snap.yes_ask:.3f} no_ask={snap.no_ask:.3f}",
+                    secs_left=snap.secs_left))
+                continue
+
+            # Fill
+            maker_px = max(round((ask - MAKER_DISCOUNT) * 100) / 100, engine.min_entry)
+            fill_px = maker_px
+            fill_method = "maker"
+
+            if fill_px < engine.min_entry or fill_px > engine.max_entry:
+                skips.append(Skip(engine.id, slug,
+                    f"E_PRICE_OOB fill={fill_px:.3f}", ask=ask))
+                continue
+
+            shares = STAKE / fill_px
+            won = (direction == "UP" and settlement.outcome == "YES") or \
+                  (direction == "DOWN" and settlement.outcome == "NO")
+
+            if won:
+                pnl = shares * 1.0 - STAKE  # settle at $1
             else:
-                stats.taker_fills += 1
-            stats.pnl += trade.pnl
-            cum_pnl += trade.pnl
-            all_trades.append(trade)
+                sl_px = fill_px * 0.50
+                recovery = shares * max(sl_px - SLIP, 0)
+                pnl = recovery - STAKE
 
-            if cum_pnl <= -MAX_DD:
-                print(f"\n  KILL SWITCH at cum=${cum_pnl:+.2f} (max DD=${MAX_DD})")
-                halted = True
-                break
+            return Trade(
+                engine_id=engine.id, engine_name=engine.name,
+                slug=slug, asset=asset, tf=settlement.tf,
+                direction=direction, fill_px=fill_px,
+                fill_method=fill_method, shares=shares, fee=0.0,
+                outcome=settlement.outcome, won=won, pnl=pnl,
+                delta_at_entry=abs(snap.delta_pct),
+                ask_at_entry=ask, secs_left=snap.secs_left,
+                reason=f"E: {direction} ask={ask:.3f}"
+            ), skips
 
-    # ── Summary table ────────────────────────────────────────────────────────
+        return None, skips
 
-    if realistic:
-        print(f"\n{'Engine':<8} {'Trades':>6} {'W':>4} {'L':>4} {'WR':>7} {'P&L':>10} "
-              f"{'Maker':>6} {'Taker':>6} {'Fees':>8}")
-        print("-" * 76)
-        for eng in engines:
-            s = engine_stats[eng.id]
-            fees = sum(t.entry_fee for t in s.trades)
-            print(f"  {eng.id:<6} {s.total:>6} {s.wins:>4} {s.losses:>4} {s.wr:>6.1f}% "
-                  f"${s.pnl:>+8.2f} {s.maker_fills:>5}M {s.taker_fills:>5}T ${fees:>+7.4f}")
-    else:
-        print(f"\n{'Engine':<8} {'Trades':>6} {'W':>4} {'L':>4} {'WR':>7} {'P&L':>10} {'Avg P&L':>10}")
-        print("-" * 60)
-        for eng in engines:
-            s = engine_stats[eng.id]
-            avg = s.pnl / s.total if s.total > 0 else 0.0
-            print(f"  {eng.id:<6} {s.total:>6} {s.wins:>4} {s.losses:>4} {s.wr:>6.1f}% "
-                  f"${s.pnl:>+8.2f} ${avg:>+8.4f}")
+    # ── Delta-based engines (A-D) ─────────────────────────────────────────
 
-    total_trades = sum(s.total for s in engine_stats.values())
-    total_wins = sum(s.wins for s in engine_stats.values())
-    total_losses = sum(s.losses for s in engine_stats.values())
-    total_wr = (total_wins / total_trades * 100) if total_trades > 0 else 0
+    # Stdev-scaled threshold
+    scaled_delta = engine.delta * stdev_scale(asset)
+    min_delta = MIN_DELTA_FLOOR.get(asset, 0.015)
 
-    print("-" * 76 if realistic else "-" * 60)
-    print(f"  {'TOTAL':<6} {total_trades:>6} {total_wins:>4} {total_losses:>4} "
-          f"{total_wr:>6.1f}% ${cum_pnl:>+8.2f}")
+    # Find best qualifying snapshot in entry window
+    for snap in sorted(entry_snaps, key=lambda s: -abs(s.delta_pct)):
+        abs_delta = abs(snap.delta_pct)
 
-    # ── Trade log ────────────────────────────────────────────────────────────
-
-    print(f"\n  TRADE LOG:")
-    for eng in engines:
-        s = engine_stats[eng.id]
-        if not s.trades:
-            print(f"    [{eng.id}] No trades")
+        # Delta threshold check
+        if abs_delta < scaled_delta:
+            skips.append(Skip(engine.id, slug,
+                f"DELTA_LOW |d|={abs_delta:.4f}% < thresh={scaled_delta:.4f}%",
+                delta=abs_delta, secs_left=snap.secs_left))
             continue
-        print(f"    [{eng.id}] {s.total} trades, {s.wins}W/{s.losses}L, "
-              f"WR={s.wr:.1f}%, P&L=${s.pnl:+.2f}")
-        for t in s.trades:
-            tag = "WIN " if t.exit_reason == "WIN" else "LOSS"
-            ft = "M" if t.fill_type == "maker" else "T"
-            fee_str = f" fee=${t.entry_fee:.4f}" if t.entry_fee > 0 else ""
-            print(f"      {tag} {t.asset:>3} {t.tf:>2}m {t.direction:>4} "
-                  f"@{t.fill_px:.3f}({ft}) -> ${t.pnl:+.4f}{fee_str}  {t.slug}")
 
-    # ── Breakdown ────────────────────────────────────────────────────────────
+        # Min delta floor (noise filter)
+        if abs_delta < min_delta:
+            skips.append(Skip(engine.id, slug,
+                f"DELTA_NOISE |d|={abs_delta:.4f}% < floor={min_delta:.3f}%",
+                delta=abs_delta, secs_left=snap.secs_left))
+            continue
 
-    if all_trades:
-        print(f"\n  By direction:")
-        for d in ["UP", "DOWN"]:
-            dt = [t for t in all_trades if t.direction == d]
-            if dt:
-                dw = sum(1 for t in dt if t.exit_reason == "WIN")
-                dp = sum(t.pnl for t in dt)
-                print(f"    {d:>4}: {len(dt)} trades, {dw}W, "
-                      f"WR={dw/len(dt)*100:.1f}%, P&L=${dp:+.2f}")
+        # Direction from CL delta at entry time
+        direction = "UP" if snap.delta_pct > 0 else "DOWN"
 
-        print(f"\n  By asset:")
-        for asset in sorted(set(t.asset for t in all_trades)):
-            at = [t for t in all_trades if t.asset == asset]
-            wins = sum(1 for t in at if t.exit_reason == "WIN")
-            pnl = sum(t.pnl for t in at)
-            print(f"    {asset:>3}: {len(at)} trades, {wins}W, "
-                  f"WR={wins/len(at)*100:.1f}%, P&L=${pnl:+.2f}")
+        # Book price for our direction
+        if direction == "UP":
+            ask = snap.yes_ask
+            our_bid = snap.yes_bid
+        else:
+            ask = snap.no_ask
+            our_bid = snap.no_bid
 
-        print(f"\n  By timeframe:")
-        for tf in sorted(set(t.tf for t in all_trades)):
-            tt = [t for t in all_trades if t.tf == tf]
-            wins = sum(1 for t in tt if t.exit_reason == "WIN")
-            pnl = sum(t.pnl for t in tt)
-            print(f"    {tf:>2}m: {len(tt)} trades, {wins}W, "
-                  f"WR={wins/len(tt)*100:.1f}%, P&L=${pnl:+.2f}")
+        if ask <= 0:
+            skips.append(Skip(engine.id, slug,
+                f"NO_ASK dir={direction}", delta=abs_delta, secs_left=snap.secs_left))
+            continue
 
-        avg_fill = sum(t.fill_px for t in all_trades) / len(all_trades)
-        print(f"\n  Avg fill price: {avg_fill:.3f}")
+        # Entry price range
+        if ask < engine.min_entry:
+            skips.append(Skip(engine.id, slug,
+                f"ASK_LOW ask={ask:.3f} < min={engine.min_entry:.2f}",
+                delta=abs_delta, ask=ask, secs_left=snap.secs_left))
+            continue
 
-    return cum_pnl, all_trades
+        if ask > engine.max_entry:
+            skips.append(Skip(engine.id, slug,
+                f"ASK_HIGH ask={ask:.3f} > max={engine.max_entry:.2f}",
+                delta=abs_delta, ask=ask, secs_left=snap.secs_left))
+            continue
+
+        # ── Continuity check (approximate) ────────────────────────────────
+        if engine.continuity > 0:
+            # With 60s snapshots we can't measure 500ms continuity.
+            # Check if direction is consistent across available entry snaps.
+            # This is WEAKER than production (4 × 500ms ticks).
+            same_dir_count = sum(
+                1 for s in entry_snaps
+                if (s.delta_pct > 0) == (snap.delta_pct > 0)
+                and abs(s.delta_pct) >= scaled_delta
+            )
+            if same_dir_count < 1:
+                skips.append(Skip(engine.id, slug,
+                    f"CONTINUITY_FAIL dir_snaps={same_dir_count}",
+                    delta=abs_delta, secs_left=snap.secs_left))
+                continue
+
+        # ── BN contra filter ──────────────────────────────────────────────
+        if engine.bn_contra:
+            # Approximate: BN vs CL-open direction
+            bn_vs_cl_open = (snap.bn_now - snap.cl_open) / snap.cl_open * 100
+            if direction == "UP" and bn_vs_cl_open < -0.02:
+                skips.append(Skip(engine.id, slug,
+                    f"BN_CONTRA UP but bn_trend={bn_vs_cl_open:+.4f}%",
+                    delta=abs_delta, secs_left=snap.secs_left))
+                continue
+            if direction == "DOWN" and bn_vs_cl_open > 0.02:
+                skips.append(Skip(engine.id, slug,
+                    f"BN_CONTRA DOWN but bn_trend={bn_vs_cl_open:+.4f}%",
+                    delta=abs_delta, secs_left=snap.secs_left))
+                continue
+
+        # ── CL fade filter ────────────────────────────────────────────────
+        if engine.cl_fade:
+            # Need 10s CL trend — approximate from previous snapshot
+            prev_snaps = [s for s in snaps
+                          if s.secs_left > snap.secs_left
+                          and s.secs_left <= snap.secs_left + 120]
+            if prev_snaps:
+                prev = prev_snaps[-1]  # closest previous snap
+                cl_trend = (snap.cl_now - prev.cl_now) / prev.cl_now * 100
+                if direction == "UP" and cl_trend < -0.03:
+                    skips.append(Skip(engine.id, slug,
+                        f"CL_FADE UP but cl_trend={cl_trend:+.4f}%",
+                        delta=abs_delta, secs_left=snap.secs_left))
+                    continue
+                if direction == "DOWN" and cl_trend > 0.03:
+                    skips.append(Skip(engine.id, slug,
+                        f"CL_FADE DOWN but cl_trend={cl_trend:+.4f}%",
+                        delta=abs_delta, secs_left=snap.secs_left))
+                    continue
+
+        # ── Regime check ──────────────────────────────────────────────────
+        if engine.regime_check:
+            if snap.sigma_pct < 0.3:
+                skips.append(Skip(engine.id, slug,
+                    f"REGIME_LOW sigma={snap.sigma_pct:.1f}% < 0.3%",
+                    delta=abs_delta, secs_left=snap.secs_left))
+                continue
+
+        # ── ENTRY SIGNAL QUALIFIES ────────────────────────────────────────
+
+        # Fill price: maker at ask - 0.01, clamped to min_entry
+        maker_px = max(round((ask - MAKER_DISCOUNT) * 100) / 100, engine.min_entry)
+
+        # 60% maker fill probability, 40% taker (deterministic by slug+engine)
+        h = hash((slug, engine.id)) & 0xFFFFFFFF
+        roll = (h % 100) / 100.0
+
+        if roll < 0.60:
+            fill_px = maker_px
+            fill_method = "maker"
+            fee = 0.0  # maker rebate
+        else:
+            fill_px = min(ask + SLIP, 0.99)
+            fill_method = "taker"
+            if fill_px > engine.max_entry:
+                skips.append(Skip(engine.id, slug,
+                    f"TAKER_OOB fill={fill_px:.3f}", delta=abs_delta, ask=ask))
+                continue
+            fee = pm_fee(fill_px) * (STAKE / fill_px)
+
+        shares = STAKE / fill_px
+
+        # ── Settlement outcome ────────────────────────────────────────────
+        won = (direction == "UP" and settlement.outcome == "YES") or \
+              (direction == "DOWN" and settlement.outcome == "NO")
+
+        if won:
+            pnl = (shares * 1.0) - STAKE - fee  # settle at $1 per share
+        else:
+            # LOSS: SL at 50% of entry (with SL fix, only on true flip)
+            sl_px = fill_px * 0.50
+            recovery = shares * max(sl_px - SLIP, 0)
+            pnl = recovery - STAKE
+
+        return Trade(
+            engine_id=engine.id, engine_name=engine.name,
+            slug=slug, asset=asset, tf=settlement.tf,
+            direction=direction, fill_px=fill_px,
+            fill_method=fill_method, shares=shares, fee=fee,
+            outcome=settlement.outcome, won=won, pnl=pnl,
+            delta_at_entry=abs_delta,
+            ask_at_entry=ask, secs_left=snap.secs_left,
+            reason=f"{engine.id}: d={abs_delta:.4f}% {direction} ask={ask:.3f}"
+        ), skips
+
+    return None, skips
 
 
-def main():
+# ── Main Forward Test ─────────────────────────────────────────────────────────
+
+def run_forward_test():
     settle_path = Path("settlements_2026-03-15.jsonl")
     log_path = Path("scanner.log")
 
-    if not settle_path.exists():
-        print(f"ERROR: {settle_path} not found")
-        sys.exit(1)
+    settlements = parse_settlements(settle_path)
+    snapshots = parse_scanner_log(str(log_path))
+    total_snaps = sum(len(v) for v in snapshots.values())
 
-    # Load settlements
-    settlements = []
-    with open(settle_path) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                settlements.append(json.loads(line))
+    print(f"{'='*80}")
+    print(f"  CL SNIPER FORWARD TEST -- 15 March 2026 Data")
+    print(f"{'='*80}")
+    print(f"\n  Settlements: {len(settlements)}")
+    print(f"  Book snapshots: {total_snaps} across {len(snapshots)} slugs")
+    print(f"  Scanner cadence: ~60s (vs 500ms production)")
+    print(f"  Stake: ${STAKE:.2f} per trade")
 
-    print(f"Loaded {len(settlements)} settlements")
+    # ── Run each engine across all settlements ────────────────────────────
 
-    # Parse scanner log
-    print(f"Parsing {log_path} for book snapshots...")
-    book_data = parse_scanner_log(str(log_path))
-    slugs_with_books = sum(1 for v in book_data.values() if v)
-    print(f"Found book data for {slugs_with_books} slugs")
+    all_trades = []
+    all_skips = []
+    engine_stats = {}
 
-    # Settlement overview
-    by_tf = defaultdict(list)
+    for engine in PRODUCTION_ENGINES:
+        trades = []
+        skips = []
+        traded_slugs = set()
+
+        for settle in settlements:
+            if settle.slug in traded_slugs:
+                continue
+
+            snaps = snapshots.get(settle.slug, [])
+            trade, skip_list = evaluate_engine(engine, settle, snaps)
+            skips.extend(skip_list)
+
+            if trade:
+                trades.append(trade)
+                traded_slugs.add(settle.slug)
+
+        wins = sum(1 for t in trades if t.won)
+        losses = sum(1 for t in trades if not t.won)
+        total_pnl = sum(t.pnl for t in trades)
+        maker_count = sum(1 for t in trades if t.fill_method == "maker")
+        taker_count = sum(1 for t in trades if t.fill_method == "taker")
+
+        engine_stats[engine.id] = {
+            "name": engine.name,
+            "trades": len(trades),
+            "wins": wins,
+            "losses": losses,
+            "wr": f"{wins/len(trades)*100:.1f}%" if trades else "N/A",
+            "pnl": total_pnl,
+            "maker": maker_count,
+            "taker": taker_count,
+        }
+
+        all_trades.extend(trades)
+        all_skips.extend(skips)
+
+    # ── Engine Summary ────────────────────────────────────────────────────
+
+    print(f"\n{'='*80}")
+    print(f"  ENGINE RESULTS (Production Config)")
+    print(f"{'='*80}")
+
+    print(f"\n  {'Engine':<12} {'Trades':>6} {'W':>4} {'L':>4} {'WR':>7} "
+          f"{'P&L':>10} {'M/T':>7}")
+    print(f"  {'-'*56}")
+
+    total_trades = 0
+    total_wins = 0
+    total_losses = 0
+    total_pnl = 0.0
+
+    for eid in ["A", "B", "C", "D", "E"]:
+        s = engine_stats[eid]
+        print(f"  {eid} {s['name']:<10} {s['trades']:>4} {s['wins']:>4} "
+              f"{s['losses']:>4} {s['wr']:>7} ${s['pnl']:>+8.2f} "
+              f"{s['maker']}M/{s['taker']}T")
+        total_trades += s['trades']
+        total_wins += s['wins']
+        total_losses += s['losses']
+        total_pnl += s['pnl']
+
+    wr = f"{total_wins/total_trades*100:.1f}%" if total_trades else "N/A"
+    print(f"  {'-'*56}")
+    print(f"  {'TOTAL':<12} {total_trades:>4} {total_wins:>4} "
+          f"{total_losses:>4} {wr:>7} ${total_pnl:>+8.2f}")
+
+    # ── Trade Details ─────────────────────────────────────────────────────
+
+    print(f"\n{'='*80}")
+    print(f"  TRADE LOG")
+    print(f"{'='*80}")
+
+    if not all_trades:
+        print(f"\n  No trades fired with production config!")
+    else:
+        cum_pnl = 0.0
+        for t in sorted(all_trades, key=lambda x: x.slug):
+            cum_pnl += t.pnl
+            status = "WIN " if t.won else "LOSS"
+            print(f"  [{t.engine_id}] {t.asset:>3} {t.tf:>2}m {t.direction:>4} "
+                  f"@{t.fill_px:.3f}({t.fill_method[0]}) d={t.delta_at_entry:.4f}% "
+                  f"ask={t.ask_at_entry:.3f} T-{t.secs_left}s "
+                  f"-> {status} ${t.pnl:>+.4f} [cum ${cum_pnl:>+.2f}]"
+                  f"  {t.slug}")
+
+    # ── Skip Analysis ─────────────────────────────────────────────────────
+
+    print(f"\n{'='*80}")
+    print(f"  SKIP ANALYSIS (why engines didn't fire)")
+    print(f"{'='*80}")
+
+    skip_reasons = defaultdict(lambda: defaultdict(int))
+    for skip in all_skips:
+        reason_type = skip.reason.split(" ")[0] if " " in skip.reason else skip.reason
+        skip_reasons[skip.engine_id][reason_type] += 1
+
+    for eid in ["A", "B", "C", "D", "E"]:
+        reasons = skip_reasons.get(eid, {})
+        if reasons:
+            print(f"\n  Engine {eid}:")
+            for reason, count in sorted(reasons.items(), key=lambda x: -x[1]):
+                print(f"    {reason}: {count}")
+
+    # ── Near-miss analysis ────────────────────────────────────────────────
+
+    print(f"\n{'='*80}")
+    print(f"  NEAR MISSES (delta close to threshold but didn't qualify)")
+    print(f"{'='*80}")
+
+    traded_combos = {(t.engine_id, t.slug) for t in all_trades}
+
+    for engine in PRODUCTION_ENGINES:
+        if engine.is_late_scalper:
+            continue
+
+        near_misses = []
+        for settle in settlements:
+            if (engine.id, settle.slug) in traded_combos:
+                continue
+            if engine.tf != 0 and settle.tf != engine.tf:
+                continue
+
+            snaps = snapshots.get(settle.slug, [])
+            entry_snaps = [s for s in snaps
+                           if engine.entry_end <= s.secs_left <= engine.entry_start]
+
+            for snap in entry_snaps:
+                abs_d = abs(snap.delta_pct)
+                scaled = engine.delta * stdev_scale(settle.asset)
+                if abs_d > 0 and abs_d < scaled and abs_d >= scaled * 0.3:
+                    direction = "UP" if snap.delta_pct > 0 else "DOWN"
+                    would_win = (direction == "UP" and settle.outcome == "YES") or \
+                               (direction == "DOWN" and settle.outcome == "NO")
+
+                    if direction == "UP":
+                        ask = snap.yes_ask
+                    else:
+                        ask = snap.no_ask
+
+                    near_misses.append({
+                        "slug": settle.slug,
+                        "delta": abs_d,
+                        "threshold": scaled,
+                        "gap": scaled - abs_d,
+                        "gap_pct": (scaled - abs_d) / scaled * 100,
+                        "direction": direction,
+                        "ask": ask,
+                        "would_win": would_win,
+                        "secs_left": snap.secs_left,
+                    })
+
+        if near_misses:
+            near_misses.sort(key=lambda x: x["gap"])
+            print(f"\n  Engine {engine.id} ({engine.name}, d>={engine.delta:.2f}%):")
+            for nm in near_misses[:10]:
+                win_str = "-> win" if nm["would_win"] else "-> LOSS"
+                print(f"    d={nm['delta']:.4f}% (need {nm['threshold']:.4f}%, "
+                      f"gap={nm['gap']:.4f}%, {nm['gap_pct']:.0f}% short) "
+                      f"{nm['direction']} ask={nm['ask']:.3f} T-{nm['secs_left']}s "
+                      f"{win_str}  {nm['slug']}")
+
+    # ── What-if scenarios ─────────────────────────────────────────────────
+
+    scenarios = [
+        ("RELAXED",    "A/C=0.03%, B/D=0.08%", [
+            EngineConfig("A*", "5M_SNP*",   5,  0.03, 4, 0.88, 0.98, 57, 44, True, True, True),
+            EngineConfig("B*", "5M_D1*",    5,  0.08, 0, 0.88, 0.98, 57, 44, True, True, True),
+            EngineConfig("C*", "15M_SNP*", 15,  0.03, 4, 0.88, 0.98, 57, 44, True, True, True),
+            EngineConfig("D*", "15M_D1*",  15,  0.08, 0, 0.88, 0.98, 57, 44, True, True, True),
+        ]),
+        ("MODERATE",   "A/C=0.03%, B/D=0.04%", [
+            EngineConfig("A+", "5M_SNP+",   5,  0.03, 4, 0.88, 0.98, 57, 44, True, True, True),
+            EngineConfig("B+", "5M_D1+",    5,  0.04, 0, 0.88, 0.98, 57, 44, True, True, True),
+            EngineConfig("C+", "15M_SNP+", 15,  0.03, 4, 0.88, 0.98, 57, 44, True, True, True),
+            EngineConfig("D+", "15M_D1+",  15,  0.04, 0, 0.88, 0.98, 57, 44, True, True, True),
+        ]),
+        ("AGGRESSIVE", "B/D=0.04%, entry 0.85-0.99", [
+            EngineConfig("A!", "5M_SNP!",   5,  0.03, 4, 0.85, 0.99, 57, 44, True, True, True),
+            EngineConfig("B!", "5M_D1!",    5,  0.04, 0, 0.85, 0.99, 57, 44, True, True, True),
+            EngineConfig("C!", "15M_SNP!", 15,  0.03, 4, 0.85, 0.99, 57, 44, True, True, True),
+            EngineConfig("D!", "15M_D1!",  15,  0.04, 0, 0.85, 0.99, 57, 44, True, True, True),
+        ]),
+        ("NO REGIME",  "Production + regime_check=off", [
+            EngineConfig("An", "5M_SNP_NR",   5,  0.04, 4, 0.88, 0.98, 57, 44, True, True, False),
+            EngineConfig("Bn", "5M_D1_NR",    5,  0.15, 0, 0.88, 0.98, 57, 44, True, True, False),
+            EngineConfig("Cn", "15M_SNP_NR", 15,  0.04, 4, 0.88, 0.98, 57, 44, True, True, False),
+            EngineConfig("Dn", "15M_D1_NR",  15,  0.15, 0, 0.88, 0.98, 57, 44, True, True, False),
+        ]),
+    ]
+
+    print(f"\n{'='*80}")
+    print(f"  WHAT-IF SCENARIOS")
+    print(f"{'='*80}")
+
+    scenario_results = {}
+
+    for name, desc, engines in scenarios:
+        trades = []
+        for engine in engines:
+            traded_slugs = set()
+            for settle in settlements:
+                if settle.slug in traded_slugs:
+                    continue
+                snaps = snapshots.get(settle.slug, [])
+                trade, _ = evaluate_engine(engine, settle, snaps)
+                if trade:
+                    trades.append(trade)
+                    traded_slugs.add(settle.slug)
+
+        w = sum(1 for t in trades if t.won)
+        l = sum(1 for t in trades if not t.won)
+        pnl = sum(t.pnl for t in trades)
+        wr_s = f"{w/(w+l)*100:.1f}%" if (w+l) > 0 else "N/A"
+
+        scenario_results[name] = {"trades": trades, "wins": w, "losses": l, "pnl": pnl}
+
+        print(f"\n  {name} ({desc}):")
+        print(f"    Trades: {w+l}, W={w}, L={l}, WR={wr_s}, P&L=${pnl:+.2f}")
+
+        if trades:
+            for t in sorted(trades, key=lambda x: x.slug):
+                status = "WIN " if t.won else "LOSS"
+                print(f"    [{t.engine_id}] {t.asset:>3} {t.tf:>2}m {t.direction:>4} "
+                      f"@{t.fill_px:.3f}({t.fill_method[0]}) d={t.delta_at_entry:.4f}% "
+                      f"-> {status} ${t.pnl:>+.4f}  {t.slug}")
+
+    # ── Market regime analysis ────────────────────────────────────────────
+
+    print(f"\n{'='*80}")
+    print(f"  MARKET REGIME ANALYSIS")
+    print(f"{'='*80}")
+
+    from datetime import datetime, timezone
+
+    by_hour = defaultdict(list)
     for s in settlements:
-        by_tf[s["tf"]].append(s)
+        hour = (s.window_start // 3600) * 3600
+        by_hour[hour].append(s)
 
-    print(f"\nSettlements by timeframe:")
-    for tf, items in sorted(by_tf.items()):
-        yes = sum(1 for i in items if i["outcome"] == "YES")
-        no = sum(1 for i in items if i["outcome"] == "NO")
-        avg = sum(abs(i["pct_move"]) for i in items) / len(items)
-        print(f"  {tf}m: {len(items)} windows (YES={yes}, NO={no}, avg_move={avg:.4f}%)")
+    print(f"\n  Settlements per hour:")
+    for hour in sorted(by_hour.keys()):
+        settles = by_hour[hour]
+        avg_move = sum(abs(s.pct_move) for s in settles) / len(settles)
+        max_move = max(abs(s.pct_move) for s in settles)
+        up = sum(1 for s in settles if s.outcome == "YES")
+        down = sum(1 for s in settles if s.outcome == "NO")
+        dt = datetime.fromtimestamp(hour, tz=timezone.utc)
+        print(f"    {dt.strftime('%H:%M')} UTC: {len(settles):>2} windows, "
+              f"avg|move|={avg_move:.4f}%, max={max_move:.4f}%, "
+              f"UP={up}/DOWN={down}")
 
-    stale = [s for s in settlements if s["pct_move"] == 0.0]
-    if stale:
-        print(f"\n  WARNING: {len(stale)} windows had 0% CL move (stale feed, excluded from sim)")
+    # CL delta distribution at entry time
+    print(f"\n  CL Delta at entry (T-44..57) across all windows:")
+    entry_deltas = []
+    for settle in settlements:
+        snaps = snapshots.get(settle.slug, [])
+        entry_snaps = [s for s in snaps if 44 <= s.secs_left <= 57]
+        for s in entry_snaps:
+            entry_deltas.append(abs(s.delta_pct))
 
-    # ── Scenario 1: ORIGINAL ────────────────────────────────────────────────
+    if entry_deltas:
+        entry_deltas.sort()
+        n = len(entry_deltas)
+        print(f"    Count: {n}")
+        print(f"    Min:   {min(entry_deltas):.4f}%")
+        print(f"    P25:   {entry_deltas[n//4]:.4f}%")
+        print(f"    P50:   {entry_deltas[n//2]:.4f}%")
+        print(f"    P75:   {entry_deltas[3*n//4]:.4f}%")
+        print(f"    Max:   {max(entry_deltas):.4f}%")
+        above_004 = sum(1 for d in entry_deltas if d > 0.04)
+        above_008 = sum(1 for d in entry_deltas if d > 0.08)
+        above_015 = sum(1 for d in entry_deltas if d > 0.15)
+        print(f"    >0.04%: {above_004}/{n} ({above_004/n*100:.0f}%)")
+        print(f"    >0.08%: {above_008}/{n} ({above_008/n*100:.0f}%)")
+        print(f"    >0.15%: {above_015}/{n} ({above_015/n*100:.0f}%)")
 
-    pnl1, trades1 = run_scenario(
-        "ORIGINAL (B=0.15%, E=0.95-0.975)",
-        make_engines_original(),
-        settlements,
-        book_data,
-        realistic=False,
-    )
+    # Sigma distribution
+    print(f"\n  Sigma (hourly vol) at entry:")
+    entry_sigmas = []
+    for settle in settlements:
+        snaps = snapshots.get(settle.slug, [])
+        entry_snaps = [s for s in snaps if 44 <= s.secs_left <= 57]
+        for s in entry_snaps:
+            entry_sigmas.append(s.sigma_pct)
 
-    # ── Scenario 2: TUNED ───────────────────────────────────────────────────
+    if entry_sigmas:
+        entry_sigmas.sort()
+        n = len(entry_sigmas)
+        below_03 = sum(1 for s in entry_sigmas if s < 0.3)
+        print(f"    Count: {n}")
+        print(f"    Min:   {min(entry_sigmas):.2f}%")
+        print(f"    P50:   {entry_sigmas[n//2]:.2f}%")
+        print(f"    Max:   {max(entry_sigmas):.2f}%")
+        print(f"    <0.3% (regime filtered): {below_03}/{n} ({below_03/n*100:.0f}%)")
 
-    pnl2, trades2 = run_scenario(
-        "TUNED (B=0.12%, E=0.93-0.98)",
-        make_engines_tuned(),
-        settlements,
-        book_data,
-        realistic=False,
-    )
+    # ── Final summary ─────────────────────────────────────────────────────
 
-    # ── Scenario 3: REALISTIC ───────────────────────────────────────────────
+    print(f"\n{'='*80}")
+    print(f"  FORWARD TEST SUMMARY")
+    print(f"{'='*80}")
 
-    pnl3, trades3 = run_scenario(
-        "REALISTIC (Tuned + 60% maker fill + taker slip + fees)",
-        make_engines_tuned(),
-        settlements,
-        book_data,
-        realistic=True,
-    )
+    sr = scenario_results
+    print(f"""
+  SESSION: 15-Mar-2026 (~6 hours captured data)
 
-    # ── Comparison ──────────────────────────────────────────────────────────
+  +{'─'*60}+
+  | Config              | Trades |  W |  L |  WR   |    P&L   |
+  +{'─'*60}+
+  | PRODUCTION          | {total_trades:>5}  | {total_wins:>2} | {total_losses:>2} | {wr:>5} | ${total_pnl:>+7.2f} |
+  | RELAXED (0.03/0.08) | {sr['RELAXED']['wins']+sr['RELAXED']['losses']:>5}  | {sr['RELAXED']['wins']:>2} | {sr['RELAXED']['losses']:>2} | {sr['RELAXED']['wins']/(sr['RELAXED']['wins']+sr['RELAXED']['losses'])*100 if sr['RELAXED']['wins']+sr['RELAXED']['losses'] > 0 else 0:>4.0f}% | ${sr['RELAXED']['pnl']:>+7.2f} |
+  | MODERATE (0.03/0.04)| {sr['MODERATE']['wins']+sr['MODERATE']['losses']:>5}  | {sr['MODERATE']['wins']:>2} | {sr['MODERATE']['losses']:>2} | {sr['MODERATE']['wins']/(sr['MODERATE']['wins']+sr['MODERATE']['losses'])*100 if sr['MODERATE']['wins']+sr['MODERATE']['losses'] > 0 else 0:>4.0f}% | ${sr['MODERATE']['pnl']:>+7.2f} |
+  | AGGRESSIVE (0.03/04)| {sr['AGGRESSIVE']['wins']+sr['AGGRESSIVE']['losses']:>5}  | {sr['AGGRESSIVE']['wins']:>2} | {sr['AGGRESSIVE']['losses']:>2} | {sr['AGGRESSIVE']['wins']/(sr['AGGRESSIVE']['wins']+sr['AGGRESSIVE']['losses'])*100 if sr['AGGRESSIVE']['wins']+sr['AGGRESSIVE']['losses'] > 0 else 0:>4.0f}% | ${sr['AGGRESSIVE']['pnl']:>+7.2f} |
+  | NO REGIME           | {sr['NO REGIME']['wins']+sr['NO REGIME']['losses']:>5}  | {sr['NO REGIME']['wins']:>2} | {sr['NO REGIME']['losses']:>2} | {sr['NO REGIME']['wins']/(sr['NO REGIME']['wins']+sr['NO REGIME']['losses'])*100 if sr['NO REGIME']['wins']+sr['NO REGIME']['losses'] > 0 else 0:>4.0f}% | ${sr['NO REGIME']['pnl']:>+7.2f} |
+  +{'─'*60}+
 
-    print(f"\n{'=' * 72}")
-    print("  SCENARIO COMPARISON")
-    print("=" * 72)
-    print(f"\n  {'Scenario':<50} {'Trades':>6} {'WR':>7} {'P&L':>10}")
-    print("  " + "-" * 68)
+  DATA LIMITATIONS:
+    - Scanner.log has ~60s cadence (production is 500ms)
+    - Engine E (late scalper T-25..3) has ZERO snapshots in window
+    - Continuity (A/C) approximated — real bot checks 500ms ticks
+    - CL fade filter approximated from 60s-apart snapshots
+    - Trade count is upper bound (missing filters reduce it)
 
-    for label, trades, pnl in [
-        ("1. ORIGINAL (B=0.15%, E=0.95-0.975)", trades1, pnl1),
-        ("2. TUNED (B=0.12%, E=0.93-0.98)", trades2, pnl2),
-        ("3. REALISTIC (Tuned + fills + fees)", trades3, pnl3),
-    ]:
-        n = len(trades)
-        w = sum(1 for t in trades if t.exit_reason == "WIN")
-        wr = w / n * 100 if n > 0 else 0
-        print(f"  {label:<50} {n:>6} {wr:>6.1f}% ${pnl:>+8.2f}")
+  COMPARISON TO 10-MAR LIVE (5h, production, more volatile):
+    10-Mar: 77 trades, 100% WR (SL fix), +$22.02
+    15-Mar: {total_trades} trades, {wr} WR, ${total_pnl:+.2f}
+""")
 
-    # Delta from original
-    if pnl1 != 0:
-        print(f"\n  Tuned vs Original:    +{len(trades2)-len(trades1)} trades, "
-              f"${pnl2-pnl1:+.2f} P&L delta")
-        print(f"  Realistic vs Original: +{len(trades3)-len(trades1)} trades, "
-              f"${pnl3-pnl1:+.2f} P&L delta")
+    # ── Save results ──────────────────────────────────────────────────────
 
-    # Realistic fill breakdown
-    maker_count = sum(1 for t in trades3 if t.fill_type == "maker")
-    taker_count = sum(1 for t in trades3 if t.fill_type == "taker")
-    total_fees = sum(t.entry_fee for t in trades3)
-    print(f"\n  Realistic fill breakdown:")
-    print(f"    Maker fills: {maker_count} ({maker_count/len(trades3)*100:.0f}%)" if trades3 else "")
-    print(f"    Taker fills: {taker_count} ({taker_count/len(trades3)*100:.0f}%)" if trades3 else "")
-    print(f"    Total taker fees paid: ${total_fees:.4f}")
+    results = {
+        "session": "2026-03-15",
+        "data_hours": 6,
+        "settlements": len(settlements),
+        "snapshots": total_snaps,
+        "scanner_cadence_ms": 60000,
+        "production": {
+            "config": {
+                "A": {"delta": 0.04, "cont": 4, "entry": [0.88, 0.98]},
+                "B": {"delta": 0.15, "cont": 0, "entry": [0.88, 0.98]},
+                "C": {"delta": 0.04, "cont": 4, "entry": [0.88, 0.98]},
+                "D": {"delta": 0.15, "cont": 0, "entry": [0.88, 0.98]},
+                "E": {"min": 0.95, "max": 0.975, "window": "T-25..3"},
+            },
+            "trades": total_trades,
+            "wins": total_wins,
+            "losses": total_losses,
+            "wr": wr,
+            "pnl": round(total_pnl, 4),
+        },
+        "scenarios": {
+            name: {
+                "trades": sr[name]["wins"] + sr[name]["losses"],
+                "wins": sr[name]["wins"],
+                "losses": sr[name]["losses"],
+                "pnl": round(sr[name]["pnl"], 4),
+            }
+            for name in sr
+        },
+        "engine_stats": {
+            eid: {k: (round(v, 4) if isinstance(v, float) else v)
+                  for k, v in stats.items()}
+            for eid, stats in engine_stats.items()
+        },
+        "trade_log": [
+            {
+                "engine": t.engine_id, "slug": t.slug, "asset": t.asset,
+                "tf": t.tf, "direction": t.direction,
+                "fill_px": round(t.fill_px, 4), "fill_method": t.fill_method,
+                "won": t.won, "pnl": round(t.pnl, 4),
+                "delta": round(t.delta_at_entry, 4),
+                "ask": round(t.ask_at_entry, 4),
+                "secs_left": t.secs_left,
+            }
+            for t in all_trades
+        ],
+    }
 
-    # Theoretical max
-    non_stale = [s for s in settlements if s["pct_move"] != 0]
-    max_theoretical = sum((STAKE / 0.92 * 1.0 - STAKE) for _ in non_stale)
-    print(f"\n  Theoretical max (all {len(non_stale)} non-stale windows @0.92): "
-          f"${max_theoretical:+.2f}")
-    print(f"  Realistic capture rate: {pnl3/max_theoretical*100:.1f}%")
+    with open("forward_test_results.json", "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"  Results saved to forward_test_results.json")
 
-    # ── CL/BN divergence ────────────────────────────────────────────────────
-
-    div_values = [s.get("cl_bn_divergence", 0) for s in settlements if s.get("cl_bn_divergence")]
-    if div_values:
-        avg_div = sum(div_values) / len(div_values)
-        max_div = max(div_values)
-        print(f"\n  CL/BN divergence: avg={avg_div:.6f}, max={max_div:.6f}")
-        high_div = [s for s in settlements if s.get("cl_bn_divergence", 0) > 0.001]
-        if high_div:
-            print(f"  {len(high_div)} windows with CL/BN divergence > 0.1%:")
-            for s in high_div:
-                print(f"    {s['slug']} | div={s['cl_bn_divergence']:.4f} "
-                      f"| pct_move={s['pct_move']:.4f}%")
-
-    # ── Save results ────────────────────────────────────────────────────────
-
-    results_path = Path("forward_test_results.jsonl")
-    with open(results_path, 'w') as f:
-        for scenario, trades in [
-            ("ORIGINAL", trades1), ("TUNED", trades2), ("REALISTIC", trades3)
-        ]:
-            for t in trades:
-                f.write(json.dumps({
-                    "scenario": scenario,
-                    "engine": t.engine,
-                    "slug": t.slug,
-                    "asset": t.asset,
-                    "tf": t.tf,
-                    "direction": t.direction,
-                    "fill_px": t.fill_px,
-                    "fill_type": t.fill_type,
-                    "shares": t.shares,
-                    "entry_fee": t.entry_fee,
-                    "outcome": t.outcome,
-                    "pnl": t.pnl,
-                    "exit_reason": t.exit_reason,
-                }) + "\n")
-
-    print(f"\n  All results saved to {results_path}")
+    return results
 
 
 if __name__ == "__main__":
-    main()
+    run_forward_test()
