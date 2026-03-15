@@ -1,0 +1,50 @@
+# Lag Sniper — CL-Leading Maker-First Lag Exploitation
+# 15th March 2026
+
+[wallet]
+private_key    = ""
+funder_address = ""
+
+[feed]
+assets     = ["btc", "eth"]
+timeframes = [5, 15]
+
+clob_rest  = "https://clob.polymarket.com"
+live_ws    = "wss://ws-live-data.polymarket.com"
+gamma_api  = "https://gamma-api.polymarket.com"
+
+rest_throttle_ms = 250
+book_warmup_secs = 5
+book_stale_secs  = 3.0
+
+[scan]
+tick_ms            = 250    # 250ms for faster lag detection (vs 500ms in oracle-v1)
+sigma_window_secs  = 300    # 5-min rolling vol from BN history
+min_secs           = 90     # don't scan below T-90s
+
+# ── Lag Detection Thresholds ─────────────────────────────────────────────
+# Signal: CL moves → PM book stale → buy gap. BN = confirmation only.
+[lag]
+min_cl_move_pct     = 0.035  # CL must move by at least 0.035% (5s window) to trigger
+min_edge            = 0.08   # fair_cl - fill_price >= 8 cents
+min_book_gap        = 0.05   # fair_cl - best_ask >= 5 cents (book staleness)
+min_bn_momentum     = 0.0003 # |BN 5s pct change| >= 0.03% (confirmation)
+min_secs_left       = 90     # don't enter below T-90s
+max_secs_left       = 600    # don't enter above T-10min
+max_sigma           = 0.80   # skip if sigma > 80% annualized
+min_depth_multiple  = 1.0    # book depth >= 1x stake ($5 depth for $5 trade)
+min_entry_price     = 0.12   # no sub-12c lottery tickets
+max_entry_price     = 0.88   # no overpaying >88c
+min_bn_flow_confirm = 0.05   # BN flow imbalance must confirm direction
+
+# ── Strategy Parameters ──────────────────────────────────────────────────
+[strategy]
+stake              = 5.0     # USD per position
+maker_chase_ticks  = 1       # chase 1 tick then taker (was 2 — faster entry)
+chase_interval_ms  = 300     # 300ms between chase ticks
+max_concurrent     = 6       # max open positions
+max_hold_secs      = 30.0    # exit if lag doesn't close in 30s
+min_profit         = 0.03    # 3 cents to trigger take-profit
+partial_tp_pct     = 0.50    # sell 50% on first TP, hold rest
+taker_fee_rate     = 0.015   # 1.5% for emergency taker exits
+max_drawdown       = 25.0    # kill switch: halt all entries if net PnL drops below -$25
