@@ -23,7 +23,6 @@ use url::Url;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-const BOOK_BATCH_SIZE: usize = 20;
 const WS_RECONNECT_SECS: u64 = 5;
 
 // ── Shared state types ──────────────────────────────────────────────────────
@@ -260,7 +259,7 @@ async fn fetch_single_book(
 ) -> Option<(String, BookEntry)> {
     let url = format!("{}/book?token_id={}", clob_rest, token_id);
     let resp = match client.get(&url)
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(2))
         .send().await
     {
         Ok(r) => r,
@@ -322,23 +321,21 @@ pub async fn fetch_books_batch(
     client:    &Client,
     clob_rest: &str,
     token_ids: &[String],
-    limiter:   &RateLimiter,
+    _limiter:  &RateLimiter,
 ) -> Result<HashMap<String, BookEntry>> {
     if token_ids.is_empty() { return Ok(HashMap::new()); }
 
     let mut result = HashMap::new();
 
-    // Fetch books concurrently in chunks to respect rate limits
-    for chunk in token_ids.chunks(BOOK_BATCH_SIZE) {
-        limiter.wait().await;
-        let futs: Vec<_> = chunk.iter()
-            .map(|tid| fetch_single_book(client, clob_rest, tid))
-            .collect();
+    // Fire all book fetches concurrently — each is an independent GET.
+    // No rate limiter needed: book reads are not write-limited by CLOB.
+    let futs: Vec<_> = token_ids.iter()
+        .map(|tid| fetch_single_book(client, clob_rest, tid))
+        .collect();
 
-        let results = futures_util::future::join_all(futs).await;
-        for entry in results.into_iter().flatten() {
-            result.insert(entry.0, entry.1);
-        }
+    let results = futures_util::future::join_all(futs).await;
+    for entry in results.into_iter().flatten() {
+        result.insert(entry.0, entry.1);
     }
 
     Ok(result)

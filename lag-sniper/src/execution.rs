@@ -67,14 +67,25 @@ fn dec(val: f64) -> Result<Decimal> {
 /// Compute size (shares) such that size * price has at most 2 decimal places.
 /// The CLOB requires: maker_amount (= size * price for buys) max 2dp,
 /// taker_amount (= size * (1 - price) for buys) max 4dp.
-/// Safest approach: floor size to a whole number so size * price always has <= 2dp.
-fn dec_size_for_price(shares: f64, _price: f64) -> Result<Decimal> {
-    let floored = shares.floor();
-    if floored <= 0.0 {
-        return Err(anyhow!("Size too small after floor: {}", shares));
+/// Truncate to 1dp for higher fill rates; fall back to whole number if
+/// maker_amount doesn't round cleanly to 2dp.
+fn dec_size_for_price(shares: f64, price: f64) -> Result<Decimal> {
+    let truncated = (shares * 10.0).floor() / 10.0;
+    if truncated <= 0.0 {
+        return Err(anyhow!("Size too small after truncate: {} (raw {})", truncated, shares));
     }
-    Decimal::from_f64(floored)
-        .ok_or_else(|| anyhow!("Cannot convert {} to Decimal", floored))
+    let maker_amount = truncated * price;
+    let maker_2dp = (maker_amount * 100.0).round() / 100.0;
+    if (maker_amount - maker_2dp).abs() > 0.005 {
+        let whole = shares.floor();
+        if whole <= 0.0 {
+            return Err(anyhow!("Size too small after floor: {}", shares));
+        }
+        return Decimal::from_f64(whole)
+            .ok_or_else(|| anyhow!("Cannot convert {} to Decimal", whole));
+    }
+    Decimal::from_f64(truncated)
+        .ok_or_else(|| anyhow!("Cannot convert {} to Decimal", truncated))
 }
 
 /// Convert f64 to Decimal, truncated to 2 decimal places for size (sell-side).
@@ -348,6 +359,79 @@ impl ExecutionLayer {
         }
     }
 
+    /// Place a FAK (taker) sell order for guaranteed exits.
+    pub async fn sell_fak(
+        &self,
+        token_id: &str,
+        price: f64,
+        shares: f64,
+    ) -> Result<FillResult> {
+        if price <= 0.0 || price >= 1.0 || shares <= 0.0 {
+            return Err(anyhow!("Invalid sell_fak params: price={} shares={}", price, shares));
+        }
+
+        if self.check_backoff().await {
+            return Err(anyhow!("In backoff period"));
+        }
+
+        let post_result = {
+            let _lock = self.clob_lock.lock().await;
+
+            let tid = U256::from_str(token_id)
+                .map_err(|e| anyhow!("Invalid token_id: {}", e))?;
+
+            let dec_price = dec(price)?;
+            let dec_sz = dec_size(shares)?;
+
+            let order = self.client.limit_order()
+                .token_id(tid)
+                .side(ClobSide::Sell)
+                .price(dec_price)
+                .size(dec_sz)
+                .order_type(OrderType::FAK)
+                .build()
+                .await
+                .map_err(|e| anyhow!("Sell FAK build failed: {}", e))?;
+
+            let signed = self.client.sign(&*self.signer, order).await
+                .map_err(|e| anyhow!("Sell FAK sign failed: {}", e))?;
+
+            self.client.post_order(signed).await
+        };
+
+        match post_result {
+            Ok(resp) => {
+                self.record_success().await;
+                let filled = resp.status == OrderStatusType::Matched;
+                if !resp.success || !filled {
+                    let _ = self.cancel_order(&resp.order_id).await;
+                    return Err(anyhow!("Sell FAK zero fill"));
+                }
+                let actual_price = self.fill_price_from_resp(&resp, price);
+                Ok(FillResult {
+                    order_id: resp.order_id.clone(),
+                    filled,
+                    price: actual_price,
+                    status: format!("{:?}", resp.status),
+                })
+            }
+            Err(e) => {
+                self.record_failure().await;
+                Err(anyhow!("Sell FAK failed: {}", e))
+            }
+        }
+    }
+
+    /// Query order status from CLOB to resolve ambiguous cancel failures.
+    pub async fn query_order_status(&self, order_id: &str) -> Result<(bool, f64)> {
+        let _lock = self.clob_lock.lock().await;
+        let resp = self.client.order(order_id).await
+            .map_err(|e| anyhow!("Query order failed: {}", e))?;
+        let filled = resp.status == OrderStatusType::Matched;
+        let price = if filled { resp.price.to_f64().unwrap_or(0.0) } else { 0.0 };
+        Ok((filled, price))
+    }
+
     /// Cancel a specific order by ID.
     /// Verifies the order actually appears in the `canceled` list.
     /// Returns Err if the order ended up in `not_canceled` (e.g. already filled).
@@ -434,10 +518,24 @@ impl ExecutionLayer {
             if let Some(ref oid) = last_oid {
                 match self.cancel_order(oid).await {
                     Ok(_) => {}
-                    Err(e) => {
-                        // Cancel failed — previous order may have filled
-                        warn!("[EXEC] Cancel failed for {}: {} — may be filled", oid, e);
-                        return Err(anyhow!("Chase cancel failed: order may be filled"));
+                    Err(_) => {
+                        // Cancel failed — query CLOB to check if order was filled
+                        match self.query_order_status(oid).await {
+                            Ok((true, fill_price)) if fill_price > 0.0 => {
+                                info!("[EXEC] Chase cancel-fail: order {} was FILLED @{:.3}", oid, fill_price);
+                                return Ok(FillResult { order_id: oid.clone(), filled: true, price: fill_price, status: "Matched".to_string() });
+                            }
+                            Ok((true, _)) => {
+                                return Ok(FillResult { order_id: oid.clone(), filled: true, price: current_price, status: "Matched".to_string() });
+                            }
+                            Ok((false, _)) => {
+                                warn!("[EXEC] Chase order {} not filled but cancel failed, retrying", oid);
+                                let _ = self.cancel_order(oid).await;
+                            }
+                            Err(e) => {
+                                return Err(anyhow!("Chase cancel ambiguous: {}", e));
+                            }
+                        }
                     }
                 }
             }
@@ -475,9 +573,23 @@ impl ExecutionLayer {
         if let Some(ref oid) = last_oid {
             match self.cancel_order(oid).await {
                 Ok(_) => {}
-                Err(e) => {
-                    warn!("[EXEC] Final cancel failed: {} — may be filled", e);
-                    return Err(anyhow!("Taker aborted: final cancel failed, order may be filled"));
+                Err(_) => {
+                    match self.query_order_status(oid).await {
+                        Ok((true, fill_price)) if fill_price > 0.0 => {
+                            info!("[EXEC] Pre-taker cancel-fail: order {} was FILLED @{:.3}", oid, fill_price);
+                            return Ok(FillResult { order_id: oid.clone(), filled: true, price: fill_price, status: "Matched".to_string() });
+                        }
+                        Ok((true, _)) => {
+                            return Ok(FillResult { order_id: oid.clone(), filled: true, price: current_price, status: "Matched".to_string() });
+                        }
+                        Ok((false, _)) => {
+                            warn!("[EXEC] Pre-taker order {} not filled but cancel failed, retrying", oid);
+                            let _ = self.cancel_order(oid).await;
+                        }
+                        Err(e) => {
+                            return Err(anyhow!("Pre-taker cancel ambiguous: {}", e));
+                        }
+                    }
                 }
             }
         }

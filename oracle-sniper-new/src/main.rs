@@ -401,14 +401,18 @@ async fn main() -> Result<()> {
         }
 
         // ── CL close snap ───────────────────────────────────────────────
+        // Snap CL price at window_end. Only accept if CL updated within
+        // last 30s (avoid stale CL from minutes ago).
         for (slug, meta) in &markets {
             if settled.get(slug.as_str()).copied().unwrap_or(false) { continue; }
             if cl_close_snap.contains_key(slug.as_str()) { continue; }
             if now_u > meta.window_end {
-                let cl_now = cl_prices.get(&meta.asset).map(|v| v.1).unwrap_or(0.0);
-                if cl_now > 0.0 {
-                    cl_close_snap.insert(slug.clone(), cl_now);
-                    info!("[CL_CLOSE] {} snap={:.2}", slug, cl_now);
+                if let Some(cl_ref) = cl_prices.get(&meta.asset) {
+                    let (cl_ts, cl_now) = (cl_ref.0, cl_ref.1);
+                    if cl_now > 0.0 && (now - cl_ts) < 30.0 {
+                        cl_close_snap.insert(slug.clone(), cl_now);
+                        info!("[CL_CLOSE] {} snap={:.2} (CL age={:.1}s)", slug, cl_now, now - cl_ts);
+                    }
                 }
             }
         }
@@ -440,6 +444,7 @@ async fn main() -> Result<()> {
                 book_state.remove(&meta.token_no);
             }
             cl_close_snap.remove(slug.as_str());
+            settled.remove(slug.as_str());
         }
 
         // ── Warmup gate ─────────────────────────────────────────────────
@@ -466,8 +471,20 @@ async fn main() -> Result<()> {
 
             if meta.open_price <= 0.0 {
                 if now_u >= meta.window_start {
-                    meta.open_price = cl_price;
-                    info!("[OPEN] {} open={:.2}", slug, cl_price);
+                    // Use CL price closest to window_start from history,
+                    // falling back to current CL if history unavailable
+                    let hist_key = format!("cl_{}", meta.asset);
+                    let open = price_history.get(&hist_key)
+                        .and_then(|h| {
+                            let ws = meta.window_start as f64;
+                            h.iter()
+                                .filter(|(ts, _)| *ts <= ws + 5.0)
+                                .last()
+                                .map(|(_, p)| *p)
+                        })
+                        .unwrap_or(cl_price);
+                    meta.open_price = open;
+                    info!("[OPEN] {} open={:.2} (current CL={:.2})", slug, open, cl_price);
                 }
                 continue;
             }

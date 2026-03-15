@@ -368,7 +368,8 @@ impl LagRunner {
                         sig.slug, post_edge, actual_price
                     );
                     let shares = self.config.stake / actual_price;
-                    let _ = self.exec.sell_gtc(token_id, actual_price, shares).await;
+                    let fak_price = (actual_price - 0.01).max(0.01);
+                    let _ = self.exec.sell_fak(token_id, fak_price, shares).await;
                     return;
                 }
 
@@ -376,7 +377,8 @@ impl LagRunner {
                 if actual_price > 0.90 {
                     warn!("[LAG_RUNNER] REJECT expensive fill {} @{:.3}", sig.slug, actual_price);
                     let shares = self.config.stake / actual_price;
-                    let _ = self.exec.sell_gtc(token_id, actual_price, shares).await;
+                    let fak_price = (actual_price - 0.01).max(0.01);
+                    let _ = self.exec.sell_fak(token_id, fak_price, shares).await;
                     return;
                 }
 
@@ -447,24 +449,32 @@ impl LagRunner {
             None => return,
         };
 
-        // Thin-book protection: if bid is garbage, hold to settlement instead
-        if exit_bid < pos.entry_price * 0.85 && reason != "HARD_SL" {
-            info!(
-                "[LAG_RUNNER] SKIP_SELL {} bid={:.3} < 85% of entry={:.3} — holding to settlement",
-                pos.slug, exit_bid, pos.entry_price
-            );
-            self.positions.insert(trade_id.to_string(), pos);
-            return;
-        }
-
-        // Sell via GTC at bid
+        // GTC sell at bid, cascade to FAK if not filled
         match self.exec.sell_gtc(&pos.token_id, exit_bid, pos.shares).await {
-            Ok(_) => {
-                self.log_close(pos, exit_bid, reason, now).await;
+            Ok(r) if r.filled => {
+                self.log_close(pos, r.price, reason, now).await;
             }
-            Err(e) => {
-                warn!("[LAG_RUNNER] Sell failed ({}): {}", reason, e);
-                self.log_close(pos, exit_bid, &format!("{}_FAIL", reason), now).await;
+            Ok(r) => {
+                // GTC posted but not filled — wait 1s then FAK
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                let _ = self.exec.cancel_order(&r.order_id).await;
+                let fak_price = (exit_bid - 0.01).max(0.01);
+                match self.exec.sell_fak(&pos.token_id, fak_price, pos.shares).await {
+                    Ok(fr) => { self.log_close(pos, fr.price, reason, now).await; }
+                    Err(_e) => {
+                        warn!("[LAG_RUNNER] FAK sell also failed — holding to settlement");
+                        self.positions.insert(trade_id.to_string(), pos);
+                        return;
+                    }
+                }
+            }
+            Err(_e) => {
+                // GTC rejected — try FAK immediately
+                let fak_price = (exit_bid - 0.01).max(0.01);
+                match self.exec.sell_fak(&pos.token_id, fak_price, pos.shares).await {
+                    Ok(fr) => { self.log_close(pos, fr.price, reason, now).await; }
+                    Err(_e2) => { self.positions.insert(trade_id.to_string(), pos); return; }
+                }
             }
         }
 

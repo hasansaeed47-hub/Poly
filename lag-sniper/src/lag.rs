@@ -154,10 +154,11 @@ impl LagDetector {
         }
 
         // ── CL cadence gate ──────────────────────────────────────────────
-        // Only enter within 3s after a CL update — CL data is fresh,
-        // book hasn't repriced yet, maximum window before MMs catch up
-        let (since_last_cl, _cadence) = cl_cadence;
-        if since_last_cl > 3.0 {
+        // Enter within half the CL cadence after update — fresh data, max lag window
+        // CL cadence varies: BTC ~20s, ETH ~12s. Hard 3s was too tight.
+        let (since_last_cl, estimated_cadence) = cl_cadence;
+        let max_age = (estimated_cadence * 0.5).max(3.0).min(15.0);
+        if since_last_cl > max_age {
             return None;
         }
 
