@@ -6,10 +6,8 @@ from collections import deque
 import hashlib,time
 
 class TF(Enum):
-    M15="15min"
     H1="1hr"
     H4="4hr"
-    D="daily"
 
 class Asset(Enum):
     BTC="BTC"
@@ -47,6 +45,9 @@ class Market:
     liq:float
     spread:float
     created:datetime
+    slug:str=""
+    token_yes:str=""
+    token_no:str=""
 
 @dataclass(slots=True)
 class Price:
@@ -123,20 +124,24 @@ def calc_pnl(shares:float,entry:float,exit:float)->tuple:
     pct=(exit-entry)/entry if entry>0 else 0
     return pnl,pct
 
+ASSET_KEYWORDS={
+    Asset.BTC:["btc","bitcoin"],
+    Asset.ETH:["eth","ethereum"],
+    Asset.SOL:["sol","solana"],
+    Asset.XRP:["xrp","ripple"],
+}
+
 def parse_asset(q:str)->Optional[Asset]:
     ql=q.lower()
-    if "btc" in ql or "bitcoin" in ql:return Asset.BTC
-    if "eth" in ql or "ethereum" in ql:return Asset.ETH
-    if "sol" in ql or "solana" in ql:return Asset.SOL
-    if "xrp" in ql or "ripple" in ql:return Asset.XRP
+    for asset,kws in ASSET_KEYWORDS.items():
+        if any(kw in ql for kw in kws):
+            return asset
     return None
 
 def parse_tf(q:str)->Optional[TF]:
     ql=q.lower()
-    if "15 min" in ql or "15min" in ql:return TF.M15
-    if "1 hour" in ql or "1hr" in ql or "hourly" in ql:return TF.H1
-    if "4 hour" in ql or "4hr" in ql:return TF.H4
-    if "daily" in ql or "today" in ql or "eod" in ql:return TF.D
+    if "4 hour" in ql or "4hr" in ql or "4h" in ql:return TF.H4
+    if "1 hour" in ql or "1hr" in ql or "hourly" in ql or "hour" in ql:return TF.H1
     return None
 
 def parse_target(q:str)->Optional[float]:
@@ -146,7 +151,7 @@ def parse_target(q:str)->Optional[float]:
     return None
 
 def parse_dir(q:str)->str:
-    return "below" if any(x in q.lower() for x in ["below","under","lower"]) else "above"
+    return "below" if any(x in q.lower() for x in ["below","under","lower","down"]) else "above"
 
 def time_to_res(res_time:datetime)->float:
     return max(0,(res_time-now()).total_seconds())
