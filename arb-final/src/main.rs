@@ -321,6 +321,11 @@ async fn main() -> Result<()> {
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
+            // Cancel all open CLOB orders before exiting
+            if let Some(ref clob) = clob_client {
+                info!("[SHUTDOWN] Cancelling all open CLOB orders...");
+                let _ = clob.cancel_all_orders().await;
+            }
             let _ = trade_log.flush();
             info!("=======================================================");
             info!("  SHUTDOWN — pairs={} cum_pnl=${:+.2}", total_pairs, cum_pnl);
@@ -435,6 +440,17 @@ async fn main() -> Result<()> {
                 let po = pending_order.take().unwrap();
                 info!("[ARB] TIMEOUT {} {} @{:.3} — cancelled after {:.0}s (ask was {:.3})",
                     po.side, po.slug, po.price, elapsed, book_ask);
+
+                // Cancel live CLOB order if it exists
+                if let (Some(clob), Some(oid)) = (&clob_client, &po.clob_order_id) {
+                    let c = clob.clone();
+                    let oid = oid.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = c.cancel_order(&oid).await {
+                            warn!("[CLOB] Cancel failed for {}: {:#}", oid, e);
+                        }
+                    });
+                }
 
                 log_arb(&mut trade_log, &ArbTradeLog {
                     event: "CANCEL".into(), ts: now,
@@ -716,18 +732,22 @@ async fn main() -> Result<()> {
                         book.status());
 
                     // Place live order if wallet configured
+                    let mut live_order_id: Option<String> = None;
                     if let Some(ref clob) = clob_client {
-                        let c = clob.clone();
-                        let tid = token_id.clone();
-                        let px = limit_px;
-                        let sz = shares;
-                        let s = slug.clone();
-                        tokio::spawn(async move {
-                            match c.place_limit_order(&tid, px, sz, "BUY").await {
-                                Ok(resp) => info!("[CLOB] BUY placed for {}: {:?}", s, resp),
-                                Err(e) => warn!("[CLOB] BUY failed for {} (px={} sz={}): {:#}", s, px, sz, e),
+                        let order_fn = if is_taker {
+                            clob.place_market_order(&token_id, limit_px, shares, "BUY").await
+                        } else {
+                            clob.place_limit_order(&token_id, limit_px, shares, "BUY").await
+                        };
+                        match order_fn {
+                            Ok(r) => {
+                                info!("[CLOB] {} BUY placed for {}: id={} ok={}",
+                                    mode, slug, r.order_id, r.success);
+                                live_order_id = Some(r.order_id);
                             }
-                        });
+                            Err(e) => warn!("[CLOB] {} BUY failed for {} (px={} sz={}): {:#}",
+                                mode, slug, limit_px, shares, e),
+                        }
                     }
 
                     pending_order = Some(PendingOrder {
@@ -739,6 +759,7 @@ async fn main() -> Result<()> {
                         cost: arb_cfg.unit_size,
                         posted_at: now,
                         is_taker,
+                        clob_order_id: live_order_id,
                     });
 
                     log_arb(&mut trade_log, &ArbTradeLog {

@@ -124,6 +124,7 @@ pub struct PendingOrder {
     pub cost:      f64,     // unit_size
     pub posted_at: f64,     // unix ts
     pub is_taker:  bool,    // taker = immediate fill, pays PM fee
+    pub clob_order_id: Option<String>, // CLOB order ID for live cancellation
 }
 
 // -- ArbBook (per-window) -----------------------------------------------------

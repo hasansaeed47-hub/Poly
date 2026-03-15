@@ -203,8 +203,9 @@ async fn main() -> Result<()> {
         }
     }
 
+    let mode = if clob_client.is_some() { "LIVE" } else { "PAPER" };
     info!("═══════════════════════════════════════════════════════");
-    info!("  SNIPER FINAL v1.0 — PAPER (diagnostic logging)");
+    info!("  SNIPER FINAL v1.0 — {} mode", mode);
     info!("═══════════════════════════════════════════════════════");
     info!("  Assets: {:?}", cfg.feed.assets);
     info!("  Timeframes: {:?}m", cfg.feed.timeframes);
@@ -373,6 +374,11 @@ async fn main() -> Result<()> {
 
     loop {
         if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            // Cancel all open CLOB orders before exiting
+            if let Some(ref clob) = clob_client {
+                info!("[SHUTDOWN] Cancelling all open CLOB orders...");
+                let _ = clob.cancel_all_orders().await;
+            }
             let _ = event_log.flush();
             let cum: f64 = trackers.iter().map(|t| t.stats.pnl).sum();
             info!("═══════════════════════════════════════════════════════");
@@ -558,7 +564,7 @@ async fn main() -> Result<()> {
                                 let reason = result.exit_reason.clone();
                                 tokio::spawn(async move {
                                     match c.place_market_order(&tid, exit_px, shares, "SELL").await {
-                                        Ok(resp) => info!("[CLOB] [{}] {} SELL placed: {:?}", eid, reason, resp),
+                                        Ok(r) => info!("[CLOB] [{}] {} SELL placed: id={} ok={}", eid, reason, r.order_id, r.success),
                                         Err(e) => warn!("[CLOB] [{}] {} SELL failed (px={} sz={}): {:#}", eid, reason, exit_px, shares, e),
                                     }
                                 });
@@ -624,7 +630,7 @@ async fn main() -> Result<()> {
                             debug!("[CLOB] [{}] BUY attempt for {}: limit_px={} shares={} tid={}",
                                 eid, slug_s, limit_px, shares, &tid[..tid.len().min(20)]);
                             match c.place_limit_order(&tid, limit_px, shares, "BUY").await {
-                                Ok(resp) => info!("[CLOB] [{}] BUY placed for {}: {:?}", eid, slug_s, resp),
+                                Ok(r) => info!("[CLOB] [{}] BUY placed for {}: id={} ok={}", eid, slug_s, r.order_id, r.success),
                                 Err(e) => warn!("[CLOB] [{}] BUY failed for {} (px={} sz={}): {:#}", eid, slug_s, limit_px, shares, e),
                             }
                         });

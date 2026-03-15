@@ -148,9 +148,9 @@ async fn main() -> Result<()> {
     info!("===============================================================");
 
     match client.place_limit_order(&token_id, price, size, "BUY").await {
-        Ok(resp) => {
+        Ok(r) => {
             info!("Order placed successfully!");
-            info!("Response: {}", resp);
+            info!("Order ID: {}  Success: {}", r.order_id, r.success);
         }
         Err(e) => {
             error!("Order FAILED: {:#}", e);

@@ -20,7 +20,7 @@ use polymarket_client_sdk::clob::types::{Amount, Side, SignatureType};
 use polymarket_client_sdk::clob::{Client, Config};
 use polymarket_client_sdk::types::{Address, Decimal, U256};
 use tokio::sync::OnceCell;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::wallet::Wallet;
@@ -32,6 +32,13 @@ pub struct ProxyConfig {
     pub funder: Address,
     /// Pre-existing API credentials (from Polymarket account)
     pub credentials: Option<(String, String, String)>, // (api_key, api_secret, passphrase)
+}
+
+/// Order placement result with the CLOB order ID for cancellation tracking.
+#[derive(Debug, Clone)]
+pub struct OrderResult {
+    pub order_id: String,
+    pub success:  bool,
 }
 
 /// Authenticated CLOB client wrapper using the official SDK.
@@ -122,14 +129,14 @@ impl ClobClient {
         Ok(())
     }
 
-    /// Build, sign, and place a limit order (GTC)
+    /// Build, sign, and place a limit order (GTC). Returns the CLOB order ID.
     pub async fn place_limit_order(
         &self,
         token_id: &str,
         price:    f64,
         size:     f64,
         side:     &str,
-    ) -> Result<String> {
+    ) -> Result<OrderResult> {
         let client = self.client().await?;
         let signer: &PrivateKeySigner = self.wallet.inner();
         let token_u256 = U256::from_str(token_id)
@@ -170,19 +177,18 @@ impl ClobClient {
             .await
             .context("SDK post_order failed")?;
 
-        let resp_str = format!("{:?}", resp);
-        info!("[SDK] Order placed: {}", &resp_str[..resp_str.len().min(200)]);
-        Ok(resp_str)
+        info!("[SDK] Limit order placed: id={} success={}", resp.order_id, resp.success);
+        Ok(OrderResult { order_id: resp.order_id, success: resp.success })
     }
 
-    /// Build, sign, and place a market order (FOK)
+    /// Build, sign, and place a market order (FOK). Returns the CLOB order ID.
     pub async fn place_market_order(
         &self,
         token_id: &str,
         price:    f64,
         size:     f64,
         side:     &str,
-    ) -> Result<String> {
+    ) -> Result<OrderResult> {
         let client = self.client().await?;
         let signer: &PrivateKeySigner = self.wallet.inner();
         let token_u256 = U256::from_str(token_id)
@@ -220,8 +226,17 @@ impl ClobClient {
             .await
             .context("SDK post_order failed")?;
 
-        let resp_str = format!("{:?}", resp);
-        info!("[SDK] Market order placed: {}", &resp_str[..resp_str.len().min(200)]);
-        Ok(resp_str)
+        info!("[SDK] Market order placed: id={} success={}", resp.order_id, resp.success);
+        Ok(OrderResult { order_id: resp.order_id, success: resp.success })
+    }
+
+    /// Cancel all open orders on the account.
+    pub async fn cancel_all_orders(&self) -> Result<()> {
+        let client = self.client().await?;
+        match client.cancel_all_orders().await {
+            Ok(resp) => info!("[SDK] Cancel all orders: {:?}", resp),
+            Err(e) => warn!("[SDK] Cancel all orders failed: {:#}", e),
+        }
+        Ok(())
     }
 }
