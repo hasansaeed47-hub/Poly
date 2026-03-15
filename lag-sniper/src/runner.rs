@@ -46,6 +46,7 @@ pub struct LagPosition {
     pub order_id:       String,
     pub tp_fired:       bool,
     pub reversal_ts:    Option<f64>,  // when reversal first detected (confirmation delay)
+    pub trail_high_bid: f64,          // highest bid seen since entry (for trailing stop)
 }
 
 // ── Trade log ───────────────────────────────────────────────────────────────
@@ -176,6 +177,14 @@ impl LagRunner {
 
             if exit_bid <= 0.0 { continue; }
 
+            // ── Update trailing high bid ──────────────────────────────
+            if exit_bid > pos.trail_high_bid {
+                if let Some(p) = self.positions.get_mut(&trade_id) {
+                    p.trail_high_bid = exit_bid;
+                }
+            }
+            let trail_high = pos.trail_high_bid.max(exit_bid);
+
             // ── Exit 1: CONVERGENCE ─────────────────────────────────────
             // CL has caught up to BN → the lag that created our edge is gone
             // Book should now be repriced → take profit at new bid
@@ -194,14 +203,16 @@ impl LagRunner {
                 continue;
             }
 
-            // ── Exit 2: PROFIT ──────────────────────────────────────────
-            // Book bid moved above entry + min_profit → take partial
-            if !pos.tp_fired && exit_bid >= pos.entry_price + self.config.min_profit {
+            // ── Exit 2: TRAILING STOP ──────────────────────────────────
+            // Once bid reaches entry + min_profit, activate trailing stop.
+            // Exit when bid drops 2c from the high-water mark.
+            let trail_activated = trail_high >= pos.entry_price + self.config.min_profit;
+            if trail_activated && exit_bid <= trail_high - 0.02 {
                 info!(
-                    "[LAG_RUNNER] PROFIT {} bid={:.3} >= entry+min={:.3} hold={:.1}s",
-                    pos.slug, exit_bid, pos.entry_price + self.config.min_profit, hold_secs
+                    "[LAG_RUNNER] TRAIL_STOP {} bid={:.3} high={:.3} drop={:.3} hold={:.1}s",
+                    pos.slug, exit_bid, trail_high, trail_high - exit_bid, hold_secs
                 );
-                self.partial_exit(&trade_id, exit_bid, "PROFIT", now).await;
+                self.exit_position(&trade_id, exit_bid, "TRAIL_STOP", now).await;
                 continue;
             }
 
@@ -338,14 +349,14 @@ impl LagRunner {
             Ok(fill) => {
                 let actual_price = fill.price;
 
-                // Post-fill edge check
+                // Post-fill edge check: after slippage, edge must be >= 0.10
                 let post_edge = match sig.side {
                     Side::Yes => sig.fair_bn - actual_price,
                     Side::No  => (1.0 - sig.fair_bn) - actual_price,
                 };
-                if post_edge < 0.01 {
+                if post_edge < 0.10 {
                     warn!(
-                        "[LAG_RUNNER] REJECT post-fill {} edge={:.3} too small (fill={:.3})",
+                        "[LAG_RUNNER] REJECT post-fill {} edge={:.3} < 0.10 (fill={:.3})",
                         sig.slug, post_edge, actual_price
                     );
                     let shares = self.config.stake / actual_price;
@@ -390,6 +401,7 @@ impl LagRunner {
                     order_id: fill.order_id,
                     tp_fired: false,
                     reversal_ts: None,
+                    trail_high_bid: 0.0,
                 };
 
                 self.positions.insert(trade_id, pos);
@@ -450,12 +462,14 @@ impl LagRunner {
 
         match reason {
             "CONVERGENCE" => self.stats.convergence += 1,
+            "TRAIL_STOP"  => self.stats.profit_exits += 1,
             "REVERSAL_SL" | "HARD_SL" => self.stats.reversal_sl += 1,
             "TIME_EXIT"   => self.stats.time_exits += 1,
             _ => {}
         }
     }
 
+    #[allow(dead_code)]
     async fn partial_exit(&mut self, trade_id: &str, exit_bid: f64, reason: &str, now: f64) {
         let pos = match self.positions.get(trade_id) {
             Some(p) => p.clone(),

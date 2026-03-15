@@ -13,14 +13,14 @@ clob_rest  = "https://clob.polymarket.com"
 live_ws    = "wss://ws-live-data.polymarket.com"
 gamma_api  = "https://gamma-api.polymarket.com"
 
-rest_throttle_ms = 500
+rest_throttle_ms = 250
 book_warmup_secs = 5
 book_stale_secs  = 3.0
 
 [scan]
 tick_ms            = 250    # 250ms for faster lag detection (vs 500ms in oracle-v1)
 sigma_window_secs  = 300    # 5-min rolling vol from BN history
-min_secs           = 60     # don't scan below T-60s
+min_secs           = 90     # don't scan below T-90s
 
 # ── Lag Detection Thresholds ─────────────────────────────────────────────
 [lag]
@@ -28,10 +28,10 @@ min_divergence_pct  = 0.035  # BN-CL must diverge by at least 0.035% (was 0.03)
 min_edge            = 0.08   # fair_bn - fill_price >= 8 cents (was 0.03 — too thin)
 min_fair_gap        = 0.05   # |fair_bn - fair_cl| >= 5 cents (was 0.01 — noise)
 min_bn_momentum     = 0.0003 # |BN 5s pct change| >= 0.03% (was 0.0002)
-min_secs_left       = 60     # don't enter below T-60s
+min_secs_left       = 90     # don't enter below T-90s (was 60 — too close to settlement)
 max_secs_left       = 600    # don't enter above T-10min (was 840 — too early is noise)
 max_sigma           = 0.80   # skip if sigma > 80% annualized
-min_depth_multiple  = 2.0    # book depth >= 2x stake
+min_depth_multiple  = 1.0    # book depth >= 1x stake ($5 depth for $5 trade)
 min_entry_price     = 0.12   # no sub-12c lottery tickets (was 0.10)
 max_entry_price     = 0.88   # no overpaying >88c (was 0.90)
 min_bn_flow_confirm = 0.05   # BN flow imbalance must confirm direction
@@ -39,8 +39,8 @@ min_bn_flow_confirm = 0.05   # BN flow imbalance must confirm direction
 # ── Strategy Parameters ──────────────────────────────────────────────────
 [strategy]
 stake              = 5.0     # USD per position
-maker_chase_ticks  = 2       # chase up 2 ticks max
-chase_interval_ms  = 300     # 300ms between chase ticks (faster than v1's 500ms)
+maker_chase_ticks  = 1       # chase 1 tick then taker (was 2 — faster entry)
+chase_interval_ms  = 300     # 300ms between chase ticks
 max_concurrent     = 6       # max open positions
 max_hold_secs      = 30.0    # exit if lag doesn't close in 30s
 min_profit         = 0.03    # 3 cents to trigger take-profit

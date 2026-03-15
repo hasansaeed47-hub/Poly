@@ -35,9 +35,9 @@ use tracing::{info, warn, error};
 use tracing_subscriber::EnvFilter;
 
 use feeds::{
-    BnPrices, BnTradeFlow, BookState, ClPrices, MarketMeta, PriceHistory, RateLimiter,
+    BnPrices, BnTradeFlow, BookState, ClCadence, ClPrices, MarketMeta, PriceHistory, RateLimiter,
     build_slug, current_window_starts, fetch_books_batch, fetch_market_meta,
-    run_cl_feed, run_bn_feed, momentum, bn_flow_imbalance,
+    run_cl_feed, run_bn_feed, momentum, bn_flow_imbalance, cl_cadence_info,
 };
 use signal::estimate_sigma;
 use lag::{LagDetector, LagConfig};
@@ -100,6 +100,7 @@ fn enforce_lag_floor(cfg: &mut LagConfigFile) {
     if cfg.min_edge            < 0.08  { cfg.min_edge            = 0.08;  }
     if cfg.min_fair_gap        < 0.05  { cfg.min_fair_gap        = 0.05;  }
     if cfg.min_bn_momentum     < 0.0003 { cfg.min_bn_momentum   = 0.0003; }
+    if cfg.min_secs_left       < 90.0  { cfg.min_secs_left       = 90.0;  }
     if cfg.max_secs_left       > 600.0 { cfg.max_secs_left       = 600.0; }
     if cfg.min_entry_price     < 0.12  { cfg.min_entry_price     = 0.12;  }
     if cfg.max_entry_price     > 0.88  { cfg.max_entry_price     = 0.88;  }
@@ -211,6 +212,7 @@ async fn main() -> Result<()> {
     let book_state:    BookState    = Arc::new(DashMap::new());
     let price_history: PriceHistory = Arc::new(DashMap::new());
     let bn_trades:     BnTradeFlow  = Arc::new(DashMap::new());
+    let cl_cadence:    ClCadence    = Arc::new(DashMap::new());
     let token_ids:     Arc<DashMap<String, ()>> = Arc::new(DashMap::new());
 
     let http = Client::builder()
@@ -255,9 +257,10 @@ async fn main() -> Result<()> {
     {
         let cp = cl_prices.clone();
         let ph = price_history.clone();
+        let cc = cl_cadence.clone();
         let ws = cfg.feed.live_ws.clone();
         tokio::spawn(async move {
-            run_cl_feed(ws, cp, ph).await;
+            run_cl_feed(ws, cp, ph, cc).await;
         });
     }
 
@@ -406,9 +409,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── Batch book refresh (every other tick) ───────────────────────
+        // ── Batch book refresh (every tick — 250ms for fresher quotes) ──
 
-        if tick_count % 2 == 0 {
+        {
             let all_tokens: Vec<String> = token_ids.iter().map(|e| e.key().clone()).collect();
             if !all_tokens.is_empty() {
                 match fetch_books_batch(&http, &cfg.feed.clob_rest, &all_tokens, &limiter).await {
@@ -518,23 +521,25 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            // Sigma from BN history (higher frequency = better estimate)
-            let sigma = {
-                let hist_key = format!("bn_{}", meta.asset);
-                let hist = price_history.get(&hist_key);
-                match hist {
-                    Some(h) => estimate_sigma(&h, cfg.scan.sigma_window_secs, now),
-                    None => 0.50,
-                }
-            };
-
-            // BN 5s momentum
+            // BN 5s momentum (compute first — used for adaptive sigma)
             let bn_mom = {
                 let hist_key = format!("bn_{}", meta.asset);
                 let hist = price_history.get(&hist_key);
                 match hist {
                     Some(h) => momentum(&h, now, 5.0).0,
                     None => 0.0,
+                }
+            };
+
+            // Adaptive sigma: use 60s window in fast moves, 300s otherwise
+            // Fast moves need responsive vol; slow markets need stable vol
+            let sigma = {
+                let hist_key = format!("bn_{}", meta.asset);
+                let hist = price_history.get(&hist_key);
+                let window = if bn_mom.abs() > 0.001 { 60.0 } else { cfg.scan.sigma_window_secs };
+                match hist {
+                    Some(h) => estimate_sigma(&h, window, now),
+                    None => 0.50,
                 }
             };
 
@@ -556,6 +561,15 @@ async fn main() -> Result<()> {
                 now,
             ).await;
 
+            // ── CL cadence info ────────────────────────────────────────
+            let cl_cad = {
+                let cad = cl_cadence.get(&meta.asset);
+                match cad {
+                    Some(c) => cl_cadence_info(&c, now),
+                    None => (0.0, 20.0),
+                }
+            };
+
             // ── Lag detection ───────────────────────────────────────────
             if let Some(lag_sig) = detector.detect(
                 slug, &meta.asset, meta.tf,
@@ -565,6 +579,7 @@ async fn main() -> Result<()> {
                 bn_mom, bn_flow,
                 &book_yes, &book_no,
                 now,
+                cl_cad,
             ) {
                 runner.on_lag_signal(
                     &lag_sig, meta.window_end,

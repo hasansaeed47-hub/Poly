@@ -131,6 +131,8 @@ impl LagDetector {
         book_yes:     &BookEntry,
         book_no:      &BookEntry,
         now:          f64,
+        // CL cadence: (secs_since_last_update, estimated_cadence)
+        cl_cadence:   (f64, f64),
     ) -> Option<LagSignal> {
         // ── Basic validity checks ───────────────────────────────────────
         if open_price <= 0.0 || bn_price <= 0.0 || cl_price <= 0.0 { return None; }
@@ -146,6 +148,14 @@ impl LagDetector {
 
         // ── Sigma gate ──────────────────────────────────────────────────
         if sigma > self.config.max_sigma {
+            return None;
+        }
+
+        // ── CL cadence gate ──────────────────────────────────────────────
+        // Only enter within 3s after a CL update — maximizes time before next
+        // CL reprice, giving us the widest lag window for convergence
+        let (since_last_cl, _cadence) = cl_cadence;
+        if since_last_cl > 3.0 {
             return None;
         }
 
@@ -172,55 +182,72 @@ impl LagDetector {
             return None;
         }
 
-        // ── Determine side from BN direction ────────────────────────────
-        // BN moving UP → YES will be worth more → buy YES
-        // BN moving DOWN → NO will be worth more → buy NO
-        let side = if bn_momentum > 0.0 { Side::Yes } else { Side::No };
+        // ── Evaluate BOTH sides and pick the one with better edge ──────
+        // BN momentum determines primary side, but we also check the other
+        // side in case the gap creates a better opportunity there.
+        let primary_side = if bn_momentum > 0.0 { Side::Yes } else { Side::No };
 
-        // ── BN flow confirmation ────────────────────────────────────────
-        // Flow imbalance must confirm the side
-        let flow_confirms = match side {
-            Side::Yes => bn_flow_imbal >= self.config.min_bn_flow_confirm,
-            Side::No  => bn_flow_imbal <= -self.config.min_bn_flow_confirm,
-        };
-        if !flow_confirms {
-            return None;
+        // Try both sides, pick the one with the highest edge
+        let sides_to_try = [primary_side, if primary_side == Side::Yes { Side::No } else { Side::Yes }];
+        let mut best_candidate: Option<(Side, f64, f64, f64, &BookEntry)> = None; // (side, edge, fill_price, depth, book)
+
+        for &try_side in &sides_to_try {
+            // BN flow confirmation for this side
+            let flow_ok = match try_side {
+                Side::Yes => bn_flow_imbal >= self.config.min_bn_flow_confirm,
+                Side::No  => bn_flow_imbal <= -self.config.min_bn_flow_confirm,
+            };
+            // Primary side requires flow confirmation; secondary side skips it
+            // (the gap itself is the signal for the secondary side)
+            if try_side == primary_side && !flow_ok {
+                continue;
+            }
+
+            let (book, fair) = match try_side {
+                Side::Yes => (book_yes, fair_bn),
+                Side::No  => (book_no, 1.0 - fair_bn),
+            };
+
+            let fill_price = match vwap_fill(&book.asks, self.config.stake) {
+                Some((p, _)) => p,
+                None => continue,
+            };
+
+            if fill_price < self.config.min_entry_price || fill_price > self.config.max_entry_price {
+                continue;
+            }
+
+            let edge = fair - fill_price;
+            if edge < self.config.min_edge {
+                continue;
+            }
+
+            let depth: f64 = book.asks.iter().map(|l| l.price * l.size).sum();
+            if depth < self.config.stake * self.config.min_depth_multiple {
+                continue;
+            }
+
+            // Pick the side with the highest edge
+            let is_better = match &best_candidate {
+                None => true,
+                Some((_, best_edge, _, _, _)) => edge > *best_edge,
+            };
+            if is_better {
+                best_candidate = Some((try_side, edge, fill_price, depth, book));
+            }
         }
 
-        // ── Get book data for our side ──────────────────────────────────
-        let (book, fair) = match side {
-            Side::Yes => (book_yes, fair_bn),
-            Side::No  => (book_no, 1.0 - fair_bn),
-        };
-
-        // ── VWAP fill price ─────────────────────────────────────────────
-        let fill_price = match vwap_fill(&book.asks, self.config.stake) {
-            Some((p, _)) => p,
+        let (side, edge, fill_price, depth, book) = match best_candidate {
+            Some((s, e, fp, d, b)) => (s, e, fp, d, b),
             None => return None,
         };
 
-        // ── Entry price gates ───────────────────────────────────────────
-        if fill_price < self.config.min_entry_price || fill_price > self.config.max_entry_price {
-            return None;
-        }
-
-        // ── Edge: how much we expect to gain ────────────────────────────
-        let edge = fair - fill_price;
-        if edge < self.config.min_edge {
-            return None;
-        }
-
-        // ── Depth gate ──────────────────────────────────────────────────
-        let depth: f64 = book.asks.iter().map(|l| l.price * l.size).sum();
-        if depth < self.config.stake * self.config.min_depth_multiple {
-            return None;
-        }
-
         // ── Compute maker bid price ─────────────────────────────────────
-        // Place inside the spread: best_bid + 0.01, but below best_ask
+        // Place at best_ask - 0.01 to be near where liquidity sits
+        // This dramatically improves fill rate vs bid+1 which is too passive
         let maker_price = {
-            let raw = ((book.best_bid + 0.01) * 100.0).round() / 100.0;
-            raw.min(book.best_ask - 0.01).max(0.01)
+            let raw = ((book.best_ask - 0.01) * 100.0).round() / 100.0;
+            raw.max(book.best_bid + 0.01).max(0.01)
         };
 
         Some(LagSignal {
@@ -304,6 +331,7 @@ mod tests {
             0.30,             // bn flow imbalance (bullish)
             &book_yes, &book_no,
             1001.0,
+            (1.0, 20.0), // cl_cadence: 1s since last update
         );
 
         assert!(sig.is_some(), "should detect upward lag");
@@ -331,6 +359,7 @@ mod tests {
             0.0,
             &book_yes, &book_no,
             1001.0,
+            (1.0, 20.0),
         );
 
         assert!(sig.is_none(), "should reject when no divergence");
@@ -354,6 +383,7 @@ mod tests {
             0.30,
             &book_yes, &book_no,
             1001.0,
+            (1.0, 20.0),
         );
 
         assert!(sig.is_none(), "should reject when insufficient time");

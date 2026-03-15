@@ -33,6 +33,8 @@ pub type BnPrices     = Arc<DashMap<String, (f64, f64)>>;     // asset -> (ts, p
 pub type BookState    = Arc<DashMap<String, BookEntry>>;
 pub type PriceHistory = Arc<DashMap<String, Vec<(f64, f64)>>>; // key -> [(ts, price)]
 pub type BnTradeFlow  = Arc<DashMap<String, Vec<BnTradeEvent>>>;
+/// CL update cadence tracker: asset -> Vec<timestamp> of CL updates
+pub type ClCadence    = Arc<DashMap<String, Vec<f64>>>;
 
 /// Individual Binance aggTrade with side information
 #[derive(Debug, Clone)]
@@ -348,10 +350,11 @@ pub async fn run_cl_feed(
     live_ws:       String,
     cl_prices:     ClPrices,
     price_history: PriceHistory,
+    cl_cadence:    ClCadence,
 ) {
     loop {
         info!("[CL] Connecting to {}", live_ws);
-        match connect_cl_feed(&live_ws, &cl_prices, &price_history).await {
+        match connect_cl_feed(&live_ws, &cl_prices, &price_history, &cl_cadence).await {
             Ok(_)  => warn!("[CL] Feed closed cleanly, reconnecting..."),
             Err(e) => error!("[CL] Feed error: {}, reconnecting in {}s", e, WS_RECONNECT_SECS),
         }
@@ -363,6 +366,7 @@ async fn connect_cl_feed(
     live_ws:       &str,
     cl_prices:     &ClPrices,
     price_history: &PriceHistory,
+    cl_cadence:    &ClCadence,
 ) -> Result<()> {
     let url = Url::parse(live_ws).context("invalid live WS URL")?;
     let (mut ws, _) = connect_async(url.to_string()).await.context("CL WS connect failed")?;
@@ -397,7 +401,7 @@ async fn connect_cl_feed(
         match msg {
             Ok(Message::Text(text)) => {
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    process_cl_message(&v, cl_prices, price_history);
+                    process_cl_message(&v, cl_prices, price_history, cl_cadence);
                 }
             }
             Ok(Message::Ping(data)) => { let _ = ws.send(Message::Pong(data)).await; }
@@ -413,6 +417,7 @@ fn process_cl_message(
     v:             &serde_json::Value,
     cl_prices:     &ClPrices,
     price_history: &PriceHistory,
+    cl_cadence:    &ClCadence,
 ) {
     let topic = v.get("topic").and_then(|t| t.as_str()).unwrap_or("");
     if topic != "crypto_prices_chainlink" { return; }
@@ -455,6 +460,14 @@ fn process_cl_message(
     if hist.len() > 5000 {
         let drain_to = hist.len() - 5000;
         hist.drain(0..drain_to);
+    }
+
+    // Track CL update timestamps for cadence prediction
+    let mut cadence = cl_cadence.entry(asset).or_default();
+    cadence.push(now_f);
+    if cadence.len() > 100 {
+        let drain_to = cadence.len() - 100;
+        cadence.drain(0..drain_to);
     }
 }
 
@@ -627,6 +640,33 @@ pub fn bn_flow_imbalance(
     // Require minimum $500 notional volume for reliable signal
     let imbalance = if total >= 500.0 { (buy_vol - sell_vol) / total } else { 0.0 };
     (buy_vol, sell_vol, imbalance)
+}
+
+/// Estimate seconds since last CL update for an asset.
+/// Returns (secs_since_last_update, estimated_cadence_secs).
+/// If fewer than 3 updates, returns (0.0, 20.0) as default.
+pub fn cl_cadence_info(cadence: &[f64], now: f64) -> (f64, f64) {
+    if cadence.len() < 3 {
+        return (0.0, 20.0); // default: assume 20s cadence
+    }
+    let since_last = now - cadence.last().copied().unwrap_or(now);
+
+    // Compute median interval from recent updates
+    let n = cadence.len().min(20);
+    let recent = &cadence[cadence.len() - n..];
+    let mut intervals: Vec<f64> = recent.windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&d| d > 0.5 && d < 120.0) // filter noise
+        .collect();
+    intervals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let median = if intervals.is_empty() {
+        20.0
+    } else {
+        intervals[intervals.len() / 2]
+    };
+
+    (since_last, median)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
