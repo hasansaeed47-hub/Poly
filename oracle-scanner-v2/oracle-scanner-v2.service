@@ -12,8 +12,7 @@ Restart=always
 RestartSec=5
 Environment=RUST_LOG=oracle_scanner_v2=info
 
-# Hardening (mount namespacing disabled — caused 226/NAMESPACE failures)
-NoNewPrivileges=true
+# All hardening removed — caused 226/NAMESPACE on this system
 
 [Install]
 WantedBy=multi-user.target
