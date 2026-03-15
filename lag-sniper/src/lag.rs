@@ -1,16 +1,18 @@
 /// lag.rs — Lag detection engine
 ///
-/// Detects exploitable CL→PM book lag using BN as the leading indicator.
+/// Detects exploitable CL→PM book lag.
 ///
-/// Two-stage lag:
-///   Stage 1: BN moves → CL hasn't caught up (1-5s)
-///   Stage 2: CL catches up → PM book hasn't repriced (0.2-2s)
+/// PM settles on Chainlink (CL). When CL updates, PM book MMs are slow to
+/// reprice (200ms-2s cancel-replace cycle). We detect the CL move, verify
+/// direction with BN momentum + flow, and buy the stale book before MMs
+/// catch up.
 ///
-/// We fire on EITHER stage:
-///   - "Predictive" entry: BN moved, CL stale, book stale → enter before CL catches up
-///   - "Reactive" entry: CL just moved, book still stale → enter in the MM cancel-replace gap
+/// Signal:  CL moved → fair_cl changed → PM book still priced at old fair
+/// Confirm: BN momentum + trade flow agree with CL direction
+/// Edge:    fair_cl - fill_price (what PM settles on minus what we pay)
+/// Exit:    PM book reprices to match CL → sell at new bid
 ///
-/// Both modes use maker-first execution (0% fee).
+/// All entries maker (0% fee). Taker only for emergency SL.
 
 use crate::feeds::{BookEntry, vwap_fill};
 use crate::signal::fair_yes;
@@ -47,14 +49,14 @@ pub struct LagSignal {
     pub open_price:   f64,
 
     // Lag metrics
-    pub divergence_pct: f64,   // |bn - cl| / cl * 100
+    pub cl_move_pct:    f64,   // |CL 5s pct change| — the trigger
     pub cl_age_ms:      f64,   // ms since last CL update
-    pub bn_momentum:    f64,   // BN 5s pct change
+    pub bn_momentum:    f64,   // BN 5s pct change (confirmation)
 
-    // Fair values (the key insight)
-    pub fair_bn:      f64,     // fair_yes using BN price (truth)
-    pub fair_cl:      f64,     // fair_yes using CL price (what market sees)
-    pub fair_gap:     f64,     // |fair_bn - fair_cl| (exploitable divergence)
+    // Fair values
+    pub fair_cl:      f64,     // fair_yes using CL price (TRUTH — PM settles on this)
+    pub fair_bn:      f64,     // fair_yes using BN price (confirmation only)
+    pub book_gap:     f64,     // fair_cl - best_ask (how stale the book is)
 
     // Book state
     pub best_ask:     f64,
@@ -63,7 +65,7 @@ pub struct LagSignal {
     pub depth:        f64,     // USD depth on entry side
 
     // Edge
-    pub edge:         f64,     // fair_bn - fill_price (for YES); analogous for NO
+    pub edge:         f64,     // fair_cl - fill_price (for YES); analogous for NO
     pub maker_price:  f64,     // recommended maker bid price
 
     // Timing
@@ -77,16 +79,16 @@ pub struct LagSignal {
 
 #[derive(Debug, Clone)]
 pub struct LagConfig {
-    pub min_divergence_pct:  f64,   // min BN-CL divergence % to trigger
-    pub min_edge:            f64,   // min fair_bn - fill_price
-    pub min_fair_gap:        f64,   // min |fair_bn - fair_cl|
-    pub min_bn_momentum:     f64,   // min |BN 5s pct change|
+    pub min_cl_move_pct:     f64,   // min |CL 5s pct change| to trigger
+    pub min_edge:            f64,   // min fair_cl - fill_price
+    pub min_book_gap:        f64,   // min fair_cl - best_ask (book staleness)
+    pub min_bn_momentum:     f64,   // min |BN 5s pct change| (confirmation)
     pub min_secs_left:       f64,   // don't enter below this
     pub max_secs_left:       f64,   // don't enter above this
     pub max_sigma:           f64,   // skip high-vol (BS unreliable)
     pub min_depth_multiple:  f64,   // depth must be >= stake * this
-    pub min_entry_price:     f64,   // no sub-30c lottery tickets
-    pub max_entry_price:     f64,   // no overpaying >60c
+    pub min_entry_price:     f64,   // no sub-12c lottery tickets
+    pub max_entry_price:     f64,   // no overpaying >88c
     pub stake:               f64,
     pub min_bn_flow_confirm: f64,   // min BN flow imbalance confirming direction
 }
@@ -104,12 +106,12 @@ impl LagDetector {
 
     /// Detect a lag opportunity on a single market.
     ///
-    /// Returns Some(LagSignal) if all conditions are met:
-    /// 1. BN-CL divergence above threshold
-    /// 2. BN momentum confirms direction
-    /// 3. BS fair value gap between BN-derived and CL-derived
-    /// 4. Book is stale (priced closer to CL-fair than BN-fair)
-    /// 5. Edge (fair_bn - fill_price) above threshold
+    /// CL is truth (PM settles on it). Signal fires when:
+    /// 1. CL just moved (cl_momentum above threshold)
+    /// 2. PM book is stale (fair_cl vs book price gap)
+    /// 3. BN momentum confirms the direction
+    /// 4. BN trade flow confirms the direction
+    /// 5. Edge (fair_cl - fill_price) above threshold
     /// 6. Sufficient depth and time remaining
     pub fn detect(
         &self,
@@ -120,13 +122,13 @@ impl LagDetector {
         secs_left:    f64,
         sigma:        f64,
         // Prices
-        bn_price:     f64,
-        _bn_ts:       f64,
         cl_price:     f64,
         cl_ts:        f64,
-        // BN signals
-        bn_momentum:  f64,     // 5s pct change
-        bn_flow_imbal: f64,    // trade flow imbalance
+        bn_price:     f64,
+        // Momentum
+        cl_momentum:  f64,     // CL 5s pct change (PRIMARY trigger)
+        bn_momentum:  f64,     // BN 5s pct change (confirmation)
+        bn_flow_imbal: f64,    // BN trade flow imbalance (confirmation)
         // Book data
         book_yes:     &BookEntry,
         book_no:      &BookEntry,
@@ -135,7 +137,7 @@ impl LagDetector {
         cl_cadence:   (f64, f64),
     ) -> Option<LagSignal> {
         // ── Basic validity checks ───────────────────────────────────────
-        if open_price <= 0.0 || bn_price <= 0.0 || cl_price <= 0.0 { return None; }
+        if open_price <= 0.0 || cl_price <= 0.0 { return None; }
         // Reject extreme open prices that make BS model ill-conditioned
         if (cl_price / open_price) < 0.90 || (cl_price / open_price) > 1.10 { return None; }
         if secs_left <= 0.0 { return None; }
@@ -152,41 +154,41 @@ impl LagDetector {
         }
 
         // ── CL cadence gate ──────────────────────────────────────────────
-        // Only enter within 3s after a CL update — maximizes time before next
-        // CL reprice, giving us the widest lag window for convergence
+        // Only enter within 3s after a CL update — CL data is fresh,
+        // book hasn't repriced yet, maximum window before MMs catch up
         let (since_last_cl, _cadence) = cl_cadence;
         if since_last_cl > 3.0 {
             return None;
         }
 
-        // ── Compute lag metrics ─────────────────────────────────────────
-        let divergence_pct = ((bn_price - cl_price) / cl_price).abs() * 100.0;
         let cl_age_ms = (now - cl_ts) * 1000.0;
 
-        // ── Divergence gate ─────────────────────────────────────────────
-        if divergence_pct < self.config.min_divergence_pct {
+        // ── CL momentum gate (PRIMARY TRIGGER) ──────────────────────────
+        // CL must have actually moved — this is the signal source
+        let cl_move_pct = cl_momentum.abs() * 100.0;
+        if cl_move_pct < self.config.min_cl_move_pct {
             return None;
         }
 
-        // ── BN momentum gate ────────────────────────────────────────────
+        // ── BN momentum confirmation ────────────────────────────────────
+        // BN must agree with CL direction — filters fake/noisy CL moves
         if bn_momentum.abs() < self.config.min_bn_momentum {
+            return None;
+        }
+        // BN and CL must be moving in the same direction
+        if (cl_momentum > 0.0) != (bn_momentum > 0.0) {
             return None;
         }
 
         // ── Compute fair values ─────────────────────────────────────────
-        let fair_bn  = fair_yes(bn_price, open_price, sigma, secs_left);
+        // fair_cl is TRUTH — PM settles on CL price
         let fair_cl  = fair_yes(cl_price, open_price, sigma, secs_left);
-        let fair_gap = (fair_bn - fair_cl).abs();
+        let fair_bn  = fair_yes(bn_price, open_price, sigma, secs_left);
 
-        if fair_gap < self.config.min_fair_gap {
-            return None;
-        }
-
-        // ── Determine side from BN direction ────────────────────────────
-        // BN moving UP → YES will be worth more → buy YES
-        // BN moving DOWN → NO will be worth more → buy NO
-        // ONLY trade the side BN confirms. Never trade against momentum.
-        let side = if bn_momentum > 0.0 { Side::Yes } else { Side::No };
+        // ── Determine side from CL direction ────────────────────────────
+        // CL moving UP → YES will be worth more → buy YES
+        // CL moving DOWN → NO will be worth more → buy NO
+        let side = if cl_momentum > 0.0 { Side::Yes } else { Side::No };
 
         // ── BN flow confirmation ────────────────────────────────────────
         let flow_confirms = match side {
@@ -199,9 +201,16 @@ impl LagDetector {
 
         // ── Get book data for our side ──────────────────────────────────
         let (book, fair) = match side {
-            Side::Yes => (book_yes, fair_bn),
-            Side::No  => (book_no, 1.0 - fair_bn),
+            Side::Yes => (book_yes, fair_cl),
+            Side::No  => (book_no, 1.0 - fair_cl),
         };
+
+        // ── Book staleness check ────────────────────────────────────────
+        // Book must be stale — priced below where CL says fair value is
+        let book_gap = fair - book.best_ask;
+        if book_gap < self.config.min_book_gap {
+            return None;
+        }
 
         // ── VWAP fill price ─────────────────────────────────────────────
         let fill_price = match vwap_fill(&book.asks, self.config.stake) {
@@ -215,6 +224,7 @@ impl LagDetector {
         }
 
         // ── Edge: how much we expect to gain ────────────────────────────
+        // Edge = fair_cl - fill_price (CL is what PM settles on)
         let edge = fair - fill_price;
         if edge < self.config.min_edge {
             return None;
@@ -228,7 +238,6 @@ impl LagDetector {
 
         // ── Compute maker bid price ─────────────────────────────────────
         // Place at best_ask - 0.01 to be near where liquidity sits
-        // This dramatically improves fill rate vs bid+1 which is too passive
         let maker_price = {
             let raw = ((book.best_ask - 0.01) * 100.0).round() / 100.0;
             raw.max(book.best_bid + 0.01).max(0.01)
@@ -242,12 +251,12 @@ impl LagDetector {
             bn_price,
             cl_price,
             open_price,
-            divergence_pct,
+            cl_move_pct,
             cl_age_ms,
             bn_momentum,
-            fair_bn,
             fair_cl,
-            fair_gap,
+            fair_bn,
+            book_gap,
             best_ask: book.best_ask,
             best_bid: book.best_bid,
             fill_price,
@@ -271,9 +280,9 @@ mod tests {
 
     fn make_config() -> LagConfig {
         LagConfig {
-            min_divergence_pct:  0.03,
+            min_cl_move_pct:     0.03,
             min_edge:            0.03,
-            min_fair_gap:        0.01,
+            min_book_gap:        0.01,
             min_bn_momentum:     0.0001,
             min_secs_left:       60.0,
             max_secs_left:       840.0,
@@ -301,18 +310,19 @@ mod tests {
         let cfg = make_config();
         let det = LagDetector::new(cfg);
 
-        // BN at 84100, CL at 84000, open at 84000
-        // BN moved up 0.12%, CL hasn't caught up
+        // CL at 84100 (just moved up from ~84000), open at 84000
+        // Book still priced at old level → stale
         let book_yes = make_book(0.52, 0.48, 100.0);
         let book_no  = make_book(0.52, 0.48, 100.0);
 
         let sig = det.detect(
             "btc-updown-5m-1000", "btc", 5,
             84000.0, 200.0, 0.50,
-            84100.0, 1000.5,  // BN
-            84000.0, 999.0,   // CL (1.5s stale)
-            0.0012,           // bn momentum (0.12%)
-            0.30,             // bn flow imbalance (bullish)
+            84100.0, 1000.5,  // CL (just updated)
+            84100.0,          // BN (confirms)
+            0.0012,           // cl momentum (0.12% — CL moved up)
+            0.0012,           // bn momentum (confirms)
+            0.30,             // bn flow imbalance (bullish, confirms)
             &book_yes, &book_no,
             1001.0,
             (1.0, 20.0), // cl_cadence: 1s since last update
@@ -322,15 +332,15 @@ mod tests {
         let s = sig.unwrap();
         assert_eq!(s.side, Side::Yes);
         assert!(s.edge > 0.0, "edge should be positive");
-        assert!(s.divergence_pct > 0.0);
+        assert!(s.cl_move_pct > 0.0);
     }
 
     #[test]
-    fn rejects_no_divergence() {
+    fn rejects_no_cl_move() {
         let cfg = make_config();
         let det = LagDetector::new(cfg);
 
-        // BN = CL = same price → no divergence
+        // CL hasn't moved → no signal
         let book_yes = make_book(0.52, 0.48, 100.0);
         let book_no  = make_book(0.52, 0.48, 100.0);
 
@@ -338,15 +348,16 @@ mod tests {
             "btc-updown-5m-1000", "btc", 5,
             84000.0, 200.0, 0.50,
             84000.0, 1000.5,
-            84000.0, 1000.0,
-            0.0,
-            0.0,
+            84000.0,
+            0.0,              // cl momentum = 0 (no move)
+            0.0,              // bn momentum = 0
+            0.0,              // bn flow = 0
             &book_yes, &book_no,
             1001.0,
             (1.0, 20.0),
         );
 
-        assert!(sig.is_none(), "should reject when no divergence");
+        assert!(sig.is_none(), "should reject when CL hasn't moved");
     }
 
     #[test]
@@ -362,7 +373,8 @@ mod tests {
             "btc-updown-5m-1000", "btc", 5,
             84000.0, 30.0, 0.50,
             84100.0, 1000.5,
-            84000.0, 999.0,
+            84100.0,
+            0.0012,
             0.0012,
             0.30,
             &book_yes, &book_no,

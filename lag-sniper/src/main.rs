@@ -1,18 +1,19 @@
-/// Lag Sniper — 14th March 2026
+/// Lag Sniper — 15th March 2026
 ///
-/// BN-leading, CL-lagging, maker-first lag exploitation bot.
+/// CL-leading, PM-lagging, maker-first lag exploitation bot.
 ///
 /// Architecture:
-///   3 parallel WS feeds: CL (chainlink), BN (binance aggTrade), PM book (REST)
-///   Lag detector: computes fair value from BN (truth) vs CL (market view)
-///   Runner: maker-first entry when lag detected, convergence-based exit
+///   3 parallel feeds: CL (chainlink WS), BN (binance aggTrade WS), PM book (REST)
+///   Lag detector: CL moves → fair_cl changes → PM book stale → buy the gap
+///   BN momentum + flow used only as confirmation
+///   Runner: maker-first entry when lag detected, book-reprice exit
 ///
 /// Flow:
-///   1. BN moves → fair_bn diverges from fair_cl
-///   2. PM book is priced off stale CL → stale asks
-///   3. Lag detector fires → maker bid inside spread
-///   4. MM cancel-replace cycle takes 200ms+ → we get filled
-///   5. CL catches up → book reprices → we sell at new bid
+///   1. CL updates with new price → fair_cl diverges from PM book
+///   2. PM book MMs haven't repriced yet (200ms-2s cancel-replace cycle)
+///   3. BN momentum + flow confirm direction → lag detector fires
+///   4. Maker bid inside spread → get filled at stale price
+///   5. PM book reprices to match CL → sell at new bid
 ///
 /// All entries maker (0% fee). Taker only for emergency SL.
 
@@ -81,9 +82,9 @@ struct ScanConfig {
 
 #[derive(Deserialize, Debug)]
 struct LagConfigFile {
-    min_divergence_pct:  f64,
+    min_cl_move_pct:     f64,
     min_edge:            f64,
-    min_fair_gap:        f64,
+    min_book_gap:        f64,
     min_bn_momentum:     f64,
     min_secs_left:       f64,
     max_secs_left:       f64,
@@ -96,14 +97,14 @@ struct LagConfigFile {
 
 /// Override stale config values with tuned minimums
 fn enforce_lag_floor(cfg: &mut LagConfigFile) {
-    if cfg.min_divergence_pct < 0.035 { cfg.min_divergence_pct = 0.035; }
-    if cfg.min_edge            < 0.08  { cfg.min_edge            = 0.08;  }
-    if cfg.min_fair_gap        < 0.05  { cfg.min_fair_gap        = 0.05;  }
-    if cfg.min_bn_momentum     < 0.0003 { cfg.min_bn_momentum   = 0.0003; }
-    if cfg.min_secs_left       < 90.0  { cfg.min_secs_left       = 90.0;  }
-    if cfg.max_secs_left       > 600.0 { cfg.max_secs_left       = 600.0; }
-    if cfg.min_entry_price     < 0.12  { cfg.min_entry_price     = 0.12;  }
-    if cfg.max_entry_price     > 0.88  { cfg.max_entry_price     = 0.88;  }
+    if cfg.min_cl_move_pct < 0.035 { cfg.min_cl_move_pct = 0.035; }
+    if cfg.min_edge         < 0.08  { cfg.min_edge         = 0.08;  }
+    if cfg.min_book_gap     < 0.05  { cfg.min_book_gap     = 0.05;  }
+    if cfg.min_bn_momentum  < 0.0003 { cfg.min_bn_momentum = 0.0003; }
+    if cfg.min_secs_left    < 90.0  { cfg.min_secs_left    = 90.0;  }
+    if cfg.max_secs_left    > 600.0 { cfg.max_secs_left    = 600.0; }
+    if cfg.min_entry_price  < 0.12  { cfg.min_entry_price  = 0.12;  }
+    if cfg.max_entry_price  > 0.88  { cfg.max_entry_price  = 0.88;  }
 }
 
 #[derive(Deserialize, Debug)]
@@ -149,12 +150,12 @@ async fn main() -> Result<()> {
     enforce_lag_floor(&mut cfg.lag);
 
     info!("═══════════════════════════════════════════════════════════");
-    info!("  LAG SNIPER — BN-Leading Maker-First — 14th March 2026");
+    info!("  LAG SNIPER — CL-Leading Maker-First — 15th March 2026");
     info!("═══════════════════════════════════════════════════════════");
     info!("Assets: {:?}", cfg.feed.assets);
     info!("Timeframes: {:?}m", cfg.feed.timeframes);
-    info!("Lag: div>={:.3}% edge>={:.2} gap>={:.2} momentum>={:.4}",
-        cfg.lag.min_divergence_pct, cfg.lag.min_edge, cfg.lag.min_fair_gap,
+    info!("Lag: cl_move>={:.3}% edge>={:.2} book_gap>={:.2} bn_confirm>={:.4}",
+        cfg.lag.min_cl_move_pct, cfg.lag.min_edge, cfg.lag.min_book_gap,
         cfg.lag.min_bn_momentum);
     info!("Strategy: stake=${} chase={}ticks hold<{}s profit>={:.2} max_pos={} max_dd=${}",
         cfg.strategy.stake, cfg.strategy.maker_chase_ticks,
@@ -278,9 +279,9 @@ async fn main() -> Result<()> {
     // ── Build lag detector ──────────────────────────────────────────────────
 
     let lag_config = LagConfig {
-        min_divergence_pct:  cfg.lag.min_divergence_pct,
+        min_cl_move_pct:     cfg.lag.min_cl_move_pct,
         min_edge:            cfg.lag.min_edge,
-        min_fair_gap:        cfg.lag.min_fair_gap,
+        min_book_gap:        cfg.lag.min_book_gap,
         min_bn_momentum:     cfg.lag.min_bn_momentum,
         min_secs_left:       cfg.lag.min_secs_left,
         max_secs_left:       cfg.lag.max_secs_left,
@@ -491,7 +492,7 @@ async fn main() -> Result<()> {
             };
 
             // Get BN price + timestamp
-            let (bn_ts, bn_price) = match bn_prices.get(&meta.asset) {
+            let (_bn_ts, bn_price) = match bn_prices.get(&meta.asset) {
                 Some(v) => (v.0, v.1),
                 None => continue,
             };
@@ -521,7 +522,17 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            // BN 5s momentum (compute first — used for adaptive sigma)
+            // CL 5s momentum (PRIMARY trigger — did CL just move?)
+            let cl_mom = {
+                let hist_key = format!("cl_{}", meta.asset);
+                let hist = price_history.get(&hist_key);
+                match hist {
+                    Some(h) => momentum(&h, now, 5.0).0,
+                    None => 0.0,
+                }
+            };
+
+            // BN 5s momentum (confirmation — used for adaptive sigma too)
             let bn_mom = {
                 let hist_key = format!("bn_{}", meta.asset);
                 let hist = price_history.get(&hist_key);
@@ -574,9 +585,9 @@ async fn main() -> Result<()> {
             if let Some(lag_sig) = detector.detect(
                 slug, &meta.asset, meta.tf,
                 meta.open_price, secs_left, sigma,
-                bn_price, bn_ts,
                 cl_price, cl_ts,
-                bn_mom, bn_flow,
+                bn_price,
+                cl_mom, bn_mom, bn_flow,
                 &book_yes, &book_no,
                 now,
                 cl_cad,

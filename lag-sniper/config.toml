@@ -1,5 +1,5 @@
-# Lag Sniper — BN-Leading Maker-First Lag Exploitation
-# 14th March 2026
+# Lag Sniper — CL-Leading Maker-First Lag Exploitation
+# 15th March 2026
 
 [wallet]
 private_key    = ""
@@ -23,17 +23,18 @@ sigma_window_secs  = 300    # 5-min rolling vol from BN history
 min_secs           = 90     # don't scan below T-90s
 
 # ── Lag Detection Thresholds ─────────────────────────────────────────────
+# Signal: CL moves → PM book stale → buy gap. BN = confirmation only.
 [lag]
-min_divergence_pct  = 0.035  # BN-CL must diverge by at least 0.035% (was 0.03)
-min_edge            = 0.08   # fair_bn - fill_price >= 8 cents (was 0.03 — too thin)
-min_fair_gap        = 0.05   # |fair_bn - fair_cl| >= 5 cents (was 0.01 — noise)
-min_bn_momentum     = 0.0003 # |BN 5s pct change| >= 0.03% (was 0.0002)
-min_secs_left       = 90     # don't enter below T-90s (was 60 — too close to settlement)
-max_secs_left       = 600    # don't enter above T-10min (was 840 — too early is noise)
+min_cl_move_pct     = 0.035  # CL must move by at least 0.035% (5s window) to trigger
+min_edge            = 0.08   # fair_cl - fill_price >= 8 cents
+min_book_gap        = 0.05   # fair_cl - best_ask >= 5 cents (book staleness)
+min_bn_momentum     = 0.0003 # |BN 5s pct change| >= 0.03% (confirmation)
+min_secs_left       = 90     # don't enter below T-90s
+max_secs_left       = 600    # don't enter above T-10min
 max_sigma           = 0.80   # skip if sigma > 80% annualized
 min_depth_multiple  = 1.0    # book depth >= 1x stake ($5 depth for $5 trade)
-min_entry_price     = 0.12   # no sub-12c lottery tickets (was 0.10)
-max_entry_price     = 0.88   # no overpaying >88c (was 0.90)
+min_entry_price     = 0.12   # no sub-12c lottery tickets
+max_entry_price     = 0.88   # no overpaying >88c
 min_bn_flow_confirm = 0.05   # BN flow imbalance must confirm direction
 
 # ── Strategy Parameters ──────────────────────────────────────────────────

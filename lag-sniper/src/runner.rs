@@ -2,11 +2,11 @@
 ///
 /// Entry: on LagSignal, maker_chase_entry
 /// Exit modes:
-///   1. CONVERGENCE: CL catches up to BN → book reprices → sell at new bid
-///   2. PROFIT: book bid >= entry + min_profit → take profit
+///   1. CONVERGENCE: PM book reprices to match CL fair value → sell at new bid
+///   2. TRAIL_STOP: profit trail with 1.5c drop threshold
 ///   3. REVERSAL: BN momentum flips against position → stop loss
-///   4. TIME: hold exceeds max_hold_secs → exit at best bid
-///   5. WINDOW: secs_left < 60 → hold to settlement (no exit)
+///   4. HARD_SL: bid drops 50%+ from entry
+///   5. TIME: hold exceeds max_hold_secs → exit at best bid
 ///   6. SETTLEMENT: window ends → position settles at outcome price
 
 use std::collections::HashMap;
@@ -33,10 +33,10 @@ pub struct LagPosition {
     pub side:           Side,
     pub token_id:       String,
     pub entry_price:    f64,
-    pub fair_bn_entry:  f64,   // BN-derived fair at entry
-    pub fair_cl_entry:  f64,   // CL-derived fair at entry
+    pub fair_cl_entry:  f64,   // CL-derived fair at entry (truth)
+    pub fair_bn_entry:  f64,   // BN-derived fair at entry (confirmation)
     pub edge_at_entry:  f64,
-    pub divergence_pct: f64,   // BN-CL divergence at entry
+    pub cl_move_pct:    f64,   // CL momentum at entry
     pub sigma:          f64,
     pub stake:          f64,
     pub shares:         f64,
@@ -59,10 +59,10 @@ pub struct TradeLog {
     pub tf:             u32,
     pub side:           String,
     pub entry_price:    f64,
-    pub fair_bn_entry:  f64,
     pub fair_cl_entry:  f64,
+    pub fair_bn_entry:  f64,
     pub edge_at_entry:  f64,
-    pub divergence_pct: f64,
+    pub cl_move_pct:    f64,
     pub sigma:          f64,
     pub stake:          f64,
     pub shares:         f64,
@@ -149,8 +149,8 @@ impl LagRunner {
     pub async fn check_exits(
         &mut self,
         slug:          &str,
-        bn_price:      f64,
-        cl_price:      f64,
+        _bn_price:     f64,
+        _cl_price:     f64,
         _open_price:   f64,
         _sigma:        f64,
         secs_left:     f64,
@@ -186,15 +186,11 @@ impl LagRunner {
             let trail_high = pos.trail_high_bid.max(exit_bid);
 
             // ── Exit 1: CONVERGENCE ─────────────────────────────────────
-            // CL has caught up to BN → the lag that created our edge is gone
-            // Book should now be repriced → take profit at new bid
-            let cl_caught_up = {
-                let cl_div = ((bn_price - cl_price) / cl_price).abs() * 100.0;
-                cl_div < 0.01  // CL within 0.01% of BN = converged
-            };
+            // PM book has repriced to match CL fair value → the lag is closed
+            // Book bid moved above our entry → take profit
             let book_repriced = exit_bid >= pos.entry_price + 0.01;
 
-            if cl_caught_up && book_repriced && !pos.tp_fired {
+            if book_repriced && !pos.tp_fired {
                 info!(
                     "[LAG_RUNNER] CONVERGENCE {} bid={:.3} > entry={:.3} hold={:.1}s",
                     pos.slug, exit_bid, pos.entry_price, hold_secs
@@ -338,10 +334,10 @@ impl LagRunner {
         };
 
         info!(
-            "[LAG_RUNNER] ENTRY {} {} maker={:.2} ask={:.2} fair_bn={:.3} fair_cl={:.3} gap={:.3} edge={:.3} div={:.3}% T-{:.0}s",
+            "[LAG_RUNNER] ENTRY {} {} maker={:.2} ask={:.2} fair_cl={:.3} book_gap={:.3} edge={:.3} cl_move={:.3}% T-{:.0}s",
             sig.slug, sig.side, sig.maker_price, sig.best_ask,
-            sig.fair_bn, sig.fair_cl, sig.fair_gap, sig.edge,
-            sig.divergence_pct, sig.secs_left
+            sig.fair_cl, sig.book_gap, sig.edge,
+            sig.cl_move_pct, sig.secs_left
         );
 
         // Cap best_ask to prevent chasing too far above maker price
@@ -361,9 +357,10 @@ impl LagRunner {
                 let actual_price = fill.price;
 
                 // Post-fill edge check: after slippage, edge must be >= 0.10
+                // Use fair_cl — CL is what PM settles on
                 let post_edge = match sig.side {
-                    Side::Yes => sig.fair_bn - actual_price,
-                    Side::No  => (1.0 - sig.fair_bn) - actual_price,
+                    Side::Yes => sig.fair_cl - actual_price,
+                    Side::No  => (1.0 - sig.fair_cl) - actual_price,
                 };
                 if post_edge < 0.10 {
                     warn!(
@@ -399,10 +396,10 @@ impl LagRunner {
                     side: sig.side,
                     token_id: token_id.to_string(),
                     entry_price: actual_price,
-                    fair_bn_entry: sig.fair_bn,
                     fair_cl_entry: sig.fair_cl,
+                    fair_bn_entry: sig.fair_bn,
                     edge_at_entry: post_edge,
-                    divergence_pct: sig.divergence_pct,
+                    cl_move_pct: sig.cl_move_pct,
                     sigma: sig.sigma,
                     stake: self.config.stake,
                     shares,
@@ -505,10 +502,10 @@ impl LagRunner {
                     tf: pos.tf,
                     side: pos.side.to_string(),
                     entry_price: pos.entry_price,
-                    fair_bn_entry: pos.fair_bn_entry,
                     fair_cl_entry: pos.fair_cl_entry,
+                    fair_bn_entry: pos.fair_bn_entry,
                     edge_at_entry: pos.edge_at_entry,
-                    divergence_pct: pos.divergence_pct,
+                    cl_move_pct: pos.cl_move_pct,
                     sigma: pos.sigma,
                     stake: tp_shares * pos.entry_price,
                     shares: tp_shares,
@@ -547,10 +544,10 @@ impl LagRunner {
             tf: pos.tf,
             side: pos.side.to_string(),
             entry_price: pos.entry_price,
-            fair_bn_entry: pos.fair_bn_entry,
             fair_cl_entry: pos.fair_cl_entry,
+            fair_bn_entry: pos.fair_bn_entry,
             edge_at_entry: pos.edge_at_entry,
-            divergence_pct: pos.divergence_pct,
+            cl_move_pct: pos.cl_move_pct,
             sigma: pos.sigma,
             stake: pos.stake,
             shares: pos.shares,
