@@ -5,14 +5,24 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
 WorkingDirectory=/home/user/Poly/oracle-scanner-v2
 ExecStart=/home/user/Poly/oracle-scanner-v2/target/release/oracle_scanner_v2
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=oracle_scanner_v2=info
 
-# All hardening removed — caused 226/NAMESPACE on this system
+# Explicitly disable all namespace/sandbox features (fixes 226/NAMESPACE on this host)
+ProtectSystem=false
+ProtectHome=false
+PrivateTmp=false
+PrivateDevices=false
+PrivateUsers=false
+ProtectKernelTunables=false
+ProtectKernelModules=false
+ProtectControlGroups=false
+RestrictNamespaces=false
+MemoryDenyWriteExecute=false
+RestrictSUIDSGID=false
 
 [Install]
 WantedBy=multi-user.target
