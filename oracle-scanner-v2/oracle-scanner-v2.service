@@ -12,11 +12,8 @@ Restart=always
 RestartSec=5
 Environment=RUST_LOG=oracle_scanner_v2=info
 
-# Hardening
+# Hardening (mount namespacing disabled — caused 226/NAMESPACE failures)
 NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/home/user/Poly/oracle-scanner-v2/data
-ProtectHome=false
 
 [Install]
 WantedBy=multi-user.target
