@@ -1,46 +1,25 @@
 [package]
-name    = "lag_scanner"
-version = "4.0.0"
-edition = "2024"
+name    = "cl_oracle_scanner"
+version = "2.0.0"
+edition = "2021"
 
 [dependencies]
-# -- Official Polymarket SDK (replaces hand-rolled wallet.rs + order.rs) --
-polymarket-client-sdk = { version = "0.4", features = ["clob"] }
-alloy    = { version = "1", features = ["signers", "signer-local"] }
-rust_decimal       = "1"
-rust_decimal_macros = "1"
-
-# -- Async runtime & networking --
-tokio            = { version = "1",  features = ["full"] }
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+tokio            = { version = "1",  features = ["full", "signal"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util     = "0.3"
-reqwest          = { version = "0.12", features = ["json"] }
+reqwest          = { version = "0.11", features = ["json"] }
 serde            = { version = "1",  features = ["derive"] }
 serde_json       = "1"
 toml             = "0.8"
 dashmap          = "5"
 tracing          = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 statrs           = "0.16"
 anyhow           = "1"
 chrono           = { version = "0.4", features = ["serde"] }
 tokio-retry      = "0.3"
 url              = "2"
-dotenvy          = "0.15"
-
-# -- Kept for HMAC L2 auth (SDK handles EIP-712, we still need HMAC for derive_api_key) --
-sha2             = "0.10"
-hmac             = "0.12"
-base64           = "0.22"
-hex              = "0.4"
-
-[[bin]]
-name = "lag_scanner"
-path = "src/main.rs"
-
-[[bin]]
-name = "test_order"
-path = "src/bin/test_order.rs"
 
 [dev-dependencies]
 tempfile = "3"
