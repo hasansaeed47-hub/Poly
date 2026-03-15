@@ -236,6 +236,12 @@ impl ArbBook {
     // -- Entry validation -----------------------------------------------------
 
     /// Can we buy `side` at `ask_price` and stay within all constraints?
+    ///
+    /// In lockdown with an unmatched position, constraints are RELAXED:
+    ///   - Trend filter disabled (completing is more important than trend avoidance)
+    ///   - max_ask lifted (any ask is fine if pair_cost < 1.0)
+    ///   - Exposure cap skipped (completing REDUCES net-at-risk)
+    ///   - Pair cost limit raised to 1.0 (any profit beats losing the unmatched unit)
     pub fn can_buy(&self, side: Side, ask_price: f64, cfg: &ArbConfig) -> bool {
         // Phase check
         if self.phase != ArbPhase::Active && self.phase != ArbPhase::Lockdown {
@@ -249,36 +255,48 @@ impl ArbBook {
             if side != needed { return false; }
         }
 
-        // Trending -> skip arb
-        if self.is_trending { return false; }
+        let completing_in_lockdown = self.phase == ArbPhase::Lockdown && self.has_unmatched();
+
+        // Trending -> skip arb (but ALLOW lockdown pair completion —
+        // a tiny-profit completed pair beats a 50/50 directional loss)
+        if self.is_trending && !completing_in_lockdown { return false; }
 
         // Matched sets
         if !self.allowed_sides().contains(&side) { return false; }
 
-        // Ask price bounds
-        if ask_price > cfg.max_ask || ask_price < cfg.min_ask { return false; }
+        // Ask price bounds (relaxed in lockdown: only enforce min_ask)
+        if completing_in_lockdown {
+            if ask_price < cfg.min_ask { return false; }
+        } else {
+            if ask_price > cfg.max_ask || ask_price < cfg.min_ask { return false; }
+        }
 
-        // Exposure cap (net at risk + new unit cost)
-        if self.net_at_risk() + cfg.unit_size > cfg.max_exposure { return false; }
+        // Exposure cap (skip for lockdown completion — it always reduces NAR)
+        if !completing_in_lockdown {
+            if self.net_at_risk() + cfg.unit_size > cfg.max_exposure { return false; }
+        }
 
         // Pair cost projection
         let new_shares = cfg.unit_size / ask_price;
+        // Lockdown completion: any pair_cost < 1.0 is profitable (beats total loss)
+        let limit = if completing_in_lockdown { 1.0 } else { cfg.max_pair_cost };
+
         match side {
             Side::Yes => {
                 let new_yes_avg = (self.yes_cost + cfg.unit_size) / (self.yes_shares + new_shares);
                 if self.no_shares > 0.0 {
-                    if new_yes_avg + self.no_avg() > cfg.max_pair_cost { return false; }
+                    if new_yes_avg + self.no_avg() > limit { return false; }
                 } else {
                     // No NO yet — YES avg must leave room for NO
-                    if new_yes_avg > cfg.max_pair_cost - cfg.min_ask { return false; }
+                    if new_yes_avg > limit - cfg.min_ask { return false; }
                 }
             }
             Side::No => {
                 let new_no_avg = (self.no_cost + cfg.unit_size) / (self.no_shares + new_shares);
                 if self.yes_shares > 0.0 {
-                    if self.yes_avg() + new_no_avg > cfg.max_pair_cost { return false; }
+                    if self.yes_avg() + new_no_avg > limit { return false; }
                 } else {
-                    if new_no_avg > cfg.max_pair_cost - cfg.min_ask { return false; }
+                    if new_no_avg > limit - cfg.min_ask { return false; }
                 }
             }
         }
@@ -677,5 +695,55 @@ mod tests {
         // Can only buy the lagging side
         assert!(!b.can_buy(Side::Yes, 0.45, &cfg));
         assert!(b.can_buy(Side::No, 0.48, &cfg));
+    }
+
+    #[test]
+    fn lockdown_completes_despite_trending() {
+        let cfg = test_cfg();
+        let mut b = test_book(15);
+        b.phase = ArbPhase::Lockdown;
+        b.is_trending = true;
+        b.record_fill(Side::Yes, 0.45, 4.44, 2.0);
+        b.yes_fills = 1;
+        // Trend filter must NOT block lockdown pair completion
+        assert!(b.can_buy(Side::No, 0.48, &cfg));
+    }
+
+    #[test]
+    fn lockdown_allows_high_ask_if_profitable() {
+        let cfg = test_cfg();
+        let mut b = test_book(15);
+        b.phase = ArbPhase::Lockdown;
+        b.record_fill(Side::Yes, 0.40, 5.0, 2.0);
+        b.yes_fills = 1;
+        // NO ask 0.55 (above max_ask 0.50) but pair_cost ~0.95 < 1.0 → allowed
+        assert!(b.can_buy(Side::No, 0.55, &cfg));
+        // NO ask 0.65 → pair_cost ~1.05 > 1.0 → blocked (would lose money)
+        assert!(!b.can_buy(Side::No, 0.65, &cfg));
+    }
+
+    #[test]
+    fn lockdown_rejects_unprofitable_completion() {
+        let cfg = test_cfg();
+        let mut b = test_book(15);
+        b.phase = ArbPhase::Lockdown;
+        b.record_fill(Side::Yes, 0.50, 4.0, 2.0);
+        b.yes_fills = 1;
+        // NO ask 0.51 → pair_cost ~1.01 > 1.0 → blocked
+        assert!(!b.can_buy(Side::No, 0.51, &cfg));
+        // NO ask 0.49 → pair_cost ~0.99 < 1.0 → allowed
+        assert!(b.can_buy(Side::No, 0.49, &cfg));
+    }
+
+    #[test]
+    fn active_trending_still_blocks_completion() {
+        let cfg = test_cfg();
+        let mut b = test_book(15);
+        b.phase = ArbPhase::Active;
+        b.is_trending = true;
+        b.record_fill(Side::Yes, 0.45, 4.44, 2.0);
+        b.yes_fills = 1;
+        // Active phase: trending STILL blocks (only lockdown gets the exemption)
+        assert!(!b.can_buy(Side::No, 0.48, &cfg));
     }
 }
