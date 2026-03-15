@@ -416,15 +416,12 @@ impl Runner {
             sig.cl_move_pct, sig.secs_left
         );
 
-        let max_chase_price = (sig.maker_price + 0.03).min(sig.best_ask);
-
         match self.exec.maker_chase_entry(
             token_id,
             sig.maker_price,
             self.config.stake,
             self.config.maker_chase_ticks,
             self.config.chase_interval_ms,
-            max_chase_price,
         ).await {
             Ok(fill) => {
                 let actual_price = fill.price;
@@ -440,7 +437,7 @@ impl Runner {
                     Side::No  => (1.0 - sig.fair_cl) - actual_price,
                 };
 
-                if post_edge < 0.03 || actual_price > 0.90 {
+                if post_edge < 0.02 || actual_price > 0.90 {
                     let reject_reason = if actual_price > 0.90 { "expensive" } else { "low_edge" };
                     warn!(
                         "[RUNNER] REJECT {} {} edge={:.3} fill={:.3}",
@@ -481,7 +478,7 @@ impl Runner {
                                 window_end,
                                 order_id: fill.order_id,
                                 state: PosState::Open,
-                                high_bid: 0.0,
+                                high_bid: actual_price,
                                 trail_stop: 0.0,
                                 reversal_ts: None,
                             };
@@ -518,7 +515,7 @@ impl Runner {
                     window_end,
                     order_id: fill.order_id,
                     state: PosState::Open,
-                    high_bid: 0.0,
+                    high_bid: actual_price,
                     trail_stop: 0.0,
                     reversal_ts: None,
                 };

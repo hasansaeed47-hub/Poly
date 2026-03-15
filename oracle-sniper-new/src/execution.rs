@@ -511,7 +511,6 @@ impl ExecutionLayer {
         stake: f64,
         max_chase_ticks: u32,
         chase_interval_ms: u64,
-        _best_ask: f64,          // unused — taker uses chase price + tick
     ) -> Result<FillResult> {
         let tick = 0.01_f64;
         let mut current_price = initial_price;
@@ -549,9 +548,12 @@ impl ExecutionLayer {
                                 });
                             }
                             Ok((false, _)) => {
-                                // Not filled, not cancelled — orphaned. Try cancel again.
+                                // Not filled, not cancelled — orphaned. Force cancel, abort chase if still stuck.
                                 warn!("[EXEC] Chase order {} not filled but cancel failed, retrying", oid);
-                                let _ = self.cancel_order(oid).await;
+                                if self.cancel_order(oid).await.is_err() {
+                                    error!("[EXEC] Chase order {} orphaned after 2 cancel attempts — aborting", oid);
+                                    return Err(anyhow!("Chase order orphaned: {}", oid));
+                                }
                             }
                             Err(e) => {
                                 warn!("[EXEC] Chase cancel-fail query error: {} — aborting", e);
@@ -641,7 +643,7 @@ impl ExecutionLayer {
     }
 
     /// Guaranteed sell cascade: escalating price sweep until filled or floor reached.
-    /// Tries: GTC at bid → cancel after 1s → FAK at bid → FAK at bid-2c → bid-4c → ... → 0.01.
+    /// Tries: GTC at bid → wait 1s → cancel → FAK at bid → FAK at bid-2c → bid-4c → ... → 0.01.
     /// Returns Ok(FillResult) if ANY step fills, Err only if ALL attempts fail.
     ///
     /// This is the ONLY sell method that should be used for exits.
@@ -659,7 +661,6 @@ impl ExecutionLayer {
         }
 
         let remaining = shares;
-        let mut total_revenue = 0.0;
         let mut last_oid = String::new();
 
         // Step 1: Try GTC at bid (maker, 0% fee)
@@ -699,31 +700,18 @@ impl ExecutionLayer {
         }
 
         // Step 2: FAK sweep from bid down to 0.01 in 2c steps
-        let mut price = (bid - 0.01).max(0.01);
+        let mut price = bid.max(0.01);
         while price >= 0.01 {
             let try_price = (price * 100.0).round() / 100.0;
             if try_price < 0.01 { break; }
 
             match self.sell_fak(token_id, try_price, remaining).await {
                 Ok(r) if r.filled => {
-                    let filled_shares = if r.price > 0.0 {
-                        // Approximate shares from the FAK response
-                        remaining // FAK matched = all remaining sold
-                    } else {
-                        remaining
-                    };
-                    total_revenue += filled_shares * r.price;
                     info!(
                         "[EXEC] guaranteed_sell: FAK filled @{:.3} (sweep price={:.2})",
                         r.price, try_price
                     );
-                    let avg_price = if shares > 0.0 { total_revenue / shares } else { r.price };
-                    return Ok(FillResult {
-                        order_id: r.order_id,
-                        filled: true,
-                        price: avg_price.max(r.price), // use best estimate
-                        status: "Matched".to_string(),
-                    });
+                    return Ok(r);
                 }
                 Ok(_) | Err(_) => {
                     // No fill at this price, sweep lower
@@ -777,13 +765,11 @@ impl ExecutionLayer {
     // ── Backoff logic (from sniper EX1) ─────────────────────────────────────
 
     async fn check_backoff(&self) -> bool {
-        let fails = *self.consec_fails.lock().await;
-        if fails < 3 { return false; }
-        let until = *self.backoff_until.lock().await;
+        if *self.consec_fails.lock().await < 3 { return false; }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default().as_secs_f64();
-        now < until
+        now < *self.backoff_until.lock().await
     }
 
     async fn record_success(&self) {
@@ -794,7 +780,7 @@ impl ExecutionLayer {
         let mut fails = self.consec_fails.lock().await;
         *fails += 1;
         if *fails >= 3 {
-            let delay = (1.0_f64 * 2.0_f64.powi((*fails as i32) - 3)).min(30.0);
+            let delay = 2.0_f64.powi((*fails as i32) - 3).min(30.0);
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default().as_secs_f64();
