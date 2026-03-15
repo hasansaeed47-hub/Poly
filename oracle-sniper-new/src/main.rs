@@ -303,11 +303,20 @@ async fn main() -> Result<()> {
     let mut settled: HashMap<String, bool> = HashMap::new();
     let mut cl_close_snap: HashMap<String, f64> = HashMap::new();
 
+    // FIX F5: Track bot startup time. Skip any window that started before the bot.
+    let bot_start_ts: u64 = now_unix();
+    info!("[MAIN] bot_start_ts={} — will skip pre-existing windows", bot_start_ts);
+
+    // FIX F8: Track feed staleness for emergency exits
+    const FEED_STALE_SECS: f64 = 15.0;
+    let mut feed_stale_warned = false;
+
     // ── Graceful shutdown ───────────────────────────────────────────────────
+    // FIX F4: Shutdown handler only sets flag. Position selling happens in
+    // main loop where runner is accessible (runner is !Send).
     let shutdown = Arc::new(AtomicBool::new(false));
     {
         let shutdown = shutdown.clone();
-        let exec = exec.clone();
         tokio::spawn(async move {
             #[cfg(unix)]
             {
@@ -325,10 +334,6 @@ async fn main() -> Result<()> {
                 warn!("SIGINT — shutting down...");
             }
             shutdown.store(true, Ordering::SeqCst);
-            match exec.cancel_all().await {
-                Ok(_)  => info!("[SHUTDOWN] All orders cancelled"),
-                Err(e) => error!("[SHUTDOWN] Cancel all failed: {}", e),
-            }
         });
     }
 
@@ -354,7 +359,13 @@ async fn main() -> Result<()> {
         tokio::time::sleep(tick).await;
 
         if shutdown.load(Ordering::SeqCst) {
-            info!("Shutdown — exiting");
+            // FIX F4: Sell all positions before exiting, then cancel remaining orders
+            info!("[SHUTDOWN] Selling all positions...");
+            runner.emergency_exit_all("SHUTDOWN", now_secs()).await;
+            match exec.cancel_all().await {
+                Ok(_)  => info!("[SHUTDOWN] All orders cancelled"),
+                Err(e) => error!("[SHUTDOWN] Cancel all failed: {}", e),
+            }
             runner.print_stats();
             break;
         }
@@ -437,6 +448,12 @@ async fn main() -> Result<()> {
             }
         }
         for slug in &newly_settled {
+            // FIX F13: Don't remove market if runner still has positions for it.
+            // This prevents orphaned positions when settlement handler couldn't close.
+            if runner.has_positions_for_slug(slug) {
+                warn!("[SETTLE] {} still has positions in runner — keeping market", slug);
+                continue;
+            }
             if let Some(meta) = markets.remove(slug) {
                 token_ids.remove(&meta.token_yes);
                 token_ids.remove(&meta.token_no);
@@ -452,6 +469,36 @@ async fn main() -> Result<()> {
             continue;
         }
 
+        // ── FIX F7/F8: Feed staleness guard ──────────────────────────────
+        // Check ALL feeds for staleness. If any feed is >15s stale:
+        //   - Emergency exit all positions (stale data = blind flying)
+        //   - Skip detection (no new entries on stale data)
+        {
+            let mut any_stale = false;
+            for asset in &cfg.feed.assets {
+                let cl_age = cl_prices.get(asset.as_str()).map(|v| now - v.0).unwrap_or(999.0);
+                let bn_age = bn_prices.get(asset.as_str()).map(|v| now - v.0).unwrap_or(999.0);
+                if cl_age > FEED_STALE_SECS || bn_age > FEED_STALE_SECS {
+                    any_stale = true;
+                    if !feed_stale_warned {
+                        error!(
+                            "[FEED] STALE {} CL_age={:.1}s BN_age={:.1}s > {}s threshold",
+                            asset.to_uppercase(), cl_age, bn_age, FEED_STALE_SECS
+                        );
+                    }
+                }
+            }
+            if any_stale {
+                if !feed_stale_warned {
+                    feed_stale_warned = true;
+                    runner.emergency_exit_all("STALE_FEED", now).await;
+                }
+                continue; // Skip all detection on stale feeds
+            } else {
+                feed_stale_warned = false;
+            }
+        }
+
         // ── Detection + state machine ───────────────────────────────────
         for (slug, meta) in &mut markets {
             if settled.get(slug.as_str()).copied().unwrap_or(false) { continue; }
@@ -464,22 +511,33 @@ async fn main() -> Result<()> {
                 None => continue,
             };
 
-            let (_bn_ts, bn_price) = match bn_prices.get(&meta.asset) {
+            // FIX F7: Check BN staleness per-asset (in addition to global guard above)
+            let (bn_ts, bn_price) = match bn_prices.get(&meta.asset) {
                 Some(v) => (v.0, v.1),
                 None => continue,
             };
+            if now - bn_ts > 10.0 {
+                continue; // BN stale for this asset — skip
+            }
 
             if meta.open_price <= 0.0 {
                 if now_u >= meta.window_start {
-                    // Use CL price closest to window_start from history,
-                    // falling back to current CL if history unavailable
+                    // FIX F5: Skip windows that started before the bot.
+                    // We have no reliable CL history at window_start for pre-existing windows.
+                    if meta.window_start < bot_start_ts {
+                        info!("[OPEN] SKIP {} — window_start={} < bot_start={}", slug, meta.window_start, bot_start_ts);
+                        meta.open_price = -1.0; // sentinel: skip this market forever
+                        continue;
+                    }
+
+                    // Use CL price closest to window_start from history
                     let hist_key = format!("cl_{}", meta.asset);
                     let open = price_history.get(&hist_key)
                         .and_then(|h| {
                             let ws = meta.window_start as f64;
                             h.iter()
-                                .filter(|(ts, _)| *ts <= ws + 5.0)
-                                .last()
+                                .filter(|(ts, _)| *ts >= ws - 2.0 && *ts <= ws + 5.0)
+                                .min_by_key(|(ts, _)| ((*ts - ws).abs() * 1000.0) as u64)
                                 .map(|(_, p)| *p)
                         })
                         .unwrap_or(cl_price);
@@ -488,6 +546,9 @@ async fn main() -> Result<()> {
                 }
                 continue;
             }
+
+            // FIX F5: sentinel -1.0 means this market was skipped
+            if meta.open_price < 0.0 { continue; }
 
             let book_yes = match book_state.get(&meta.token_yes) {
                 Some(b) if b.best_ask > 0.0 => b.clone(),
@@ -498,8 +559,10 @@ async fn main() -> Result<()> {
                 _ => continue,
             };
 
-            if now - book_yes.ts > cfg.feed.book_stale_secs
-                || now - book_no.ts > cfg.feed.book_stale_secs {
+            // FIX F11: Hard cap book staleness at 2.0s even if config is higher
+            let effective_book_stale = cfg.feed.book_stale_secs.min(2.0);
+            if now - book_yes.ts > effective_book_stale
+                || now - book_no.ts > effective_book_stale {
                 continue;
             }
 
@@ -513,7 +576,7 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // BN momentum (confirmation + adaptive sigma)
+            // BN momentum (confirmation)
             let bn_mom = {
                 let hist_key = format!("bn_{}", meta.asset);
                 let hist = price_history.get(&hist_key);
@@ -523,13 +586,18 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Adaptive sigma
+            // FIX F6: Multi-timeframe sigma — always max(60s, 300s).
+            // This catches calm→volatile transitions without needing
+            // a BN momentum threshold to switch windows.
             let sigma = {
                 let hist_key = format!("bn_{}", meta.asset);
                 let hist = price_history.get(&hist_key);
-                let window = if bn_mom.abs() > 0.001 { 60.0 } else { cfg.scan.sigma_window_secs };
                 match hist {
-                    Some(h) => estimate_sigma(&h, window, now),
+                    Some(h) => {
+                        let sigma_short = estimate_sigma(&h, 60.0, now);
+                        let sigma_long = estimate_sigma(&h, cfg.scan.sigma_window_secs, now);
+                        sigma_short.max(sigma_long)
+                    }
                     None => 0.50,
                 }
             };

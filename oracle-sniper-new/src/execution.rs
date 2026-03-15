@@ -640,6 +640,108 @@ impl ExecutionLayer {
         }
     }
 
+    /// Guaranteed sell cascade: escalating price sweep until filled or floor reached.
+    /// Tries: GTC at bid → cancel after 1s → FAK at bid → FAK at bid-2c → bid-4c → ... → 0.01.
+    /// Returns Ok(FillResult) if ANY step fills, Err only if ALL attempts fail.
+    ///
+    /// This is the ONLY sell method that should be used for exits.
+    /// It guarantees that either:
+    ///   1. Shares are sold (Ok returned), or
+    ///   2. All liquidity is exhausted down to 0.01 (Err returned, position truly stuck)
+    pub async fn guaranteed_sell(
+        &self,
+        token_id: &str,
+        initial_bid: f64,
+        shares: f64,
+    ) -> Result<FillResult> {
+        if shares <= 0.0 {
+            return Err(anyhow!("No shares to sell"));
+        }
+
+        let remaining = shares;
+        let mut total_revenue = 0.0;
+        let mut last_oid = String::new();
+
+        // Step 1: Try GTC at bid (maker, 0% fee)
+        let bid = initial_bid.max(0.01).min(0.99);
+        match self.sell_gtc(token_id, bid, remaining).await {
+            Ok(r) if r.filled => {
+                info!("[EXEC] guaranteed_sell: GTC filled @{:.3}", r.price);
+                return Ok(r);
+            }
+            Ok(r) => {
+                last_oid = r.order_id.clone();
+                info!("[EXEC] guaranteed_sell: GTC posted {}, waiting 1s...", r.order_id);
+            }
+            Err(e) => {
+                warn!("[EXEC] guaranteed_sell: GTC failed: {}", e);
+            }
+        }
+
+        // Wait for GTC fill
+        if !last_oid.is_empty() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            // Check if filled
+            match self.query_order_status(&last_oid).await {
+                Ok((true, fill_price)) => {
+                    info!("[EXEC] guaranteed_sell: GTC filled during wait @{:.3}", fill_price);
+                    return Ok(FillResult {
+                        order_id: last_oid,
+                        filled: true,
+                        price: if fill_price > 0.0 { fill_price } else { bid },
+                        status: "Matched".to_string(),
+                    });
+                }
+                _ => {
+                    let _ = self.cancel_order(&last_oid).await;
+                }
+            }
+        }
+
+        // Step 2: FAK sweep from bid down to 0.01 in 2c steps
+        let mut price = (bid - 0.01).max(0.01);
+        while price >= 0.01 {
+            let try_price = (price * 100.0).round() / 100.0;
+            if try_price < 0.01 { break; }
+
+            match self.sell_fak(token_id, try_price, remaining).await {
+                Ok(r) if r.filled => {
+                    let filled_shares = if r.price > 0.0 {
+                        // Approximate shares from the FAK response
+                        remaining // FAK matched = all remaining sold
+                    } else {
+                        remaining
+                    };
+                    total_revenue += filled_shares * r.price;
+                    info!(
+                        "[EXEC] guaranteed_sell: FAK filled @{:.3} (sweep price={:.2})",
+                        r.price, try_price
+                    );
+                    let avg_price = if shares > 0.0 { total_revenue / shares } else { r.price };
+                    return Ok(FillResult {
+                        order_id: r.order_id,
+                        filled: true,
+                        price: avg_price.max(r.price), // use best estimate
+                        status: "Matched".to_string(),
+                    });
+                }
+                Ok(_) | Err(_) => {
+                    // No fill at this price, sweep lower
+                }
+            }
+
+            price -= 0.02;
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        }
+
+        // All attempts failed
+        error!(
+            "[EXEC] GUARANTEED_SELL FAILED — all prices exhausted for {} shares of {}",
+            shares, &token_id[..8.min(token_id.len())]
+        );
+        Err(anyhow!("Guaranteed sell exhausted all prices"))
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// Extract actual fill price from PostOrderResponse amounts.

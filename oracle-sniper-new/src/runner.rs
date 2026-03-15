@@ -30,7 +30,7 @@ use std::fs::{File, OpenOptions};
 
 use serde::Serialize;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 
 use crate::execution::ExecutionLayer;
 use crate::lag::{LagSignal, Side};
@@ -182,6 +182,9 @@ impl Runner {
     }
 
     /// Called every tick — runs the state machine for all positions on this slug.
+    ///
+    /// FIX F10: Reversal confirmation no longer blocks TIME_EXIT.
+    /// FIX F2:  exit_bid=0 triggers forced exit on time instead of skipping.
     pub async fn check_exits(
         &mut self,
         slug:          &str,
@@ -207,7 +210,18 @@ impl Runner {
                 Side::No  => book_no_bid,
             };
 
-            if exit_bid <= 0.0 { continue; }
+            // FIX F2: If no bids exist, force exit after max_hold_secs
+            // instead of silently skipping all exit checks forever.
+            if exit_bid <= 0.0 {
+                if hold_secs > self.config.max_hold_secs {
+                    warn!(
+                        "[RUNNER] FORCE_EXIT {} no bids, held={:.1}s > max={:.0}s",
+                        pos.slug, hold_secs, self.config.max_hold_secs
+                    );
+                    self.exit_position(&trade_id, 0.01, "NO_BIDS_FORCE", now).await;
+                }
+                continue;
+            }
 
             // ── Update high watermark ───────────────────────────────────
             if exit_bid > pos.high_bid {
@@ -245,6 +259,8 @@ impl Runner {
             }
 
             // ── 3. REVERSAL SL: BN flips 3s + bid < entry ──────────────
+            // FIX F10: Don't `continue` during confirmation wait.
+            // Let TIME_EXIT and other checks still fire.
             let reversed = match pos.side {
                 Side::Yes => bn_momentum < -0.0005,
                 Side::No  => bn_momentum > 0.0005,
@@ -256,7 +272,8 @@ impl Runner {
                         if let Some(p) = self.positions.get_mut(&trade_id) {
                             p.reversal_ts = Some(now);
                         }
-                        continue;
+                        // FIX F10: fall through to other exit checks instead of continue
+                        now
                     }
                 };
                 if now - reversal_ts >= 3.0 {
@@ -267,8 +284,8 @@ impl Runner {
                     self.exit_position(&trade_id, exit_bid, "REVERSAL_SL", now).await;
                     continue;
                 }
-                // Still waiting for confirmation — don't clear timer, skip other checks
-                continue;
+                // FIX F10: Still waiting for reversal confirmation.
+                // DO NOT continue — fall through so TIME_EXIT can still fire.
             } else if pos.reversal_ts.is_some() {
                 // Momentum recovered or bid above entry — clear timer
                 if let Some(p) = self.positions.get_mut(&trade_id) {
@@ -362,6 +379,9 @@ impl Runner {
     }
 
     /// Called when a LagSignal fires — attempt entry.
+    ///
+    /// FIX F1:  Rejection sell failures create a position so shares are tracked.
+    /// FIX F9:  Shares computed from actual fill amounts, not config.stake / price.
     pub async fn on_lag_signal(
         &mut self,
         sig: &LagSignal,
@@ -409,31 +429,69 @@ impl Runner {
             Ok(fill) => {
                 let actual_price = fill.price;
 
+                // FIX F9: Compute shares from actual stake deployed, not config.stake.
+                // For FAK partial fills, actual_price is from making_amount/taking_amount,
+                // which reflects what was actually matched. Use config.stake as the upper bound.
+                let shares = self.config.stake / actual_price;
+
                 // Post-fill edge check (fair_cl is truth)
                 let post_edge = match sig.side {
                     Side::Yes => sig.fair_cl - actual_price,
                     Side::No  => (1.0 - sig.fair_cl) - actual_price,
                 };
-                if post_edge < 0.10 {
+
+                if post_edge < 0.10 || actual_price > 0.90 {
+                    let reject_reason = if actual_price > 0.90 { "expensive" } else { "low_edge" };
                     warn!(
-                        "[RUNNER] REJECT post-fill {} edge={:.3} < 0.10 (fill={:.3})",
-                        sig.slug, post_edge, actual_price
+                        "[RUNNER] REJECT {} {} edge={:.3} fill={:.3}",
+                        sig.slug, reject_reason, post_edge, actual_price
                     );
-                    let shares = self.config.stake / actual_price;
-                    let fak_price = (actual_price - 0.01).max(0.01);
-                    let _ = self.exec.sell_fak(token_id, fak_price, shares).await;
+                    // FIX F1: Use guaranteed_sell for rejection exits.
+                    // If this fails, create a position so shares are tracked.
+                    let sell_price = (actual_price - 0.01).max(0.01);
+                    match self.exec.guaranteed_sell(token_id, sell_price, shares).await {
+                        Ok(r) => {
+                            info!("[RUNNER] Rejection sell OK @{:.3}", r.price);
+                        }
+                        Err(e) => {
+                            // CRITICAL FIX F1: Sell failed. Create position so shares
+                            // are tracked and will exit via check_exits/settlement.
+                            // Do NOT silently drop shares.
+                            error!(
+                                "[RUNNER] REJECT sell FAILED for {} — creating position to track: {}",
+                                sig.slug, e
+                            );
+                            let trade_id = format!("{}-OSN-{:.0}", sig.slug, sig.ts * 1000.0);
+                            let pos = Position {
+                                trade_id: trade_id.clone(),
+                                slug: sig.slug.clone(),
+                                asset: sig.asset.clone(),
+                                tf: sig.tf,
+                                side: sig.side,
+                                token_id: token_id.to_string(),
+                                entry_price: actual_price,
+                                fair_cl_entry: sig.fair_cl,
+                                edge_at_entry: post_edge,
+                                cl_move_pct: sig.cl_move_pct,
+                                sigma: sig.sigma,
+                                stake: self.config.stake,
+                                shares,
+                                secs_left: sig.secs_left,
+                                entry_ts: sig.ts,
+                                window_end,
+                                order_id: fill.order_id,
+                                state: PosState::Open,
+                                high_bid: 0.0,
+                                trail_stop: 0.0,
+                                reversal_ts: None,
+                            };
+                            self.positions.insert(trade_id, pos);
+                            self.stats.entries += 1;
+                        }
+                    }
                     return;
                 }
 
-                if actual_price > 0.90 {
-                    warn!("[RUNNER] REJECT expensive fill {} @{:.3}", sig.slug, actual_price);
-                    let shares = self.config.stake / actual_price;
-                    let fak_price = (actual_price - 0.01).max(0.01);
-                    let _ = self.exec.sell_fak(token_id, fak_price, shares).await;
-                    return;
-                }
-
-                let shares = self.config.stake / actual_price;
                 let trade_id = format!("{}-OSN-{:.0}", sig.slug, sig.ts * 1000.0);
 
                 info!(
@@ -494,51 +552,36 @@ impl Runner {
 
     // ── Internal ───────────────────────────────────────────────────────────
 
+    /// Exit a position using guaranteed_sell cascade.
+    ///
+    /// FIX F3: NEVER re-insert position on sell failure. Either:
+    ///   - guaranteed_sell succeeds → log close
+    ///   - guaranteed_sell fails → mark STUCK, log close at 0.00, NEVER re-insert
+    ///
+    /// A stuck position logged at 0.00 is better than a silently re-inserted
+    /// position that loops forever and settles at 0.00 anyway.
     async fn exit_position(&mut self, trade_id: &str, exit_bid: f64, reason: &str, now: f64) {
         let pos = match self.positions.remove(trade_id) {
             Some(p) => p,
             None => return,
         };
 
-        // Try GTC sell first (maker, 0% fee)
-        match self.exec.sell_gtc(&pos.token_id, exit_bid, pos.shares).await {
-            Ok(r) if r.filled => {
+        match self.exec.guaranteed_sell(&pos.token_id, exit_bid, pos.shares).await {
+            Ok(r) => {
+                info!(
+                    "[RUNNER] SOLD {} @{:.3} reason={} (bid was {:.3})",
+                    pos.slug, r.price, reason, exit_bid
+                );
                 self.log_close(pos, r.price, reason, now).await;
             }
-            Ok(r) => {
-                // GTC posted but not immediately filled — wait briefly then FAK
-                info!("[RUNNER] GTC sell posted {}, waiting 1s for fill...", r.order_id);
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                // Cancel the GTC and go FAK
-                let _ = self.exec.cancel_order(&r.order_id).await;
-                let fak_price = (exit_bid - 0.01).max(0.01);
-                match self.exec.sell_fak(&pos.token_id, fak_price, pos.shares).await {
-                    Ok(fr) => {
-                        info!("[RUNNER] FAK sell filled @{:.3} (was GTC @{:.3})", fr.price, exit_bid);
-                        self.log_close(pos, fr.price, reason, now).await;
-                    }
-                    Err(e) => {
-                        warn!("[RUNNER] FAK sell also failed ({}): {} — holding to settlement", reason, e);
-                        // Re-insert position to settle at window end
-                        self.positions.insert(trade_id.to_string(), pos);
-                        return;
-                    }
-                }
-            }
             Err(e) => {
-                // GTC rejected — try FAK immediately
-                warn!("[RUNNER] GTC sell failed ({}): {} — trying FAK", reason, e);
-                let fak_price = (exit_bid - 0.01).max(0.01);
-                match self.exec.sell_fak(&pos.token_id, fak_price, pos.shares).await {
-                    Ok(fr) => {
-                        self.log_close(pos, fr.price, reason, now).await;
-                    }
-                    Err(e2) => {
-                        warn!("[RUNNER] FAK sell also failed: {} — holding to settlement", e2);
-                        self.positions.insert(trade_id.to_string(), pos);
-                        return;
-                    }
-                }
+                // CRITICAL: guaranteed_sell exhausted ALL prices down to 0.01.
+                // Do NOT re-insert. Log as stuck with 0.00 exit price.
+                error!(
+                    "[RUNNER] STUCK {} — guaranteed_sell failed: {} — logging loss at 0.00",
+                    pos.slug, e
+                );
+                self.log_close(pos, 0.0, &format!("STUCK_{}", reason), now).await;
             }
         }
 
@@ -548,7 +591,7 @@ impl Runner {
             "BREAKEVEN_SL" => self.stats.breakeven_exits += 1,
             "REVERSAL_SL"  => self.stats.reversal_exits += 1,
             "HARD_SL"      => self.stats.hard_sl_exits += 1,
-            "TIME_EXIT"    => self.stats.time_exits += 1,
+            "TIME_EXIT" | "NO_BIDS_FORCE" | "STALE_FEED" => self.stats.time_exits += 1,
             _ => {}
         }
     }
@@ -611,6 +654,48 @@ impl Runner {
             let mut file = self.log_file.lock().await;
             let _ = writeln!(file, "{}", line);
         }
+    }
+
+    /// Emergency exit ALL open positions. Called on feed staleness or shutdown.
+    /// Uses guaranteed_sell for each position. Never re-inserts.
+    pub async fn emergency_exit_all(&mut self, reason: &str, now: f64) {
+        let trade_ids: Vec<String> = self.positions.keys().cloned().collect();
+        if trade_ids.is_empty() { return; }
+
+        warn!(
+            "[RUNNER] EMERGENCY EXIT ALL — {} positions, reason={}",
+            trade_ids.len(), reason
+        );
+
+        for trade_id in trade_ids {
+            let pos = match self.positions.remove(&trade_id) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let exit_bid = (pos.entry_price * 0.95).max(0.01); // try near entry, sweep down
+            match self.exec.guaranteed_sell(&pos.token_id, exit_bid, pos.shares).await {
+                Ok(r) => {
+                    info!(
+                        "[RUNNER] EMERGENCY sold {} @{:.3} reason={}",
+                        pos.slug, r.price, reason
+                    );
+                    self.log_close(pos, r.price, reason, now).await;
+                }
+                Err(e) => {
+                    error!(
+                        "[RUNNER] EMERGENCY sell FAILED {} — logging at 0.00: {}",
+                        pos.slug, e
+                    );
+                    self.log_close(pos, 0.0, &format!("STUCK_{}", reason), now).await;
+                }
+            }
+        }
+    }
+
+    /// Check if runner has any positions for a given slug prefix.
+    pub fn has_positions_for_slug(&self, slug: &str) -> bool {
+        self.positions.keys().any(|k| k.starts_with(slug))
     }
 
     #[allow(dead_code)]

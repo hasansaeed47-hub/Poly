@@ -15,7 +15,7 @@ gamma_api  = "https://gamma-api.polymarket.com"
 
 rest_throttle_ms = 250
 book_warmup_secs = 5
-book_stale_secs  = 3.0
+book_stale_secs  = 1.5
 
 [scan]
 tick_ms            = 250
