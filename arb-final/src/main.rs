@@ -40,7 +40,7 @@ use wallet::Wallet;
 
 use arb::{
     ArbBook, ArbConfig, ArbPhase, ArbTradeLog, PendingOrder, Side,
-    maker_limit_price,
+    maker_limit_price, pm_fee,
 };
 
 // -- Config -------------------------------------------------------------------
@@ -389,12 +389,14 @@ async fn main() -> Result<()> {
             let elapsed = now - po.posted_at;
             let book_ask = book_state.get(&po.token_id).map(|b| b.best_ask).unwrap_or(0.0);
 
-            // Paper mode fill simulation: maker fills when book ask drops TO our
-            // limit price (ask - 0.01). Requires actual selling pressure to reach
-            // our level — does NOT fill immediately at the original ask.
-            let filled = elapsed >= 1.0
-                && book_ask > 0.0
-                && book_ask <= po.price;
+            // Paper mode fill simulation:
+            // - Taker: fills immediately when book has liquidity (crosses spread)
+            // - Maker: fills when ask drops TO our limit (real selling pressure)
+            let filled = if po.is_taker {
+                elapsed >= 0.5 && book_ask > 0.0
+            } else {
+                elapsed >= 1.0 && book_ask > 0.0 && book_ask <= po.price
+            };
 
             // Shorter timeout in lockdown to retry completion faster
             // (90s lockdown / 10s timeout = 9 retries vs 3 with 30s)
@@ -674,22 +676,43 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Post maker order for best opportunity
+            // Post order for best opportunity (maker or taker)
             if let Some((slug, side, ask, _priority)) = best {
-                let limit_px = maker_limit_price(ask);
+                let book = arb_books.get(&slug).unwrap();
 
-                // Skip if maker price falls below minimum (don't break main loop)
+                // Decide maker vs taker:
+                // Taker mode in late lockdown (last 1/3) when completing unmatched pair
+                let remaining = book.window_end as f64 - now;
+                let lockdown_secs = if book.tf == 60 {
+                    arb_cfg.lockdown_secs_60m
+                } else {
+                    arb_cfg.lockdown_secs_15m
+                };
+                let use_taker = book.phase == ArbPhase::Lockdown
+                    && book.has_unmatched()
+                    && remaining < lockdown_secs / 3.0;
+
+                let (limit_px, shares, is_taker) = if use_taker {
+                    // Taker: buy at ask, pay PM fee, get fewer shares
+                    let fee = pm_fee(ask);
+                    let effective = ask + fee;
+                    (ask, arb_cfg.unit_size / effective, true)
+                } else {
+                    // Maker: bid at ask-0.01, no fee
+                    let lp = maker_limit_price(ask);
+                    (lp, arb_cfg.unit_size / lp, false)
+                };
+
+                // Skip if price falls below minimum
                 if limit_px >= arb_cfg.min_ask {
-                    let book = arb_books.get(&slug).unwrap();
                     let token_id = match side {
                         Side::Yes => book.token_yes.clone(),
                         Side::No  => book.token_no.clone(),
                     };
 
-                    let shares = arb_cfg.unit_size / limit_px;
-
-                    info!("[ARB] POST {} {} @{:.3} (ask={:.3}) {:.0} shares ${:.2} | {}",
-                        side, slug, limit_px, ask, shares, arb_cfg.unit_size,
+                    let mode = if is_taker { "TAKER" } else { "MAKER" };
+                    info!("[ARB] POST {} {} {} @{:.3} (ask={:.3}) {:.0} shares ${:.2} | {}",
+                        mode, side, slug, limit_px, ask, shares, arb_cfg.unit_size,
                         book.status());
 
                     // Place live order if wallet configured
@@ -715,6 +738,7 @@ async fn main() -> Result<()> {
                         shares,
                         cost: arb_cfg.unit_size,
                         posted_at: now,
+                        is_taker,
                     });
 
                     log_arb(&mut trade_log, &ArbTradeLog {
@@ -725,7 +749,7 @@ async fn main() -> Result<()> {
                         yes_avg: None, no_avg: None, pair_cost: None,
                         pairs_complete: None, net_at_risk: None,
                         locked_profit: None, pnl: None, cl_delta_pct: None,
-                        phase: Some(format!("{:?}", book.phase)),
+                        phase: Some(format!("{:?}{}", book.phase, if is_taker { " TAKER" } else { "" })),
                     });
                 }
             }

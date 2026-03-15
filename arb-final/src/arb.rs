@@ -19,6 +19,11 @@ use tracing::info;
 
 const STDEV_BASE: f64 = 0.167;
 
+/// Polymarket taker fee per share: px * (1 - px) * 0.0625
+pub fn pm_fee(px: f64) -> f64 {
+    px * (1.0 - px) * 0.0625
+}
+
 fn stdev_for(asset: &str) -> f64 {
     match asset {
         "btc" => 0.167,
@@ -114,10 +119,11 @@ pub struct PendingOrder {
     pub slug:      String,
     pub side:      Side,
     pub token_id:  String,
-    pub price:     f64,     // our limit price (ask - 0.01)
-    pub shares:    f64,     // unit_size / price
+    pub price:     f64,     // limit price (maker: ask-0.01, taker: ask)
+    pub shares:    f64,     // shares received (taker: adjusted for fee)
     pub cost:      f64,     // unit_size
     pub posted_at: f64,     // unix ts
+    pub is_taker:  bool,    // taker = immediate fill, pays PM fee
 }
 
 // -- ArbBook (per-window) -----------------------------------------------------
@@ -277,7 +283,13 @@ impl ArbBook {
         }
 
         // Pair cost projection
-        let new_shares = cfg.unit_size / ask_price;
+        // In lockdown completion, assume taker fee (conservative — worst case)
+        let effective_ask = if completing_in_lockdown {
+            ask_price + pm_fee(ask_price)
+        } else {
+            ask_price // maker, no fee
+        };
+        let new_shares = cfg.unit_size / effective_ask;
         // Lockdown completion: any pair_cost < 1.0 is profitable (beats total loss)
         let limit = if completing_in_lockdown { 1.0 } else { cfg.max_pair_cost };
 
@@ -729,10 +741,10 @@ mod tests {
         b.phase = ArbPhase::Lockdown;
         b.record_fill(Side::Yes, 0.50, 4.0, 2.0);
         b.yes_fills = 1;
-        // NO ask 0.51 → pair_cost ~1.01 > 1.0 → blocked
-        assert!(!b.can_buy(Side::No, 0.51, &cfg));
-        // NO ask 0.49 → pair_cost ~0.99 < 1.0 → allowed
-        assert!(b.can_buy(Side::No, 0.49, &cfg));
+        // NO ask 0.50 → effective ~0.516 (taker fee) → pair_cost ~1.016 → blocked
+        assert!(!b.can_buy(Side::No, 0.50, &cfg));
+        // NO ask 0.48 → effective ~0.496 (taker fee) → pair_cost ~0.996 < 1.0 → allowed
+        assert!(b.can_buy(Side::No, 0.48, &cfg));
     }
 
     #[test]

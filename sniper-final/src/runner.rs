@@ -100,6 +100,7 @@ pub struct Tracker {
     log_file:         File,
     // Diagnostic state
     sl_decline_ticks: u32,                      // ticks bid declining before SL fires
+    sl_below_count:   u32,                      // consecutive ticks below SL threshold
     entry_bn_trend:   Option<f64>,              // bn_trend at entry time
     entry_cl_trend:   Option<f64>,              // cl_trend at entry time
     entry_hour_range: Option<f64>,              // hour_range at entry time
@@ -129,6 +130,7 @@ impl Tracker {
             sl_skip_logged: false,
             log_file: file,
             sl_decline_ticks: 0,
+            sl_below_count: 0,
             entry_bn_trend: None,
             entry_cl_trend: None,
             entry_hour_range: None,
@@ -150,6 +152,13 @@ impl Tracker {
             self.sl_decline_ticks += 1;
         }
 
+        // Track consecutive ticks below SL threshold (for forced exit)
+        if our_bk.best_bid > 0.0 && our_bk.best_bid <= pos.sl_px {
+            self.sl_below_count += 1;
+        } else {
+            self.sl_below_count = 0;
+        }
+
         let (fire, reason) = check_sl(
             our_bk.best_bid,
             our_bk.best_bid > 0.0,
@@ -159,15 +168,27 @@ impl Tracker {
             self.exec.sl_confirm_bid,
         );
 
-        if fire {
+        // Force SL after 10 ticks (5s) below threshold even without flip confirmation.
+        // Prevents thin-book death spiral where position rides to $0 at settlement.
+        let forced = !fire && self.sl_below_count >= 10;
+
+        if fire || forced {
             let decline_ticks = self.sl_decline_ticks;
+            let below_count = self.sl_below_count;
             let pos = self.active.take().unwrap();
             let result = execute_sl(&pos, our_bk.best_bid, &self.exec, now);
 
             info!("═══════════════════════════════════════════════════════");
-            info!("  [{}] SL {} {} {}m", self.cfg.id, pos.dir, pos.asset.to_uppercase(), pos.wmin);
-            info!("  bid={:.3} <= {:.3} (50% of {:.3})  opp_bid={:.3} <- CONFIRMED",
-                our_bk.best_bid, pos.sl_px, pos.fill_px, opp_bk.best_bid);
+            if forced {
+                info!("  [{}] SL FORCED {} {} {}m (below SL {} ticks / {:.1}s)",
+                    self.cfg.id, pos.dir, pos.asset.to_uppercase(), pos.wmin,
+                    below_count, below_count as f64 * 0.5);
+            } else {
+                info!("  [{}] SL {} {} {}m", self.cfg.id, pos.dir, pos.asset.to_uppercase(), pos.wmin);
+            }
+            info!("  bid={:.3} <= {:.3} (50% of {:.3})  opp_bid={:.3} <- {}",
+                our_bk.best_bid, pos.sl_px, pos.fill_px, opp_bk.best_bid,
+                if forced { "FORCED" } else { "CONFIRMED" });
             info!("  decline_ticks={} ({:.1}s distressed)  hold={:.1}s",
                 decline_ticks, decline_ticks as f64 * 0.5, now - pos.entry_ts);
             if let (Some(bt), Some(ct)) = (self.entry_bn_trend, self.entry_cl_trend) {
@@ -187,14 +208,15 @@ impl Tracker {
             self.done.insert(pos.slug.clone());
             self.log_trade(&result);
             self.sl_decline_ticks = 0;
+            self.sl_below_count = 0;
             self.entry_bn_trend = None;
             self.entry_cl_trend = None;
             self.entry_hour_range = None;
             self.entry_fill_method = None;
             return Some(result);
         } else if reason == "THIN_BOOK" && !self.sl_skip_logged {
-            info!("  [{}] SL skip: bid={:.3}<={:.3} but opp_bid={:.3} (thin book, holding)",
-                self.cfg.id, our_bk.best_bid, pos.sl_px, opp_bk.best_bid);
+            info!("  [{}] SL skip: bid={:.3}<={:.3} but opp_bid={:.3} (thin book {} ticks, force@10)",
+                self.cfg.id, our_bk.best_bid, pos.sl_px, opp_bk.best_bid, self.sl_below_count);
             self.sl_skip_logged = true;
         }
 
@@ -246,6 +268,7 @@ impl Tracker {
             self.entry_hour_range = None;
             self.entry_fill_method = None;
             self.sl_decline_ticks = 0;
+            self.sl_below_count = 0;
             Some(result)
         } else {
             warn!("[{}] NO_SETTLE {} — returning stake", self.cfg.id, pos.slug);
@@ -255,6 +278,7 @@ impl Tracker {
             self.entry_hour_range = None;
             self.entry_fill_method = None;
             self.sl_decline_ticks = 0;
+            self.sl_below_count = 0;
             None
         }
     }
@@ -392,6 +416,7 @@ impl Tracker {
         self.entry_hour_range = Some(hr);
         self.entry_fill_method = Some(fill_method.to_string());
         self.sl_decline_ticks = 0;
+        self.sl_below_count = 0;
 
         self.active = Some(pos);
         self.sl_skip_logged = false;
@@ -537,6 +562,7 @@ impl Tracker {
         self.entry_hour_range = Some(hr);
         self.entry_fill_method = Some(fill_method.to_string());
         self.sl_decline_ticks = 0;
+        self.sl_below_count = 0;
 
         self.active = Some(pos);
         self.sl_skip_logged = false;
@@ -626,6 +652,7 @@ impl Tracker {
 
         self.entry_fill_method = Some(fill_method.to_string());
         self.sl_decline_ticks = 0;
+        self.sl_below_count = 0;
         self.entry_bn_trend = None;
         self.entry_cl_trend = None;
         self.entry_hour_range = None;
@@ -723,6 +750,7 @@ impl Tracker {
         self.entry_hour_range = None;
         self.entry_fill_method = None;
         self.sl_decline_ticks = 0;
+        self.sl_below_count = 0;
     }
 
     // -- Logging --------------------------------------------------------------
