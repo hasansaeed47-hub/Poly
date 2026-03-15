@@ -1,2 +1,1 @@
-# LFS disabled - server unreachable from CI; store jsonl as regular git objects
-# *.jsonl filter=lfs diff=lfs merge=lfs -text
+
