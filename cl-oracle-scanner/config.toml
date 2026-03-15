@@ -1,42 +1,21 @@
-# CL Sniper v3.0 — Hybrid Live Execution Config
-# All thresholds here — nothing hardcoded in binary
-#
-# If private_key is not set (here or via env vars), runs in PAPER mode.
-
-# ── WALLET / API CREDENTIALS ─────────────────────────────────────────
-# Place your keys directly here, or use env vars / .env as fallback.
-# Config.toml takes priority over env vars.
-
-[wallet]
-# Credentials loaded from .env file automatically (see .env.example)
-# You can also place them here — config.toml takes priority over env vars:
-# private_key  = "0x..."
-# api_key      = "..."
-# api_secret   = "..."
-# passphrase   = "..."
-
-# Optional overrides
-# api_url      = "https://clob.polymarket.com"
-# neg_risk     = false
+# CL Scanner v2 — external config
+# All thresholds here, nothing hardcoded in binary
 
 [feed]
-# Assets with Chainlink feeds on Polymarket RTDS
-assets = ["btc", "eth", "sol", "xrp"]
+# Assets to scan
+assets = ["btc", "eth", "sol"]
 
 # Window timeframes in minutes
 timeframes = [5, 15]
 
-# Polymarket CLOB REST base (batch book fetches)
+# Polymarket CLOB REST base (for batch book fetches)
 clob_rest    = "https://clob.polymarket.com"
 
-# Polymarket CLOB WebSocket (order book updates — primary)
+# Polymarket CLOB WebSocket (order book updates)
 clob_ws      = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
-# Polymarket live data WebSocket (CL oracle prices)
+# Polymarket live data WebSocket (CL prices)
 live_ws      = "wss://ws-live-data.polymarket.com"
-
-# Binance aggTrade WebSocket (cross-validation)
-bn_ws        = "wss://stream.binance.com:9443/ws"
 
 # Gamma API (market discovery)
 gamma_api    = "https://gamma-api.polymarket.com"
@@ -50,133 +29,75 @@ rest_throttle_ms = 500
 # Book warmup: wait this many seconds after WS connect before trading
 book_warmup_secs = 5
 
-# Max seconds after window_start to still capture open_price reliably
-max_open_delay = 5.0
+# WebSocket reconnect delay in seconds
+ws_reconnect_secs = 5
+
+# Max CL price history entries per asset (at ~1Hz → seconds of history)
+price_history_cap = 3600
 
 [scan]
-# Scan tick interval in milliseconds (500ms active, 1000ms idle — auto)
+# Scan tick interval in milliseconds
 tick_ms = 500
 
-# ==============================================================================
-# EXECUTION PARAMETERS — proven from cl-sniper-10mar (v2.0, 100% WR day)
-# ==============================================================================
+# Sigma estimation: rolling window in seconds
+sigma_window_secs = 300
 
-[exec]
-# Stake per trade per engine
+# Minimum seconds left in window to consider entry
+min_secs = 60
+
+[paper]
+# Stake per trade in USD (paper only)
 stake = 5.0
 
-# Cumulative drawdown kill switch
-max_dd = 50.0
+# Taker fee rate (Polymarket curve approximation)
+taker_fee_rate = 0.015
 
-# Stop-loss: bid <= this fraction of fill price
-sl_pct = 0.50
+# Maker fee rate
+maker_fee_rate = 0.0
 
-# SL confirmation: opposing side bid must be >= this to confirm flip is real
-sl_confirm_bid = 0.80
+# Max simultaneous open positions across ALL configs
+max_positions_per_config = 10
 
-# Taker slippage (added to ask for taker orders)
-slip = 0.005
+# Max total USD exposure per config
+max_exposure_per_config = 100.0
 
-# Maker chase: ticks before switching to taker (4 ticks x 500ms = 2s)
-maker_chase_ticks = 4
+[configs]
+# Config 1 — Base
+[configs.c1]
+name           = "BASE"
+min_edge       = 0.12
+max_secs_left  = 840
+stop_loss      = false
+take_profit    = false
 
-# Settlement delay: seconds after window_end to wait for CLOB resolution
-settle_delay_secs = 8
+# Config 2 — Base + Time Filter (last 3 minutes only)
+[configs.c2]
+name           = "TIME_FILTER"
+min_edge       = 0.12
+max_secs_left  = 180
+stop_loss      = false
+take_profit    = false
 
-# Regime filter: 1h range below this % = chop, skip
-regime_thresh = 0.3
+# Config 3 — Base + Edge Filter (large gaps only)
+[configs.c3]
+name           = "EDGE_FILTER"
+min_edge       = 0.25
+max_secs_left  = 840
+stop_loss      = false
+take_profit    = false
 
-# Binance contra-momentum filter threshold (%)
-bn_contra_thresh = 0.02
+# Config 4 — Base + Stop Loss (exit when fair < entry_price)
+[configs.c4]
+name           = "STOP_LOSS"
+min_edge       = 0.12
+max_secs_left  = 840
+stop_loss      = true
+take_profit    = false
 
-# CL fade filter threshold (%)
-cl_fade_thresh = 0.03
-
-# BN lookback (seconds) for contra filter
-bn_contra_secs = 15
-
-# CL lookback (seconds) for fade filter
-cl_fade_secs = 10
-
-# ==============================================================================
-# ENGINES — 5 engines matching proven 10-Mar configuration
-#
-# A: 5m sniper  — low delta (0.04%), continuity=4 ticks, all filters
-# B: 5m D1      — high delta (0.15%), instant, all filters
-# C: 15m sniper — low delta (0.04%), continuity=4 ticks, all filters
-# D: 15m D1     — high delta (0.15%), instant, all filters
-# E: late scalp — book-price driven, no filters, last 25s only
-#
-# Stdev scaling: delta thresholds auto-scale per asset volatility
-#   BTC: 1.000x  ETH: 1.162x  SOL: 1.479x  XRP: 2.635x
-# ==============================================================================
-
-[engines.a]
-id              = "A"
-tf              = 5
-delta           = 0.04
-continuity      = 4
-bn_contra       = true
-cl_fade         = true
-regime          = true
-is_late_scalper = false
-entry_start     = 57
-taker_deadline  = 44
-min_entry       = 0.88
-max_entry       = 0.98
-
-[engines.b]
-id              = "B"
-tf              = 5
-delta           = 0.15
-continuity      = 0
-bn_contra       = true
-cl_fade         = true
-regime          = true
-is_late_scalper = false
-entry_start     = 57
-taker_deadline  = 44
-min_entry       = 0.88
-max_entry       = 0.98
-
-[engines.c]
-id              = "C"
-tf              = 15
-delta           = 0.04
-continuity      = 4
-bn_contra       = true
-cl_fade         = true
-regime          = true
-is_late_scalper = false
-entry_start     = 57
-taker_deadline  = 44
-min_entry       = 0.88
-max_entry       = 0.98
-
-[engines.d]
-id              = "D"
-tf              = 15
-delta           = 0.15
-continuity      = 0
-bn_contra       = true
-cl_fade         = true
-regime          = true
-is_late_scalper = false
-entry_start     = 57
-taker_deadline  = 44
-min_entry       = 0.88
-max_entry       = 0.98
-
-[engines.e]
-id              = "E"
-tf              = 0
-delta           = 0.0
-continuity      = 0
-bn_contra       = false
-cl_fade         = false
-regime          = false
-is_late_scalper = true
-entry_start     = 25
-taker_deadline  = 3
-min_entry       = 0.95
-max_entry       = 0.975
+# Config 5 — CL Target Exit (exit when book >= fair_at_entry)
+[configs.c5]
+name           = "CL_TARGET"
+min_edge       = 0.12
+max_secs_left  = 840
+stop_loss      = false
+take_profit    = true
