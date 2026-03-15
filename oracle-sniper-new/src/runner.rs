@@ -7,7 +7,7 @@
 ///   OPEN:      Filled. Monitoring bid. No protection yet.
 ///              → bid > entry_price: move to BREAKEVEN
 ///   BREAKEVEN: SL locked at entry_price. Tracking high watermark.
-///              → bid > entry + 1.5c: activate TRAILING
+///              → bid > entry + 1c: activate TRAILING
 ///              → bid <= entry_price: exit at breakeven
 ///              → bid >= entry + 10c: take profit
 ///   TRAILING:  SL = max(entry, highest_bid - 1.5c). Ratchets up only.
@@ -145,7 +145,7 @@ pub struct RunnerConfig {
     pub max_concurrent:     usize,
     pub max_hold_secs:      f64,
     pub take_profit:        f64,     // 0.10 = 10c
-    pub trail_activation:   f64,     // 0.015 = 1.5c above entry to activate trailing
+    pub trail_activation:   f64,     // 0.01 = 1c above entry to activate trailing
     pub trail_distance:     f64,     // 0.015 = 1.5c from high
     pub max_drawdown:       f64,
 }
@@ -440,7 +440,7 @@ impl Runner {
                     Side::No  => (1.0 - sig.fair_cl) - actual_price,
                 };
 
-                if post_edge < 0.10 || actual_price > 0.90 {
+                if post_edge < 0.03 || actual_price > 0.90 {
                     let reject_reason = if actual_price > 0.90 { "expensive" } else { "low_edge" };
                     warn!(
                         "[RUNNER] REJECT {} {} edge={:.3} fill={:.3}",

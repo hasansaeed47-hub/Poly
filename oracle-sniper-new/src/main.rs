@@ -95,9 +95,9 @@ struct LagConfigFile {
 }
 
 fn enforce_lag_floor(cfg: &mut LagConfigFile) {
-    if cfg.min_cl_move_pct < 0.035 { cfg.min_cl_move_pct = 0.035; }
-    if cfg.min_edge         < 0.08  { cfg.min_edge         = 0.08;  }
-    if cfg.min_book_gap     < 0.05  { cfg.min_book_gap     = 0.05;  }
+    if cfg.min_cl_move_pct < 0.020 { cfg.min_cl_move_pct = 0.020; }
+    if cfg.min_edge         < 0.03  { cfg.min_edge         = 0.03;  }
+    if cfg.min_book_gap     < 0.03  { cfg.min_book_gap     = 0.03;  }
     if cfg.min_bn_momentum  < 0.0003 { cfg.min_bn_momentum = 0.0003; }
     if cfg.min_secs_left    < 90.0  { cfg.min_secs_left    = 90.0;  }
     if cfg.max_secs_left    > 600.0 { cfg.max_secs_left    = 600.0; }

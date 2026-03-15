@@ -6,7 +6,7 @@ private_key    = ""
 funder_address = ""
 
 [feed]
-assets     = ["btc", "eth"]
+assets     = ["btc", "eth", "sol"]
 timeframes = [5, 15]
 
 clob_rest  = "https://clob.polymarket.com"
@@ -25,8 +25,8 @@ min_secs           = 90
 # ── Lag Detection ───────────────────────────────────────────────────────
 # Signal: CL moves → PM book stale → buy gap. BN = confirmation only.
 [lag]
-min_cl_move_pct     = 0.035  # CL must move by >= 0.035% to trigger
-min_edge            = 0.08   # fair_cl - fill_price >= 8c
+min_cl_move_pct     = 0.025  # CL must move by >= 0.025% to trigger
+min_edge            = 0.05   # fair_cl - fill_price >= 5c
 min_book_gap        = 0.05   # fair_cl - best_ask >= 5c (book staleness)
 min_bn_momentum     = 0.0003 # BN must confirm direction (>= 0.03%)
 min_secs_left       = 90     # don't enter below T-90s
@@ -46,6 +46,6 @@ chase_interval_ms  = 300     # 300ms between chase ticks
 max_concurrent     = 3       # max open positions
 max_hold_secs      = 30.0    # time exit after 30s (60s if BN supports)
 take_profit        = 0.10    # TP at entry + 10c
-trail_activation   = 0.015   # activate trailing at entry + 1.5c
+trail_activation   = 0.01    # activate trailing at entry + 1c
 trail_distance     = 0.015   # trail 1.5c from high watermark
 max_drawdown       = 25.0    # kill switch at -$25 net PnL
