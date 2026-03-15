@@ -1,0 +1,39 @@
+# Core dependencies for Polymarket trading bots
+# Install: pip install -r requirements.txt
+# Preferred: conda env create -f environment.yml
+
+# HTTP & WebSocket
+requests>=2.31
+websocket-client>=1.7
+aiohttp>=3.9
+websockets>=12.0
+
+# Data & science
+numpy>=1.26
+pandas>=2.1
+scipy>=1.12
+scikit-learn>=1.4
+statsmodels>=0.14
+
+# Fast JSON parsing
+orjson>=3.9
+
+# Polymarket CLOB API
+py-clob-client
+
+# Exchange data (Binance, etc.)
+ccxt>=4.0
+
+# Technical analysis
+ta>=0.11
+
+# Environment management
+python-dotenv
+
+# Scheduling
+schedule>=1.2
+
+# Visualization (optional)
+matplotlib>=3.8
+seaborn>=0.13
+plotly>=5.18
