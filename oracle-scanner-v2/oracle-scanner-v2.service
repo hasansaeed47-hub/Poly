@@ -11,18 +11,34 @@ Restart=always
 RestartSec=5
 Environment=RUST_LOG=oracle_scanner_v2=info
 
-# Explicitly disable all namespace/sandbox features (fixes 226/NAMESPACE on this host)
+# ── Firecracker microVM: disable EVERY namespace/sandbox feature ──
+# This host runs Firecracker (PID1 = /process_api), not native systemd.
+# Kernel blocks namespace syscalls → 226/NAMESPACE on any sandbox directive.
 ProtectSystem=false
 ProtectHome=false
 PrivateTmp=false
 PrivateDevices=false
 PrivateUsers=false
+PrivateNetwork=false
 ProtectKernelTunables=false
 ProtectKernelModules=false
+ProtectKernelLogs=false
 ProtectControlGroups=false
+ProtectHostname=false
+ProtectClock=false
+ProtectProc=default
 RestrictNamespaces=false
+LockPersonality=false
 MemoryDenyWriteExecute=false
 RestrictSUIDSGID=false
+RestrictRealtime=false
+RestrictAddressFamilies=
+SystemCallFilter=
+SystemCallArchitectures=
+MountAPIVFS=false
+KeyringMode=inherit
+NoNewPrivileges=false
+RemoveIPC=false
 
 [Install]
 WantedBy=multi-user.target
