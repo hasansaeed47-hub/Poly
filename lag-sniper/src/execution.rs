@@ -495,19 +495,39 @@ impl ExecutionLayer {
                     }
                 }
 
-                // Step 3: Fall through to taker (capped by best_ask passed from runner)
-                if best_ask > 0.90 {
-                    return Err(anyhow!("Taker price {:.2} too high, aborting", best_ask));
+                // Step 3: Fall through to taker using current chase price + 1 tick
+                // (best_ask passed from runner may be stale after chase loop)
+                let taker_price = (current_price + tick).min(0.90);
+                if taker_price <= current_price || taker_price > 0.90 {
+                    return Err(anyhow!("Taker price {:.2} out of range after chase, aborting", taker_price));
                 }
-                info!("[EXEC] Maker chase exhausted, taker fill at ask={:.2}", best_ask);
-                self.buy_fak(token_id, best_ask, stake).await
+                info!("[EXEC] Maker chase exhausted, taker fill at {:.2} (chase was {:.2})", taker_price, current_price);
+                match self.buy_fak(token_id, taker_price, stake).await {
+                    Ok(r) => Ok(r),
+                    Err(e) if e.to_string().contains("no orders found to match") => {
+                        // Ask-side liquidity pulled — retry once at +1 more tick
+                        let retry_price = (taker_price + tick).min(0.90);
+                        warn!("[EXEC] FAK no match at {:.2}, retry at {:.2}", taker_price, retry_price);
+                        self.buy_fak(token_id, retry_price, stake).await
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => {
                 let err_str = e.to_string();
                 if err_str.starts_with("CROSS:") {
-                    // Price already at/above ask — just taker
-                    info!("[EXEC] Cross on first try, taker at {:.2}", best_ask);
-                    self.buy_fak(token_id, best_ask, stake).await
+                    // Price already at/above ask — taker at initial_price (freshest)
+                    let taker_price = initial_price.min(0.90);
+                    info!("[EXEC] Cross on first try, taker at {:.2}", taker_price);
+                    match self.buy_fak(token_id, taker_price, stake).await {
+                        Ok(r) => Ok(r),
+                        Err(e2) if e2.to_string().contains("no orders found to match") => {
+                            let retry_price = (taker_price + tick).min(0.90);
+                            warn!("[EXEC] FAK no match at {:.2}, retry at {:.2}", taker_price, retry_price);
+                            self.buy_fak(token_id, retry_price, stake).await
+                        }
+                        Err(e2) => Err(e2),
+                    }
                 } else {
                     Err(e)
                 }
