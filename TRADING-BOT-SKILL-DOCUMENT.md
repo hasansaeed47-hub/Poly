@@ -1,13 +1,16 @@
 # Profitable Trading Bot — Complete Skill Document
 
-**Based on: Polymarket v4.1 Production System + CL Sniper + Hydra Multi-Strategy**
-**Source: Real code, paper trading data (3,000+ trades), and live infrastructure**
-**Date: March 2026**
+> **Live document — updated continuously. No repeated disclaimers.**
+
+**System: Polymarket v4.1 + CL Sniper + Hydra Multi-Strategy**
+**Data: 3,000+ paper trades, real market data, March 2026**
+**Last updated: 2026-03-15**
 
 ---
 
 ## Table of Contents
 
+0. [Core Objectives](#0-core-objectives)
 1. [Market Structure & How PM Markets Work](#1-market-structure--how-pm-markets-work)
 2. [How Chainlink (CL) and Binance (BN) Feeds Are Captured](#2-how-chainlink-cl-and-binance-bn-feeds-are-captured)
 3. [Core Architecture — Python Format](#3-core-architecture--python-format)
@@ -18,8 +21,40 @@
 8. [Risk Management Framework](#8-risk-management-framework)
 9. [Paper Trading Results & Statistical Evidence](#9-paper-trading-results--statistical-evidence)
 10. [Infrastructure Patterns for Live Trading](#10-infrastructure-patterns-for-live-trading)
-11. [Common Failure Modes & Lessons Learned](#11-common-failure-modes--lessons-learned)
-12. [Complete System Checklist](#12-complete-system-checklist)
+11. [How to Speed Up Trading](#11-how-to-speed-up-trading)
+12. [Current Status — Directional, Arb, Lag & Latency Bots](#12-current-status--directional-arb-lag--latency-bots)
+13. [Common Failure Modes & Lessons Learned](#13-common-failure-modes--lessons-learned)
+14. [Complete System Checklist](#14-complete-system-checklist)
+
+---
+
+## 0. Core Objectives
+
+### What We Are Building
+
+A **self-sustaining automated trading operation** across prediction markets (Polymarket, Kalshi) that generates consistent returns through four complementary bot types:
+
+| Bot Type | Objective | Target Return | Status |
+|----------|-----------|---------------|--------|
+| **Directional** | Trade CL oracle edge on 5m/15m crypto windows | 8-15%/month | Paper validated (72-77% win rate) |
+| **Arbitrage** | Capture YES+NO < $1.00 mispricings | 2-5%/month (low risk) | Production-ready (merge strategy) |
+| **Lag** | Exploit CL RTDS → book price update delay | 15-30%/month | Paper validated (CL Sniper) |
+| **Latency** | Sub-100ms execution on oracle feed divergence | 20-40%/month | Rust prototype (polyfill-rs integration pending) |
+
+### Revenue Targets
+
+- **Phase 1 (current):** $50-200/day from directional + arb on $500-2,000 deployed capital
+- **Phase 2:** $500-1,000/day scaling to $5,000-10,000 capital with Rust latency bots
+- **Phase 3:** Cross-platform (Polymarket + Kalshi) with weather/structured markets
+
+### Non-Negotiable Principles
+
+1. **Maker-first execution** — 0% fee vs 2-6% taker fee is the entire edge
+2. **CL settles, BN quotes** — never confuse which oracle determines the outcome
+3. **Paper before live** — every strategy runs 500+ paper trades before real capital
+4. **Stop-losses always on** — a single uncontrolled loss wipes 6 wins
+5. **Regime awareness** — skip choppy markets (BTC 1h range < 0.3%), pause on cascades
+6. **Capital preservation** — $50/day max loss, $200 max exposure per strategy
 
 ---
 
@@ -1249,7 +1284,284 @@ def on_cancel(order_id):
 
 ---
 
-## 11. Common Failure Modes & Lessons Learned
+## 11. How to Speed Up Trading
+
+### 11.1 Current Latency Stack
+
+```
+Signal (CL RTDS update)           ~0ms (WebSocket push)
+  → JSON parse (orjson/Python)    ~1-3ms
+  → Fair value calc               ~0.1ms
+  → Edge check + decision         ~0.5ms
+  → HTTP order placement          ~80-400ms  ← BOTTLENECK
+  → Fill confirmation (WS)        ~50-200ms
+─────────────────────────────────────────────
+Total tick-to-trade:              ~130-600ms (Python)
+                                  ~5-50ms (Rust, optimized)
+```
+
+### 11.2 Networking Layer Optimization
+
+| Technique | Latency | Improvement | Effort |
+|-----------|---------|-------------|--------|
+| **Standard kernel TCP** | 20-50 us | Baseline | None |
+| **io_uring** (async ring buffers) | 10-30 us | 2x | Medium |
+| **AF_XDP** (eBPF fast path) | 5-15 us | 3-4x | High |
+| **DPDK** (full kernel bypass) | **3.5 us** | **100x** | Very high |
+| **FPGA** (hardware parsing) | **<1 us** | **1000x** | Extreme |
+
+**For prediction markets:** DPDK is overkill. The bottleneck is Polymarket's API response time (80-400ms), not local networking. Focus optimization effort on:
+1. Connection pooling + HTTP/2 keep-alive
+2. Parallel book fetches via thread pool
+3. WebSocket for all data (avoid REST polling)
+4. Batch orders (up to 15 per call)
+
+### 11.3 Rust-Specific Speed Gains
+
+**polyfill-rs** — the fastest Polymarket Rust client (drop-in replacement):
+- **321.6ms mean latency** vs 409.3ms for polymarket-rs-client (21.4% faster)
+- simd-json parsing: **1.77x speedup** over serde_json
+- HTTP/2 stream windows tuned to 512KB for typical 469KB payloads
+- Zero-allocation hot paths (no heap after warmup)
+- Designed for co-located environments processing 100k+ updates/sec
+
+Source: [polyfill-rs on GitHub](https://github.com/floor-licker/polyfill-rs)
+
+**Other Rust speed crates:**
+
+| Crate | Feature | Use Case |
+|-------|---------|----------|
+| `polyfill-rs` | SIMD JSON, zero-alloc, HTTP/2 tuned | Order placement |
+| `polymarket-hft` | HFT system with built-in API | Full trading system |
+| `sockudo-ws` | Zero-copy WS, AVX2/AVX-512, io_uring | Market data streaming |
+| `websockets-monoio` | fastwebsockets + io_uring | Ultra-low-latency WS |
+| `crossbeam` | Lock-free SPSC ring buffers | Inter-thread data passing |
+| `dashmap` | Concurrent hashmap | Shared price state |
+
+**Compile-time optimization (Cargo.toml):**
+
+```toml
+[profile.release]
+opt-level = 3
+lto = "fat"           # 10-20% runtime improvement
+codegen-units = 1      # better cross-module optimization
+panic = "abort"        # smaller binary, faster unwind
+strip = "symbols"
+```
+
+Build with: `RUSTFLAGS="-C target-cpu=native" cargo build --release`
+
+### 11.4 CPU & Memory Optimization
+
+**CPU pinning** — eliminates scheduler jitter:
+```rust
+use core_affinity;
+let cores = core_affinity::get_core_ids().unwrap();
+core_affinity::set_for_current(cores[0]); // pin to core 0
+```
+
+**NUMA awareness** — cross-node penalty is 79% latency increase:
+- Same node: 330ns latency, 4220 MiB/s throughput
+- Cross node: 590ns latency, 3410 MiB/s throughput
+- Rule: keep feed thread and strategy thread on same NUMA node
+
+**Busy-wait vs async:**
+```
+CRITICAL PATH (tick-to-trade):     busy-wait (spin_loop)
+INFRASTRUCTURE (feeds, heartbeat): tokio async
+```
+
+Rust's `std::hint::spin_loop` signals the CPU to optimize power during spin. Tokio adds task scheduling overhead (~5-10us) unsuitable for the hot path.
+
+**Data processing benchmarks (Rust vs Python):**
+- Quote message parse: **12 us (Rust)** vs **250-500 us (Python)**
+- Trade message parse: **6 us (Rust)** vs **100-300 us (Python)**
+- Order book update: **<1 us (Rust, fixed-point)** vs **50-100 us (Python)**
+
+### 11.5 Co-location
+
+**For Polymarket:** New York servers provide optimal connectivity.
+- Co-located: **1-5ms** to Polymarket CLOB
+- Retail (home internet): **50-200ms**
+- Impact: 73% of arbitrage profits captured by sub-100ms execution bots
+
+**Recommended VPS specs:**
+- AMD EPYC or Intel Xeon, 3.8+ GHz
+- DDR5, tight timings
+- 1 Gbps+ network
+- NYC data center (e.g., Equinix NY5, QuantVPS NYC)
+
+### 11.6 Protocol-Level Optimizations
+
+**Rate limits (Polymarket, 2026):**
+- Trading endpoints: 60 orders/minute
+- Public API: 100 requests/minute
+- WebSocket: 500 instruments/connection (undocumented cap)
+- Batch orders: up to 15 per POST
+
+**Maximizing throughput within limits:**
+- Batch all possible orders into single 15-order POSTs
+- Use WS for all market data (REST polling burns rate limit)
+- Pipeline: submit next order while waiting for previous fill confirmation
+- Pre-sign orders (EIP-712) before the signal arrives, submit instantly on trigger
+
+### 11.7 Speed Priority Matrix
+
+| Optimization | Impact | Implementation |
+|-------------|--------|----------------|
+| Switch Python → Rust for execution | **10-50x** | Replace bot.py hot path |
+| polyfill-rs for Polymarket API | **21%** | Drop-in crate swap |
+| simd-json parsing | **1.77x** on JSON | One dependency change |
+| Batch orders (15/call) | **15x** fewer API calls | Already implemented |
+| WS for books (not REST) | **5-10x** fresher data | Already implemented |
+| CPU pinning | **2-5x** less jitter | 3 lines of code |
+| NYC co-location | **10-40x** less network RTT | $20-50/month VPS |
+| DPDK kernel bypass | **100x** networking | Not needed (API is bottleneck) |
+
+---
+
+## 12. Current Status — Directional, Arb, Lag & Latency Bots
+
+### 12.1 Directional Bot (Polymarket v4.1 — Python)
+
+**Status: Paper-validated, ready for live with small capital**
+
+| Metric | Value |
+|--------|-------|
+| Codebase | `bot.py` + `infra.py` + `strategy.py` (2,000+ lines Python) |
+| Win rate | 72-77% (3,051 paper trades, March 8-9 2026) |
+| Strategy | Black-Scholes fair value vs CLOB book price |
+| Edge source | CL oracle divergence from book (2-8 second windows) |
+| Assets | BTC, ETH, SOL (XRP removed — too noisy) |
+| Timeframes | 5m, 15m windows |
+| Execution | Maker-only GTC (0% fee), FAK for emergency leg2 |
+| Risk | $200 max exposure, $50 daily loss cap |
+| Tick speed | 400ms (Python) |
+| Feed | CL RTDS primary, BN fallback |
+| Architecture | Pair accumulator (LEG1 → LEG2 → MERGE at $1.00) |
+| Open issues | GC pauses during settlement window, needs Rust migration for hot path |
+
+### 12.2 Arbitrage Bot (Merge Strategy — Python)
+
+**Status: Production-ready, running in paper mode**
+
+| Metric | Value |
+|--------|-------|
+| Codebase | MergeEngine in `strategy.py` |
+| Strategy | Buy UP + DOWN when combined < $1.00, merge for guaranteed profit |
+| Typical spread | 1-3 cents ($0.98-0.99 combined cost → $1.00 merge) |
+| Fill challenge | Must fill BOTH sides as maker (25% fill rate per side) |
+| Return per merge | $0.01-0.03 per pair |
+| Frequency | Every 30 seconds (MERGE_INTERVAL) |
+| Risk | Near-zero (only risk is filling one side and not the other) |
+| Orphan handling | Sell unfilled side at 50%+ recovery |
+| Edge sustainability | Persistent — structural feature of CLOB binary markets |
+
+**Industry context (2026):**
+- $40M in arb profits extracted from Polymarket (Apr 2024 – Apr 2025, IMDEA study)
+- Top arbitrageur: $2.01M across 4,049 transactions
+- Average arb window: **2.7 seconds** (down from 12.3s in 2024)
+- 73% of arb profits go to sub-100ms bots
+- Polymarket removed 500ms delay and introduced dynamic fees in 2026 — pure taker arb is now fee-negative near 50% probability. **Maker arb remains viable.**
+
+Sources: [Yahoo Finance](https://finance.yahoo.com/news/arbitrage-bots-dominate-polymarket-millions-100000888.html), [IMDEA Study](https://medium.com/illumination/beyond-simple-arbitrage-4-polymarket-strategies-bots-actually-profit-from-in-2026-ddacc92c5b4f)
+
+### 12.3 Lag Bot (CL Sniper — Rust)
+
+**Status: Paper-validated, strong results, needs live capital testing**
+
+| Metric | Value |
+|--------|-------|
+| Codebase | `cl-sniper-9mar.tar.gz` (Rust, 40 parallel trackers) |
+| Architecture | 10 engines x 2 timeframes x 2 regime modes |
+| Strategy | Exploit CL RTDS → CLOB book update lag |
+| Edge window | 2-15 seconds between CL price update and book adjustment |
+| Win rate | 72-77% (111 paper trades, March 8 2026) |
+| Engine variants | A (δ≥0.10%), B (+3tick), C (δ≥0.03%+3tick), D (δ≥0.15%), E (δ≥0.05%) |
+| Stop-loss | Sell at 50% of entry, posted at entry, cancelled T-3s |
+| Tick speed | 500ms active, 1s idle |
+| Risk | $35 max drawdown, 4 max consecutive losses, 6 max concurrent |
+| Regime filter | Skip when BTC 1h range < 0.3% |
+| Taker deadline | 44 seconds left in window |
+
+**Real-world lag exploit examples:**
+- A trader earned **$50,000 in one week** exploiting hourly resolution latency — buying outcomes that had already occurred during oracle update delays. Perfect accuracy across 23 trades.
+- A bot turned **$313 into $414,000 in one month** on BTC/ETH/SOL 15m markets with 98% win rate via temporal arbitrage.
+
+Sources: [Phemex](https://phemex.com/news/article/trader-exploits-oracle-latency-for-50k-profit-in-one-week-45143), [Medium](https://medium.com/illumination/beyond-simple-arbitrage-4-polymarket-strategies-bots-actually-profit-from-in-2026-ddacc92c5b4f)
+
+**Oracle lag risks:**
+- UMA governance manipulation: whale with 5M UMA tokens (25% voting power) manipulated $7M resolution (March 2025)
+- $240M "Zelenskyy Suit Case" oracle dispute (June 2025)
+- Cross-platform resolution divergence (2024 govt shutdown: PM resolved YES, Kalshi resolved NO)
+
+Source: [Orochi Network](https://orochi.network/blog/oracle-manipulation-in-polymarket-2025)
+
+### 12.4 Latency Bot (Planned — Rust)
+
+**Status: Architecture designed, polyfill-rs integration pending**
+
+| Metric | Target |
+|--------|--------|
+| Codebase | New Rust binary using polyfill-rs + sockudo-ws |
+| Strategy | Sub-100ms execution on CL feed divergence from book |
+| Target latency | 5-50ms tick-to-trade (vs 130-600ms current Python) |
+| Execution | Maker post-only with pre-signed EIP-712 orders |
+| Co-location | NYC VPS for 1-5ms API RTT |
+| Feed | CL RTDS via zero-copy WS (sockudo-ws) |
+| Architecture | Busy-wait on pinned core, tokio for infrastructure |
+| Dependencies | polyfill-rs (321ms API), simd-json, crossbeam, dashmap |
+| Revenue target | Capture the 73% of arb profits currently going to fastest bots |
+
+**Implementation roadmap:**
+1. Integrate polyfill-rs as Polymarket client
+2. Replace tokio-tungstenite with sockudo-ws for CL RTDS
+3. Implement busy-wait main loop on pinned core
+4. Pre-sign order batch and submit on CL tick
+5. Deploy on NYC co-located VPS
+6. Paper test 500+ trades before live capital
+
+### 12.5 Cross-Platform Arb (Polymarket ↔ Kalshi — Planned)
+
+**Status: Research phase**
+
+| Metric | Finding |
+|--------|---------|
+| Spread opportunity | 3-5% on similar events across platforms |
+| Combined monthly volume | ~$10B (Kalshi $5.8B + PM $3.74B, Nov 2025) |
+| Primary risk | Resolution divergence (different oracles, different rules) |
+| PM oracle | UMA Optimistic Oracle (propose-dispute-vote) |
+| Kalshi oracle | NWS Daily Climate Report / internal Outcome Review Committee |
+| Fee drag | Combined 5%+ makes spreads under 5% unprofitable |
+| Execution challenge | PM = crypto wallet + USDC; Kalshi = US residency + bank |
+| Failure rate | 78% of arb opps in low-volume markets fail on execution |
+| New competitor | Binance-backed Opinion (30-32% global market share by Jan 2026) |
+
+Sources: [AhaSignals](https://ahasignals.com/research/prediction-market-arbitrage-strategies/), [CoinGape](https://coingape.com/blog/kalshi-vs-polymarket/)
+
+### 12.6 Multi-Strategy Bot Status Summary
+
+```
+OPERATIONAL:
+  [==========] Directional (v4.1 Python)     — paper-validated, live-ready
+  [==========] Arbitrage/Merge (Python)       — production-ready
+  [========  ] CL Sniper Lag (Rust)           — paper-validated, needs live test
+  [====      ] Oracle Scanner (Rust)          — 5 configs tested, needs tuning
+  [===       ] A/B Test Framework (Rust)      — maker vs taker comparison done
+
+IN DEVELOPMENT:
+  [==        ] Latency Bot (Rust)             — architecture designed
+  [=         ] Cross-Platform Arb (PM↔Kalshi) — research phase
+  [          ] Weather Market Bot              — see companion document
+
+DEPRECATED:
+  [XXXXXXXXXX] polymarket-bot.zip (Python v1) — replaced by v4.1
+  [XXXXXXXXXX] CL Sniper v6                   — replaced by 9Mar version
+```
+
+---
+
+## 13. Common Failure Modes & Lessons Learned
 
 ### 11.1 Failures That Lost Money
 
@@ -1287,7 +1599,7 @@ def on_cancel(order_id):
 
 ---
 
-## 12. Complete System Checklist
+## 14. Complete System Checklist
 
 ### Pre-Launch
 
@@ -1368,4 +1680,19 @@ From 3,051 paper trades (March 2026):
 
 ---
 
-*This document is based on production code (Polymarket v4.1), Rust trading bots (CL Sniper v6/9Mar, Hydra), and 3,000+ paper trades with real market data from March 2026. All strategies, configurations, and results are from actual bot execution, not theoretical models.*
+## Appendix D: Key External Sources
+
+- [polyfill-rs — Fastest Polymarket Rust Client](https://github.com/floor-licker/polyfill-rs)
+- [Polymarket CLOB API Docs](https://docs.polymarket.com/developers/CLOB/introduction)
+- [Polymarket rs-clob-client](https://github.com/Polymarket/rs-clob-client)
+- [polymarket-hft crate](https://lib.rs/crates/polymarket-hft)
+- [Arb Bots Dominate Polymarket — Yahoo Finance](https://finance.yahoo.com/news/arbitrage-bots-dominate-polymarket-millions-100000888.html)
+- [Oracle Manipulation in Polymarket 2025 — Orochi](https://orochi.network/blog/oracle-manipulation-in-polymarket-2025)
+- [Latency Arbitrage in Crypto Markets — SSRN](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5143158)
+- [Prediction Market Arbitrage Guide 2026](https://newyorkcityservers.com/blog/prediction-market-arbitrage-guide)
+- [How Latency Impacts Polymarket Trading — QuantVPS](https://www.quantvps.com/blog/how-latency-impacts-polymarket-trading-performance)
+- [Kernel Bypass in HFT — QuantVPS](https://www.quantvps.com/blog/kernel-bypass-in-hft)
+- [Rust for HFT — Lucas Bardella](https://lucasbardella.com/coding/2025/rust-for-hft)
+- [Nexus: Low-Latency Primitives for Rust](https://users.rust-lang.org/t/announcing-nexus-low-latency-primitives-for-high-performance-systems/137293)
+- [CoinDesk: AI Helping Retail Exploit PM Glitches](https://www.coindesk.com/markets/2026/02/21/how-ai-is-helping-retail-traders-exploit-prediction-market-glitches-to-make-easy-money)
+- [Cross-Platform Arb Strategies — AhaSignals](https://ahasignals.com/research/prediction-market-arbitrage-strategies/)
