@@ -204,10 +204,9 @@ impl LagRunner {
             }
 
             // ── Exit 2: TRAILING STOP ──────────────────────────────────
-            // Once bid reaches entry + min_profit, activate trailing stop.
-            // Exit when bid drops 2c from the high-water mark.
-            let trail_activated = trail_high >= pos.entry_price + self.config.min_profit;
-            if trail_activated && exit_bid <= trail_high - 0.02 {
+            // Activate once bid is 3c above entry. Trail by 1.5c.
+            let trail_activated = trail_high >= pos.entry_price + 0.03;
+            if trail_activated && exit_bid <= trail_high - 0.015 {
                 info!(
                     "[LAG_RUNNER] TRAIL_STOP {} bid={:.3} high={:.3} drop={:.3} hold={:.1}s",
                     pos.slug, exit_bid, trail_high, trail_high - exit_bid, hold_secs
