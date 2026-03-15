@@ -437,14 +437,16 @@ fn process_cl_message(
     let raw_ts = payload.get("timestamp")
         .and_then(|t| t.as_f64().or_else(|| t.as_i64().map(|i| i as f64)))
         .unwrap_or(0.0);
+    let now_f = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs_f64();
     let ts = if raw_ts > 1e12 { raw_ts / 1000.0 }
              else if raw_ts > 1e9 { raw_ts }
-             else {
-                 std::time::SystemTime::now()
-                     .duration_since(std::time::UNIX_EPOCH)
-                     .unwrap_or_default().as_secs_f64()
-             };
+             else { now_f };
+    // Reject future timestamps (malformed data)
+    let ts = if ts > now_f + 60.0 { now_f } else { ts };
 
+    if asset.is_empty() { return; }
     cl_prices.insert(asset.clone(), (ts, price));
 
     let hist_key = format!("cl_{}", asset);
@@ -545,8 +547,8 @@ fn process_bn_message(
     };
 
     let asset = match bn_symbol_to_asset(symbol) {
-        Some(a) => a,
-        None => return,
+        Some(a) if !a.is_empty() => a,
+        _ => return,
     };
 
     let price: f64 = data.get("p")
@@ -622,7 +624,8 @@ pub fn bn_flow_imbalance(
     }
 
     let total = buy_vol + sell_vol;
-    let imbalance = if total > 0.0 { (buy_vol - sell_vol) / total } else { 0.0 };
+    // Require minimum $500 notional volume for reliable signal
+    let imbalance = if total >= 500.0 { (buy_vol - sell_vol) / total } else { 0.0 };
     (buy_vol, sell_vol, imbalance)
 }
 

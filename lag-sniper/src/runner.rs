@@ -257,14 +257,14 @@ impl LagRunner {
             // ── Exit 5: TIME ────────────────────────────────────────────
             // Held too long without convergence
             if hold_secs > self.config.max_hold_secs && secs_left > 60.0 {
-                // If BN still supports our direction, hold to settlement
-                // rather than panic-selling into a thin bid
+                // If BN still supports our direction AND we haven't held 2x max,
+                // hold to settlement rather than panic-selling into a thin bid
                 let bn_supports = match pos.side {
                     Side::Yes => bn_momentum >= 0.0,
                     Side::No  => bn_momentum <= 0.0,
                 };
-                if bn_supports || exit_bid < pos.entry_price * 0.85 {
-                    // Better to ride to settlement than sell at a big haircut
+                let hard_time_cap = hold_secs > self.config.max_hold_secs * 2.0;
+                if !hard_time_cap && (bn_supports || exit_bid < pos.entry_price * 0.85) {
                     continue;
                 }
                 info!(

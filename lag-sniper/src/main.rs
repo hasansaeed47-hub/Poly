@@ -438,6 +438,7 @@ async fn main() -> Result<()> {
 
         // ── Settlements ─────────────────────────────────────────────────
 
+        let mut newly_settled: Vec<String> = Vec::new();
         for (slug, meta) in &markets {
             if settled.get(slug.as_str()).copied().unwrap_or(false) { continue; }
             if now_u >= meta.window_end + 5 {
@@ -452,7 +453,18 @@ async fn main() -> Result<()> {
 
                 runner.on_settlement(slug, outcome, now).await;
                 settled.insert(slug.clone(), true);
+                newly_settled.push(slug.clone());
             }
+        }
+        // Clean up settled markets to prevent unbounded memory growth
+        for slug in &newly_settled {
+            if let Some(meta) = markets.remove(slug) {
+                token_ids.remove(&meta.token_yes);
+                token_ids.remove(&meta.token_no);
+                book_state.remove(&meta.token_yes);
+                book_state.remove(&meta.token_no);
+            }
+            cl_close_snap.remove(slug.as_str());
         }
 
         // ── Warmup gate ─────────────────────────────────────────────────

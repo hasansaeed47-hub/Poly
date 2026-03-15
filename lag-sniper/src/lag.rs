@@ -134,6 +134,8 @@ impl LagDetector {
     ) -> Option<LagSignal> {
         // ── Basic validity checks ───────────────────────────────────────
         if open_price <= 0.0 || bn_price <= 0.0 || cl_price <= 0.0 { return None; }
+        // Reject extreme open prices that make BS model ill-conditioned
+        if (cl_price / open_price) < 0.90 || (cl_price / open_price) > 1.10 { return None; }
         if secs_left <= 0.0 { return None; }
         if book_yes.best_ask <= 0.0 || book_no.best_ask <= 0.0 { return None; }
 

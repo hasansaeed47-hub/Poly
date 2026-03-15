@@ -495,7 +495,10 @@ impl ExecutionLayer {
                     }
                 }
 
-                // Step 3: Fall through to taker
+                // Step 3: Fall through to taker (capped by best_ask passed from runner)
+                if best_ask > 0.90 {
+                    return Err(anyhow!("Taker price {:.2} too high, aborting", best_ask));
+                }
                 info!("[EXEC] Maker chase exhausted, taker fill at ask={:.2}", best_ask);
                 self.buy_fak(token_id, best_ask, stake).await
             }
