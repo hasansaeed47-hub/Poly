@@ -1,32 +1,38 @@
 {
-  "sweep_summary": {
+  "version": "v2_reversal_aware",
+  "data_summary": {
     "total_settlements": 63,
-    "tradeable_5m": 27,
-    "tradeable_15m": 21,
-    "tradeable_late": 0,
-    "reversal_warnings": 0
+    "with_entry_data": 48,
+    "reversals_in_data": 3
   },
   "optimal_engines": {
     "B": {
-      "id": "B",
       "tf": 5,
-      "delta": 0.02,
+      "delta": 0.04,
       "continuity": 0,
       "min_entry": 0.85,
       "max_entry": 0.99,
-      "is_late_scalper": false
+      "estimated_reversal_risk": 0.05,
+      "estimated_wr": 95.0
     },
     "D": {
-      "id": "D",
       "tf": 15,
-      "delta": 0.02,
+      "delta": 0.04,
       "continuity": 0,
       "min_entry": 0.85,
       "max_entry": 0.99,
-      "is_late_scalper": false
+      "estimated_reversal_risk": 0.05,
+      "estimated_wr": 95.0
     }
   },
-  "combined_trades": [
+  "production_comparison": {
+    "production_trades": 0,
+    "production_pnl": 0,
+    "optimal_trades": 16,
+    "optimal_pnl": 4.1188,
+    "realistic_pnl": 3.4386
+  },
+  "trades": [
     {
       "engine": "D",
       "slug": "btc-updown-15m-1773536400",
@@ -35,7 +41,8 @@
       "direction": "DOWN",
       "outcome": "NO",
       "fill_px": 0.96,
-      "pnl": 0.20833333333333393
+      "pnl": 0.20833333333333393,
+      "delta_at_entry": 0.0932
     },
     {
       "engine": "B",
@@ -45,7 +52,8 @@
       "direction": "DOWN",
       "outcome": "NO",
       "fill_px": 0.98,
-      "pnl": 0.1020408163265305
+      "pnl": 0.1020408163265305,
+      "delta_at_entry": 0.0976
     },
     {
       "engine": "D",
@@ -55,7 +63,8 @@
       "direction": "DOWN",
       "outcome": "NO",
       "fill_px": 0.98,
-      "pnl": 0.1020408163265305
+      "pnl": 0.1020408163265305,
+      "delta_at_entry": 0.0929
     },
     {
       "engine": "B",
@@ -65,7 +74,8 @@
       "direction": "UP",
       "outcome": "YES",
       "fill_px": 0.93,
-      "pnl": 0.37634408602150504
+      "pnl": 0.37634408602150504,
+      "delta_at_entry": 0.0637
     },
     {
       "engine": "B",
@@ -75,7 +85,8 @@
       "direction": "UP",
       "outcome": "YES",
       "fill_px": 0.96,
-      "pnl": 0.20833333333333393
+      "pnl": 0.20833333333333393,
+      "delta_at_entry": 0.0651
     },
     {
       "engine": "B",
@@ -85,7 +96,8 @@
       "direction": "UP",
       "outcome": "YES",
       "fill_px": 0.97,
-      "pnl": 0.1546391752577323
+      "pnl": 0.1546391752577323,
+      "delta_at_entry": 0.1085
     },
     {
       "engine": "D",
@@ -95,27 +107,8 @@
       "direction": "DOWN",
       "outcome": "NO",
       "fill_px": 0.9,
-      "pnl": 0.5555555555555554
-    },
-    {
-      "engine": "D",
-      "slug": "eth-updown-15m-1773537300",
-      "asset": "eth",
-      "tf": 15,
-      "direction": "DOWN",
-      "outcome": "NO",
-      "fill_px": 0.96,
-      "pnl": 0.20833333333333393
-    },
-    {
-      "engine": "D",
-      "slug": "eth-updown-15m-1773538200",
-      "asset": "eth",
-      "tf": 15,
-      "direction": "UP",
-      "outcome": "YES",
-      "fill_px": 0.92,
-      "pnl": 0.43478260869565233
+      "pnl": 0.5555555555555554,
+      "delta_at_entry": 0.0409
     },
     {
       "engine": "D",
@@ -125,7 +118,8 @@
       "direction": "UP",
       "outcome": "YES",
       "fill_px": 0.93,
-      "pnl": 0.37634408602150504
+      "pnl": 0.37634408602150504,
+      "delta_at_entry": 0.0828
     },
     {
       "engine": "B",
@@ -135,7 +129,8 @@
       "direction": "UP",
       "outcome": "YES",
       "fill_px": 0.97,
-      "pnl": 0.1546391752577323
+      "pnl": 0.1546391752577323,
+      "delta_at_entry": 0.1342
     },
     {
       "engine": "B",
@@ -145,7 +140,8 @@
       "direction": "UP",
       "outcome": "YES",
       "fill_px": 0.89,
-      "pnl": 0.6179775280898872
+      "pnl": 0.6179775280898872,
+      "delta_at_entry": 0.0584
     },
     {
       "engine": "B",
@@ -155,17 +151,8 @@
       "direction": "UP",
       "outcome": "YES",
       "fill_px": 0.98,
-      "pnl": 0.1020408163265305
-    },
-    {
-      "engine": "B",
-      "slug": "btc-updown-5m-1773550800",
-      "asset": "btc",
-      "tf": 5,
-      "direction": "DOWN",
-      "outcome": "NO",
-      "fill_px": 0.88,
-      "pnl": 0.6818181818181817
+      "pnl": 0.1020408163265305,
+      "delta_at_entry": 0.1451
     },
     {
       "engine": "B",
@@ -175,7 +162,8 @@
       "direction": "DOWN",
       "outcome": "NO",
       "fill_px": 0.96,
-      "pnl": 0.20833333333333393
+      "pnl": 0.20833333333333393,
+      "delta_at_entry": 0.0659
     },
     {
       "engine": "D",
@@ -185,7 +173,8 @@
       "direction": "DOWN",
       "outcome": "NO",
       "fill_px": 0.97,
-      "pnl": 0.1546391752577323
+      "pnl": 0.1546391752577323,
+      "delta_at_entry": 0.0416
     },
     {
       "engine": "D",
@@ -195,17 +184,8 @@
       "direction": "UP",
       "outcome": "YES",
       "fill_px": 0.98,
-      "pnl": 0.1020408163265305
-    },
-    {
-      "engine": "B",
-      "slug": "sol-updown-5m-1773563400",
-      "asset": "sol",
-      "tf": 5,
-      "direction": "DOWN",
-      "outcome": "NO",
-      "fill_px": 0.9,
-      "pnl": 0.5555555555555554
+      "pnl": 0.1020408163265305,
+      "delta_at_entry": 0.131
     },
     {
       "engine": "B",
@@ -215,7 +195,8 @@
       "direction": "DOWN",
       "outcome": "NO",
       "fill_px": 0.93,
-      "pnl": 0.37634408602150504
+      "pnl": 0.37634408602150504,
+      "delta_at_entry": 0.0424
     },
     {
       "engine": "D",
@@ -225,8 +206,8 @@
       "direction": "DOWN",
       "outcome": "NO",
       "fill_px": 0.94,
-      "pnl": 0.31914893617021267
+      "pnl": 0.31914893617021267,
+      "delta_at_entry": 0.0576
     }
-  ],
-  "combined_pnl": 5.999284748362214
+  ]
 }
