@@ -7,8 +7,6 @@ edition = "2024"
 # Official Polymarket SDK — handles EIP-712, HMAC auth, order building
 polymarket-client-sdk = { version = "0.4", features = ["clob"] }
 alloy    = { version = "1", features = ["signers", "signer-local", "contract", "provider-http"] }
-rust_decimal       = "1"
-rust_decimal_macros = "1"
 
 # Async runtime & networking
 tokio            = { version = "1",  features = ["full"] }
@@ -22,8 +20,6 @@ dashmap          = "5"
 tracing          = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow           = "1"
-chrono           = { version = "0.4", features = ["serde"] }
-tokio-retry      = "0.3"
 dotenvy          = "0.15"
 uuid             = "1"
 

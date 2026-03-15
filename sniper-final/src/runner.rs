@@ -272,7 +272,6 @@ impl Tracker {
             Some(result)
         } else {
             warn!("[{}] NO_SETTLE {} — returning stake", self.cfg.id, pos.slug);
-            self.active = None;
             self.entry_bn_trend = None;
             self.entry_cl_trend = None;
             self.entry_hour_range = None;

@@ -196,8 +196,6 @@ async fn main() -> Result<()> {
         }
     };
 
-    let _live_mode = clob_client.is_some();
-
     // Pre-authenticate SDK so first order doesn't pay 1-2s auth latency
     if let Some(ref clob) = clob_client {
         if let Err(e) = clob.ensure_auth().await {
@@ -347,6 +345,18 @@ async fn main() -> Result<()> {
     }
     info!("Warmup complete — scan loop starting");
 
+    // -- Shutdown signal ------------------------------------------------------
+
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let s = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::signal::ctrl_c().await.ok();
+            info!("Shutdown signal received — flushing logs...");
+            s.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+    }
+
     // -- Main scan loop -------------------------------------------------------
 
     let mut tick_count:    u64 = 0;
@@ -362,6 +372,18 @@ async fn main() -> Result<()> {
     let mut market_slugs: Vec<String> = Vec::with_capacity(32);
 
     loop {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = event_log.flush();
+            let cum: f64 = trackers.iter().map(|t| t.stats.pnl).sum();
+            info!("═══════════════════════════════════════════════════════");
+            info!("  SHUTDOWN — cum_pnl=${:+.2}", cum);
+            for tr in &trackers {
+                tr.print_stats();
+            }
+            info!("═══════════════════════════════════════════════════════");
+            return Ok(());
+        }
+
         let sleep_ms = if trackers.iter().any(|t| t.active.is_some()) {
             cfg.scan.tick_ms
         } else {
