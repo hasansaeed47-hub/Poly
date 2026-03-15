@@ -129,11 +129,39 @@ struct GammaEvent {
     markets: Vec<GammaMarket>,
 }
 
+/// Deserialize a field that may be either a JSON array or a stringified JSON array.
+/// Polymarket's Gamma API sometimes returns `"[\"Up\",\"Down\"]"` instead of `["Up","Down"]`.
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de;
+    struct StringOrVec;
+    impl<'de> de::Visitor<'de> for StringOrVec {
+        type Value = Option<Vec<String>>;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON array or a stringified JSON array")
+        }
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> { Ok(None) }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> { Ok(None) }
+        fn visit_str<E: de::Error>(self, s: &str) -> Result<Self::Value, E> {
+            serde_json::from_str(s).map(Some).map_err(de::Error::custom)
+        }
+        fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            let v = Vec::deserialize(de::value::SeqAccessDeserializer::new(seq))?;
+            Ok(Some(v))
+        }
+    }
+    deserializer.deserialize_any(StringOrVec)
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct GammaMarket {
     condition_id:   Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     clob_token_ids: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     outcomes:       Option<Vec<String>>,
     start_date_iso: Option<String>,
     end_date_iso:   Option<String>,

@@ -6,7 +6,7 @@
 assets = ["btc", "eth", "sol"]
 
 # Window timeframes in minutes
-timeframes = [5, 15, 60, 240]
+timeframes = [5, 15]
 
 # Polymarket CLOB REST base (for batch book fetches)
 clob_rest    = "https://clob.polymarket.com"
