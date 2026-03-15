@@ -34,12 +34,12 @@ use chrono::Utc;
 use dashmap::DashMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use feeds::{
     BnPrices, BnTradeFlow, BookState, ClPrices, MarketMeta, PriceHistory, RateLimiter,
-    build_slug, current_window_starts, fetch_books_batch, fetch_market_meta,
+    build_slugs, current_window_starts, fetch_books_batch, fetch_market_meta,
     run_cl_feed, run_bn_feed, momentum_from_history, count_updates_in_window,
     max_gap_in_window, bn_trade_flow_stats, price_acceleration,
 };
@@ -706,18 +706,27 @@ async fn main() -> Result<()> {
         for &tf in &cfg.feed.timeframes {
             let now = now_unix();
             for window_start in current_window_starts(tf, now) {
-                let slug = build_slug(asset, tf, window_start);
-                match fetch_market_meta(
-                    &http, &cfg.feed.gamma_api, &slug, asset, tf, &limiter,
-                ).await {
-                    Ok(Some(meta)) => {
-                        info!("[DISCOVER] {}", slug);
-                        token_ids.insert(meta.token_yes.clone(), ());
-                        token_ids.insert(meta.token_no.clone(), ());
-                        markets.insert(slug, meta);
+                let mut found = false;
+                for slug in build_slugs(asset, tf, window_start) {
+                    if markets.contains_key(&slug) { found = true; break; }
+                    match fetch_market_meta(
+                        &http, &cfg.feed.gamma_api, &slug, asset, tf, &limiter,
+                    ).await {
+                        Ok(Some(meta)) => {
+                            info!("[DISCOVER] {}", slug);
+                            token_ids.insert(meta.token_yes.clone(), ());
+                            token_ids.insert(meta.token_no.clone(), ());
+                            markets.insert(slug, meta);
+                            found = true;
+                            break; // found it, skip remaining slug variants
+                        }
+                        Ok(None) => {} // try next variant
+                        Err(e) => warn!("[DISCOVER] {} error: {}", slug, e),
                     }
-                    Ok(None) => {}
-                    Err(e) => warn!("[DISCOVER] {} error: {}", slug, e),
+                }
+                if !found && tf >= 60 {
+                    debug!("[DISCOVER] No market found for {} {}m window_start={}",
+                        asset, tf, window_start);
                 }
             }
         }
@@ -969,8 +978,11 @@ async fn main() -> Result<()> {
             for asset in &cfg.feed.assets {
                 for &tf in &cfg.feed.timeframes {
                     for window_start in current_window_starts(tf, now_u) {
-                        let slug = build_slug(asset, tf, window_start);
-                        if !markets.contains_key(&slug) {
+                        // Try all slug variants (60m vs 1h, 240m vs 4h)
+                        let variants = build_slugs(asset, tf, window_start);
+                        let already_known = variants.iter().any(|s| markets.contains_key(s));
+                        if already_known { continue; }
+                        for slug in variants {
                             if let Ok(Some(meta)) = fetch_market_meta(
                                 &http, &cfg.feed.gamma_api, &slug, asset, tf, &limiter,
                             ).await {
@@ -978,6 +990,7 @@ async fn main() -> Result<()> {
                                 token_ids.insert(meta.token_yes.clone(), ());
                                 token_ids.insert(meta.token_no.clone(), ());
                                 markets.insert(slug, meta);
+                                break; // found it
                             }
                         }
                     }

@@ -163,14 +163,34 @@ where D: serde::Deserializer<'de>,
 
 // -- Slug helpers -------------------------------------------------------------
 
-pub fn build_slug(asset: &str, tf_mins: u32, window_start: u64) -> String {
-    format!("{}-updown-{}m-{}", asset, tf_mins, window_start)
+/// Build all slug variants for a given timeframe.
+/// Polymarket uses inconsistent naming: 5m/15m use "{N}m" format,
+/// but 60m and 240m markets may also appear as "1h" / "4h".
+pub fn build_slugs(asset: &str, tf_mins: u32, window_start: u64) -> Vec<String> {
+    let mut slugs = vec![format!("{}-updown-{}m-{}", asset, tf_mins, window_start)];
+    match tf_mins {
+        60  => slugs.push(format!("{}-updown-1h-{}", asset, window_start)),
+        240 => slugs.push(format!("{}-updown-4h-{}", asset, window_start)),
+        _   => {}
+    }
+    slugs
 }
 
+/// Returns the first (canonical) slug variant. Used in tests.
+#[cfg(test)]
+pub fn build_slug(asset: &str, tf_mins: u32, window_start: u64) -> String {
+    build_slugs(asset, tf_mins, window_start).into_iter().next().unwrap()
+}
+
+/// Return current AND previous window starts.
+/// For short TFs (5m/15m), previous window is usually expired so it's harmless.
+/// For long TFs (60m/240m), the previous window's market is often still active
+/// with significant time remaining — missing it was the main discovery bug.
 pub fn current_window_starts(tf_mins: u32, now_secs: u64) -> Vec<u64> {
     let interval = (tf_mins as u64) * 60;
     let current  = (now_secs / interval) * interval;
-    vec![current]
+    let previous = current.saturating_sub(interval);
+    vec![previous, current]
 }
 
 // -- Market discovery ---------------------------------------------------------
@@ -679,10 +699,53 @@ mod tests {
     }
 
     #[test]
-    fn current_window_starts_5m() {
+    fn build_slugs_variants_60m() {
+        let slugs = build_slugs("btc", 60, 1772784000);
+        assert_eq!(slugs.len(), 2);
+        assert_eq!(slugs[0], "btc-updown-60m-1772784000");
+        assert_eq!(slugs[1], "btc-updown-1h-1772784000");
+    }
+
+    #[test]
+    fn build_slugs_variants_240m() {
+        let slugs = build_slugs("eth", 240, 1772784000);
+        assert_eq!(slugs.len(), 2);
+        assert_eq!(slugs[0], "eth-updown-240m-1772784000");
+        assert_eq!(slugs[1], "eth-updown-4h-1772784000");
+    }
+
+    #[test]
+    fn build_slugs_no_variants_5m() {
+        let slugs = build_slugs("btc", 5, 1772788200);
+        assert_eq!(slugs.len(), 1);
+        assert_eq!(slugs[0], "btc-updown-5m-1772788200");
+    }
+
+    #[test]
+    fn current_window_starts_returns_prev_and_current() {
         let starts = current_window_starts(5, 1772788230);
-        assert_eq!(starts.len(), 1);
-        assert_eq!(starts[0], 1772788200);
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[0], 1772788200 - 300); // previous
+        assert_eq!(starts[1], 1772788200);        // current
+    }
+
+    #[test]
+    fn current_window_starts_60m() {
+        // 1772784000 is aligned to 3600s boundary
+        let starts = current_window_starts(60, 1772785800); // mid-window
+        assert_eq!(starts.len(), 2);
+        assert_eq!(starts[1], 1772784000);         // current window
+        assert_eq!(starts[0], 1772784000 - 3600);   // previous window
+    }
+
+    #[test]
+    fn current_window_starts_240m() {
+        let starts = current_window_starts(240, 1772790000);
+        assert_eq!(starts.len(), 2);
+        let interval = 240 * 60; // 14400
+        let current = (1772790000 / interval) * interval;
+        assert_eq!(starts[1], current);
+        assert_eq!(starts[0], current - interval);
     }
 
     #[test]
