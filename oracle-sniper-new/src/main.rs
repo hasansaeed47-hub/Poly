@@ -658,10 +658,10 @@ async fn main() -> Result<()> {
             for asset in &cfg.feed.assets {
                 let cl = cl_prices.get(asset.as_str()).map(|v| (now - v.0, v.1));
                 let bn = bn_prices.get(asset.as_str()).map(|v| (now - v.0, v.1));
-                if let (Some((cl_age, cl_p)), Some((_bn_age, bn_p))) = (cl, bn) {
+                if let (Some((cl_age, cl_p)), Some((bn_age, bn_p))) = (cl, bn) {
                     info!(
-                        "[FEED] {} CL={:.2}({:.1}s) BN={:.2}",
-                        asset.to_uppercase(), cl_p, cl_age, bn_p
+                        "[FEED] {} CL={:.2}({:.1}s) BN={:.2}({:.1}s)",
+                        asset.to_uppercase(), cl_p, cl_age, bn_p, bn_age
                     );
                 }
             }
