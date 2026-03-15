@@ -1,0 +1,91 @@
+# CL Scanner — external config
+# All thresholds here, nothing hardcoded in binary
+
+[feed]
+# Assets to scan
+assets = ["btc", "eth", "sol"]
+
+# Window timeframes in minutes
+timeframes = [5, 15]
+
+# Polymarket CLOB REST base (for batch book fetches)
+clob_rest    = "https://clob.polymarket.com"
+
+# Polymarket CLOB WebSocket (order book updates)
+clob_ws      = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+# Polymarket live data WebSocket (CL prices)
+live_ws      = "wss://ws-live-data.polymarket.com"
+
+# Gamma API (market discovery)
+gamma_api    = "https://gamma-api.polymarket.com"
+
+# Batch size: max token IDs per single book REST request
+book_batch_size = 20
+
+# Minimum ms between REST requests (throttle guard)
+rest_throttle_ms = 500
+
+# Book warmup: wait this many seconds after WS connect before trading
+book_warmup_secs = 5
+
+[scan]
+# Scan tick interval in milliseconds
+tick_ms = 500
+
+# Sigma estimation: rolling window in seconds
+sigma_window_secs = 300
+
+# Minimum seconds left in window to consider entry
+min_secs = 60
+
+[paper]
+# Stake per trade in USD (paper only)
+stake = 5.0
+
+# Taker fee rate (Polymarket curve approximation)
+taker_fee_rate = 0.015
+
+# Maker fee rate
+maker_fee_rate = 0.0
+
+[configs]
+# Config 1 — Base
+[configs.c1]
+name           = "BASE"
+min_edge       = 0.12
+max_secs_left  = 840
+stop_loss      = false
+take_profit    = false
+
+# Config 2 — Base + Time Filter (last 3 minutes only)
+[configs.c2]
+name           = "TIME_FILTER"
+min_edge       = 0.12
+max_secs_left  = 180
+stop_loss      = false
+take_profit    = false
+
+# Config 3 — Base + Edge Filter (large gaps only)
+[configs.c3]
+name           = "EDGE_FILTER"
+min_edge       = 0.25
+max_secs_left  = 840
+stop_loss      = false
+take_profit    = false
+
+# Config 4 — Base + Stop Loss (exit when fair < entry_price)
+[configs.c4]
+name           = "STOP_LOSS"
+min_edge       = 0.12
+max_secs_left  = 840
+stop_loss      = true
+take_profit    = false
+
+# Config 5 — CL Target Exit (exit when book >= fair_at_entry)
+[configs.c5]
+name           = "CL_TARGET"
+min_edge       = 0.12
+max_secs_left  = 840
+stop_loss      = false
+take_profit    = true
