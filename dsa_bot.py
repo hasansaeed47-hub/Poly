@@ -264,8 +264,11 @@ class Engine:
             up_head = Cfg.MAX_IMBALANCE - max(0.0, st.up.confirmed_qty - st.dn.confirmed_qty)
             dn_head = Cfg.MAX_IMBALANCE - max(0.0, st.dn.confirmed_qty - st.up.confirmed_qty)
             if phase == Phase.ESCALATE:
-                if st.up.confirmed_qty >= st.dn.confirmed_qty: up_head = 0
-                if st.dn.confirmed_qty >= st.up.confirmed_qty: dn_head = 0
+                # Only suppress leading side when fills exist on both;
+                # if both are 0 (late entry), treat like ACCUMULATE.
+                if st.up.confirmed_qty > 0 or st.dn.confirmed_qty > 0:
+                    if st.up.confirmed_qty >= st.dn.confirmed_qty: up_head = 0
+                    if st.dn.confirmed_qty >= st.up.confirmed_qty: dn_head = 0
 
             # Step 3: PROVISIONAL CHUNK
             prov_up = math.floor(min(Cfg.BASE_CHUNK, up_head))
