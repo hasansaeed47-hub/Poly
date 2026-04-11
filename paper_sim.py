@@ -163,17 +163,25 @@ class PaperSimulator:
                     fill_px = m.pop_fill(side_char)
                     if fill_px is None:
                         continue
-                    # Fill all pending orders for this side at fill_px
-                    for oid, (px, qty, ts) in list(side._pending.items()):
-                        if fill_px <= px:   # only fill if price ≤ our bid
-                            side.on_confirm(oid, fill_px, qty)
-                            self.bot._oid_to_key.pop(oid, None)
-                            log.info(
-                                f"[FILL] {mid[:22]} {side_char}"
-                                f" @{fill_px:.2f}×{qty:.0f}"
-                                f"  vwap={side.vwap:.3f}"
-                                f"  comb={eng.st.combined:.3f}"
-                            )
+                    # Fill ONE order per event (highest-bid wins), cancel stale rest
+                    best_oid = best_px = None
+                    for oid, (px, qty, ts) in side._pending.items():
+                        if fill_px <= px and (best_px is None or px > best_px):
+                            best_oid, best_px = oid, px
+                    if best_oid:
+                        _, qty, _ = side._pending[best_oid]
+                        side.on_confirm(best_oid, fill_px, qty)
+                        self.bot._oid_to_key.pop(best_oid, None)
+                        # Cancel stale accumulated orders so they don't pile up
+                        for stale in list(side._pending.keys()):
+                            side.on_cancel(stale)
+                            self.bot._oid_to_key.pop(stale, None)
+                        log.info(
+                            f"[FILL] {mid[:22]} {side_char}"
+                            f" @{fill_px:.2f}×{qty:.0f}"
+                            f"  vwap={side.vwap:.3f}"
+                            f"  comb={eng.st.combined:.3f}"
+                        )
 
 
 # ── Patch ─────────────────────────────────────────────────────────────────────
