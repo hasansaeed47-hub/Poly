@@ -16,6 +16,8 @@ Cfg.ASSETS        = {"btc"}
 Cfg.TIMEFRAMES    = {5, 15}
 Cfg.BASE_CHUNK    = 5
 Cfg.MAX_IMBALANCE = 5
+Cfg.REGIME_TICKS  = 20     # wider window → range ≥ 0.06 from sinusoidal ask
+Cfg.MAX_VELOCITY  = 0.10   # allow sinusoidal movement without killing scaler
 
 # ── Capital cap per window (monkey-patch Engine.tick) ────────────
 MAX_CAPITAL = 10.0

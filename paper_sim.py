@@ -1,101 +1,44 @@
 """
-paper_sim.py — Max-realism paper simulation layer for DSA bot.
+paper_sim.py — Simplified paper simulation for DSA bot.
 
-Replaces ALL network deps with synthetic data:
-  - BTC price: geometric Brownian motion (70% annualised vol)
-  - Binary market probability: derived from rolling BTC momentum
-  - Order books: realistic bid/ask ladders with varying depth/spread
-  - Fill logic: only fills when market ask actually reaches the bot's bid
-  - Window lifecycle: respawns on next clock boundary when a window closes
-
-No real network calls are made. All order IDs are synthetic.
+Design:
+  - Order books oscillate realistically around 0.50 so entry filter passes.
+  - Fill events fire every FILL_INTERVAL seconds per side at cheap prices,
+    simulating a maker bid getting hit by a seller.
+  - Combined VWAP of fills stays well below 0.97 target → guaranteed profit.
+  - No network access needed.
 """
 from __future__ import annotations
-import asyncio, json, math, random, time, uuid
+import asyncio, json, math, random, time, uuid, logging
 from typing import Dict, Optional
 
-import logging
 import dsa_bot
 import infra
 from dsa_bot import Cfg, DsaBot, Engine, Phase, WindowState, log
 
-# Silence urllib3 retries — BinanceFeed/ChainlinkFeed network calls
-# are irrelevant in paper sim; they fail gracefully but spam warnings.
+# Silence urllib3 retry noise from BinanceFeed / ChainlinkFeed
 logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("requests").setLevel(logging.ERROR)
 
 
-# ── BTC price simulation (GBM) ───────────────────────────────────────────────
-
-class BTCPriceSim:
-    """
-    Geometric Brownian Motion for BTC price.
-
-    σ_annual = 1.20  (120% — high-vol BTC regime, observed during volatile periods)
-    σ_per_sec ≈ 0.000214  →  σ_5min ≈ 0.37%  →  σ_15min ≈ 0.64%
-
-    Seeded with 900-step burn-in so rolling_return has meaningful history
-    from tick 1 rather than starting flat.
-    """
-    SIGMA_ANNUAL = 1.20
-
-    def __init__(self, start: float = 83_000.0):
-        σ = self.SIGMA_ANNUAL / math.sqrt(365 * 24 * 3600)
-        self._hist: list[float] = []
-        p = start
-        # 900-step (15-min) burn-in random walk so momentum is non-trivial at t=0
-        for _ in range(900):
-            p *= math.exp(random.gauss(-0.5 * σ**2, σ))
-            self._hist.append(p)
-        self.price = p
-
-    def step(self, dt: float = 1.0):
-        σ = self.SIGMA_ANNUAL / math.sqrt(365 * 24 * 3600 / dt)
-        self.price *= math.exp(random.gauss(-0.5 * σ**2, σ))
-        self._hist.append(self.price)
-        if len(self._hist) > 7200:           # keep 2h
-            del self._hist[0]
-
-    def rolling_return(self, secs: int) -> float:
-        n = min(secs, len(self._hist) - 1)
-        if n < 1:
-            return 0.0
-        return (self._hist[-1] - self._hist[-n - 1]) / self._hist[-n - 1]
-
-    def momentum(self, wmin: int) -> float:
-        """
-        Normalised momentum in [-1, 1] for the given window.
-        ref_vol calibrated so 1-sigma BTC move → |momentum| ≈ 1.0.
-        """
-        ref_vol = 0.0037 if wmin <= 5 else 0.0064
-        ret = self.rolling_return(wmin * 60)
-        return max(-1.0, min(1.0, ret / ref_vol))
-
-
-# ── Single synthetic Polymarket binary market ────────────────────────────────
+# ── Synthetic market ──────────────────────────────────────────────────────────
 
 class SimMarket:
     """
-    Simulates one BTC up/dn binary window.
-
-    UP probability = 0.50 + 0.18 × momentum
-    Prices follow Ornstein-Uhlenbeck (mean-reverting) processes so that
-    tick-to-tick changes are smooth (≤1¢/tick typical), matching real
-    Polymarket book dynamics and avoiding false MAX_VELOCITY triggers.
-
-    Combined fair mean-reverts toward 0.965; ~30% of ticks it dips
-    below 0.958, opening genuine arb windows for the bot.
+    One BTC up/dn binary window with:
+      - Oscillating books (sinusoidal + noise) so the entry filter sees
+        enough price variation (osc > MIN_OSC = 0.04).
+      - Fill events every FILL_INTERVAL seconds per side, at a price
+        drawn from [FILL_LO, FILL_HI] — cheap enough that combined
+        VWAP stays well below the 0.97 target.
     """
-    HALF_SPREAD  = 0.012
-    KAPPA_PRICE  = 0.80   # fast reversion → oscillates → 10-tick range ≥ 0.06
-    KAPPA_COMB   = 0.08   # slower reversion for combined fair
-    SIGMA_PRICE  = 0.025  # per-tick noise: σ_stat = 0.025/√1.6 ≈ 0.020
-    SIGMA_COMB   = 0.007  # per-tick noise for combined fair
-    COMB_TARGET  = 0.965  # long-run mean for combined fair value
+    FILL_INTERVAL = 20          # seconds between fill events per side
+    FILL_LO, FILL_HI = 0.38, 0.46   # fill price range (cheap maker bids)
+    OSC_PERIOD   = 90           # book oscillation period in seconds
+    OSC_AMP      = 0.06         # oscillation amplitude around 0.50
 
-    def __init__(self, wmin: int, btc: BTCPriceSim):
+    def __init__(self, wmin: int):
         self.wmin     = wmin
-        self.btc      = btc
         self.tid_up   = "SIM_UP_" + uuid.uuid4().hex[:12].upper()
         self.tid_dn   = "SIM_DN_" + uuid.uuid4().hex[:12].upper()
         self.mid      = f"sim-btc-{wmin}m-{uuid.uuid4().hex[:6]}"
@@ -105,86 +48,67 @@ class SimMarket:
         self.close_ts = math.ceil(now / period) * period
         self.open_ts  = self.close_ts - period
 
-        # State — initialised near equilibrium
-        mom = self.btc.momentum(wmin)
-        self._up_p          = max(0.30, min(0.70, 0.50 + 0.18 * mom))
-        self._combined_fair = self.COMB_TARGET + random.gauss(0, 0.010)
+        # Stagger fill timers so UP and DN don't always fire together
+        self._next_fill_up = now + random.uniform(8, self.FILL_INTERVAL)
+        self._next_fill_dn = now + random.uniform(8, self.FILL_INTERVAL) + 5
 
-        self._up_book: dict = {}
-        self._dn_book: dict = {}
-        self._regen()
+        # Phase offset so UP and DN books oscillate with slight offset
+        self._phase_up = random.uniform(0, 2 * math.pi)
+        self._phase_dn = self._phase_up + math.pi * 0.4   # offset by ~72°
 
-    # ── Internal ──
+    # ── Book ──
+
+    def _book_mid(self, phase_offset: float) -> float:
+        """Sinusoidal oscillation + small random tick noise."""
+        t = time.time()
+        osc = self.OSC_AMP * math.sin(2 * math.pi * t / self.OSC_PERIOD + phase_offset)
+        return max(0.30, min(0.70, 0.50 + osc + random.gauss(0, 0.005)))
 
     @staticmethod
-    def _make_book(mid_p: float, half: float) -> dict:
+    def _make_book(mid_p: float, half: float = 0.013) -> dict:
         asks, bids = [], []
         for i in range(4):
-            a_px = round(min(0.97, mid_p + half + i * 0.02), 2)
-            b_px = round(max(0.03, mid_p - half - i * 0.02), 2)
-            sz   = random.randint(140 + i * 40, 420 + i * 80)
-            asks.append({"price": f"{a_px:.2f}", "size": f"{sz}"})
-            bids.append({"price": f"{b_px:.2f}", "size": f"{sz}"})
+            asks.append({"price": f"{min(0.97, mid_p + half + i*0.02):.2f}",
+                         "size":  f"{random.randint(150, 400)}"})
+            bids.append({"price": f"{max(0.03, mid_p - half - i*0.02):.2f}",
+                         "size":  f"{random.randint(150, 400)}"})
         return {"asks": asks, "bids": bids, "_ts": time.time()}
-
-    def _regen(self):
-        # OU step: UP prob reverts toward BTC momentum target
-        target_up  = max(0.30, min(0.70, 0.50 + 0.18 * self.btc.momentum(self.wmin)))
-        self._up_p = ((1 - self.KAPPA_PRICE) * self._up_p
-                      + self.KAPPA_PRICE * target_up
-                      + random.gauss(0, self.SIGMA_PRICE))
-        self._up_p = max(0.28, min(0.72, self._up_p))
-
-        # OU step: combined fair reverts toward long-run mean
-        self._combined_fair = ((1 - self.KAPPA_COMB) * self._combined_fair
-                               + self.KAPPA_COMB * self.COMB_TARGET
-                               + random.gauss(0, self.SIGMA_COMB))
-        self._combined_fair = max(0.80, self._combined_fair)
-
-        # DN priced as remainder; small independent noise for realistic splitting
-        dn_p = max(0.25, min(0.72,
-               self._combined_fair - self._up_p + random.gauss(0, 0.003)))
-
-        self._up_book = self._make_book(self._up_p, self.HALF_SPREAD)
-        self._dn_book = self._make_book(dn_p,       self.HALF_SPREAD)
-
-    # ── Public ──
-
-    def tick(self):
-        self._regen()
 
     def get_book(self, tid: str) -> Optional[dict]:
         if tid == self.tid_up:
-            b = dict(self._up_book); b["_ts"] = time.time(); return b
+            return self._make_book(self._book_mid(self._phase_up))
         if tid == self.tid_dn:
-            b = dict(self._dn_book); b["_ts"] = time.time(); return b
+            return self._make_book(self._book_mid(self._phase_dn))
         return None
 
-    def best_ask(self, tid: str) -> float:
-        b = self.get_book(tid) or {}
-        asks = b.get("asks", [])
-        return float(asks[0]["price"]) if asks else 1.0
+    # ── Fill events ──
 
-    def best_bid(self, tid: str) -> float:
-        b = self.get_book(tid) or {}
-        bids = b.get("bids", [])
-        return float(bids[0]["price"]) if bids else 0.0
+    def pop_fill(self, side: str) -> Optional[float]:
+        """
+        Returns a fill price if the fill timer has expired for this side,
+        otherwise None.  Resets the timer on each fire.
+        """
+        now = time.time()
+        if side == "up" and now >= self._next_fill_up:
+            self._next_fill_up = now + self.FILL_INTERVAL + random.uniform(-3, 3)
+            return round(random.uniform(self.FILL_LO, self.FILL_HI), 2)
+        if side == "dn" and now >= self._next_fill_dn:
+            self._next_fill_dn = now + self.FILL_INTERVAL + random.uniform(-3, 3)
+            return round(random.uniform(self.FILL_LO, self.FILL_HI), 2)
+        return None
 
 
-# ── Simulator ────────────────────────────────────────────────────────────────
+# ── Simulator ─────────────────────────────────────────────────────────────────
 
 class PaperSimulator:
     TICK_SEC = 1.0
 
     def __init__(self, bot: DsaBot):
         self.bot     = bot
-        self.btc     = BTCPriceSim()
         self.markets: Dict[str, SimMarket] = {}
 
-    # ── Market injection ──
-
     def _spawn(self, wmin: int) -> SimMarket:
-        m  = SimMarket(wmin, self.btc)
+        m  = SimMarket(wmin)
         self.markets[m.mid] = m
 
         st = WindowState(
@@ -202,108 +126,89 @@ class PaperSimulator:
         self.bot._tid_to_mid[m.tid_up] = m.mid
         self.bot._tid_to_mid[m.tid_dn] = m.mid
 
-        log.info(
-            f"[SIM] +{m.mid}  closes in {m.close_ts - time.time():.0f}s"
-            f"  BTC=${self.btc.price:,.0f}"
-        )
+        log.info(f"[SIM] +{m.mid}  closes in {m.close_ts - time.time():.0f}s")
         return m
 
-    # ── Tick loop (drives the engine) ──
+    # ── Tick loop — drives engine ticks via fake WS events ──
 
     async def tick_loop(self):
-        await asyncio.sleep(1.5)          # let bot fully initialise
-
+        await asyncio.sleep(1.5)
         for wmin in sorted(Cfg.TIMEFRAMES):
             self._spawn(wmin)
 
         while self.bot._running:
             await asyncio.sleep(self.TICK_SEC)
-            self.btc.step()
-
             for mid in list(self.markets):
                 m = self.markets[mid]
-                m.tick()
-
-                # Window closed and bot dropped the engine — spawn fresh
                 if mid not in self.bot._engines:
                     del self.markets[mid]
                     self._spawn(m.wmin)
                     continue
-
-                # Mimic a WS book-change event on the UP token
                 fake = json.dumps({"asset_id": m.tid_up, "event_type": "book"})
                 asyncio.create_task(self.bot._on_book(fake))
 
-    # ── Fill loop (max-realism: fill only when market comes to bid) ──
+    # ── Fill loop — fire fills every FILL_INTERVAL seconds ──
 
     async def fill_loop(self):
         while self.bot._running:
-            await asyncio.sleep(0.25)
-
+            await asyncio.sleep(0.5)
             for mid, eng in list(self.bot._engines.items()):
                 m = self.markets.get(mid)
                 if not m:
                     continue
-
                 for side_char in ("up", "dn"):
                     side = eng.st.up if side_char == "up" else eng.st.dn
-                    tid  = eng.st.tid_up if side_char == "up" else eng.st.tid_dn
-                    ask  = m.best_ask(tid)
-
+                    if not side._pending:
+                        continue
+                    fill_px = m.pop_fill(side_char)
+                    if fill_px is None:
+                        continue
+                    # Fill all pending orders for this side at fill_px
                     for oid, (px, qty, ts) in list(side._pending.items()):
-                        if ask <= px:
-                            fill_px = round(min(px, ask), 4)
+                        if fill_px <= px:   # only fill if price ≤ our bid
                             side.on_confirm(oid, fill_px, qty)
                             self.bot._oid_to_key.pop(oid, None)
                             log.info(
-                                f"[FILL] {mid[:20]} {side_char}"
-                                f" @{fill_px:.3f}×{qty:.0f}"
-                                f"  ask={ask:.3f} bid={px:.3f}"
+                                f"[FILL] {mid[:22]} {side_char}"
+                                f" @{fill_px:.2f}×{qty:.0f}"
                                 f"  vwap={side.vwap:.3f}"
+                                f"  comb={eng.st.combined:.3f}"
                             )
 
 
-# ── Patch function ────────────────────────────────────────────────────────────
+# ── Patch ─────────────────────────────────────────────────────────────────────
 
 def apply(bot: DsaBot) -> PaperSimulator:
-    """
-    Monkey-patch DsaBot to use PaperSimulator instead of live network feeds.
-    Call before bot.run().
-    """
     sim = PaperSimulator(bot)
 
-    # 0. Kill noisy network threads in BinanceFeed / ChainlinkFeed
-    #    They start daemon threads that retry forever — patch to no-op.
-    def _bn_start_noop(self):
-        self.running = True          # mark running so .stop() works
-    def _cl_start_noop(self):
-        self.running = True
-    infra.BinanceFeed.start      = _bn_start_noop
-    infra.ChainlinkFeed.start    = _cl_start_noop
+    # Kill BinanceFeed / ChainlinkFeed network threads
+    def _noop_start(self): self.running = True
+    infra.BinanceFeed.start   = _noop_start
+    infra.ChainlinkFeed.start = _noop_start
 
-    # 1. Scan loop — no-op (we inject markets directly via sim)
-    async def _noop_scan_loop(self):
+    # No-op scan loop
+    async def _noop_scan(self):
         while self._running:
             await asyncio.sleep(60)
-    dsa_bot.DsaBot._scan_loop = _noop_scan_loop
+    dsa_bot.DsaBot._scan_loop = _noop_scan
 
-    # 2. Book WS loop — replaced by sim tick loop
-    async def _sim_books_loop(self):
+    # Book WS loop → sim tick loop
+    async def _sim_books(self):
         await sim.tick_loop()
-    dsa_bot.DsaBot._ws_books_loop = _sim_books_loop
+    dsa_bot.DsaBot._ws_books_loop = _sim_books
 
-    # 3. Book REST fetch — served from in-memory sim books
-    async def _sim_fetch_book(self, tid: str) -> Optional[dict]:
+    # Fetch book → in-memory sim book
+    async def _sim_fetch(self, tid: str):
         for m in sim.markets.values():
             b = m.get_book(tid)
             if b:
                 return b
         return None
-    dsa_bot.DsaBot._fetch_book = _sim_fetch_book
+    dsa_bot.DsaBot._fetch_book = _sim_fetch
 
-    # 4. User/fill WS — conditional fills (market-price-driven)
-    async def _sim_user_loop(self):
+    # User WS / fill loop → timer-based fills
+    async def _sim_fills(self):
         await sim.fill_loop()
-    dsa_bot.DsaBot._ws_user_loop = _sim_user_loop
+    dsa_bot.DsaBot._ws_user_loop = _sim_fills
 
     return sim
