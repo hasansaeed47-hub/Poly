@@ -1,0 +1,5 @@
+aiohttp>=3.9.0
+uvloop>=0.19.0
+requests>=2.31.0
+websocket-client>=1.7.0
+py_clob_client>=0.34.0
