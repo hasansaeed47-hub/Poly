@@ -154,7 +154,7 @@ class Config:
     ESCALATION_COOLDOWN_SEC = 5.0   # B6: min seconds between leg2 escalations
 
     # ── WINDOWS ──
-    ASSETS = {"btc", "eth", "sol"}
+    ASSETS = {"btc", "eth"}
     TIMEFRAMES = {5, 15}
     STOP_QUOTING_LEFT = 30          # stop new quotes when <30s left
     CANCEL_ALL_LEFT = 10            # cancel all when <10s left

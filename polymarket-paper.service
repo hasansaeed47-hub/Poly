@@ -1,0 +1,21 @@
+[Unit]
+Description=Polymarket v4.1 Paper Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/poly
+ExecStartPre=/usr/bin/pip install -q -r /opt/poly/requirements.txt
+ExecStart=/usr/bin/python3 /opt/poly/bot.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-paper
+
+# Paper mode — no secrets needed
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
