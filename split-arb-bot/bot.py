@@ -1112,16 +1112,21 @@ async def run(cfg: dict):
                     await book_feed.subscribe_new_tokens(new_tokens)
 
             # -- Scan all markets for arb opportunities -------------------------
-            opportunities = 0
+            # Collect all candidates this tick, then execute highest-profit first.
+            # Prevents dict-order luck from burying the best opportunity when
+            # multiple markets fire simultaneously in the same 500ms window.
+            candidates: list[tuple[float, "Market", "PaperTrade"]] = []
             for m in tracked.values():
-                # Skip if on cooldown
                 if engine.on_cooldown(m.condition_id):
                     continue
-
                 trade = engine.evaluate(m)
                 if trade is not None:
-                    opportunities += 1
-                    engine.execute(m, trade)
+                    candidates.append((trade.profit, m, trade))
+
+            candidates.sort(key=lambda x: -x[0])  # highest profit first
+            opportunities = len(candidates)
+            for _, m, trade in candidates:
+                engine.execute(m, trade)
 
             # -- Status line (every 20 scans = ~10s) ----------------------------
             if scan_count % 20 == 0:
