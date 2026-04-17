@@ -124,11 +124,10 @@ class PaperTrade:
 
 def taker_fee(price: float, max_rate: float) -> float:
     """
-    Polymarket fee: rate * price * (1 - price)
-    Peaks at 50c (max_rate * 0.25), zero at 0c and 100c.
+    Polymarket taker fee per token: price * (1 - price) * max_rate
+    Peaks at 0.25 * max_rate at price=0.50, zero at 0 and 1.
     """
-    effective_rate = min(max_rate, 2 * max_rate * min(price, 1 - price))
-    return price * effective_rate
+    return price * (1 - price) * max_rate
 
 
 def compute_arb(
@@ -763,6 +762,71 @@ class PolyClient:
 
         return markets
 
+    async def discover_markets_by_slugs(self, slugs: list[str]) -> list[Market]:
+        """Fetch specific markets by slug — used to subscribe pre-arb route candidates."""
+        if not slugs:
+            return []
+        session = await self._get_session()
+
+        async def _fetch(slug: str):
+            try:
+                async with session.get(
+                    f"{self.gamma_api}/markets", params={"slug": slug},
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    return (slug, await resp.json())
+            except Exception:
+                return None
+
+        results = await asyncio.gather(*[_fetch(s) for s in slugs])
+        markets = []
+        for result in results:
+            if result is None:
+                continue
+            slug, data = result
+            m = data[0] if isinstance(data, list) and data else (data if isinstance(data, dict) else None)
+            if not m:
+                continue
+
+            tokens = m.get("clobTokenIds", "")
+            if isinstance(tokens, str):
+                try:
+                    tokens = json.loads(tokens)
+                except Exception:
+                    continue
+            if not isinstance(tokens, list) or len(tokens) < 2:
+                continue
+
+            outcomes = m.get("outcomes", "")
+            if isinstance(outcomes, str):
+                try:
+                    outcomes = json.loads(outcomes)
+                except Exception:
+                    continue
+            if not isinstance(outcomes, list) or len(outcomes) != 2:
+                continue
+
+            o_lower = [o.lower() for o in outcomes]
+            if "up" in o_lower:
+                yi, ni = o_lower.index("up"), 1 - o_lower.index("up")
+            elif "yes" in o_lower:
+                yi, ni = o_lower.index("yes"), 1 - o_lower.index("yes")
+            else:
+                yi, ni = 0, 1
+
+            cond_id = m.get("conditionId", "")
+            if not cond_id:
+                continue
+            markets.append(Market(
+                condition_id=cond_id,
+                question=m.get("question", "")[:120],
+                slug=slug,
+                token_yes=tokens[yi],
+                token_no=tokens[ni],
+            ))
+        return markets
+
     async def fetch_books(self, token_ids: list[str]) -> dict[str, dict]:
         """Fetch order books for a batch of token IDs (REST fallback)."""
         if not token_ids:
@@ -897,59 +961,64 @@ class PaperEngine:
         yes_ask = market.yes_asks.best
         no_ask  = market.no_asks.best
 
+        # Reject stale books — don't trade on data older than 5 seconds
+        if market.last_update > 0 and (now - market.last_update) > 5.0:
+            return None
+
         split_trade: Optional[PaperTrade] = None
         merge_trade: Optional[PaperTrade] = None
 
         # -- Split-sell: bid_sum > 1.0 ----------------------------------------
         if yes_bid > 0 and no_bid > 0 and (yes_bid + no_bid) > 1.0:
-            bid_sum = yes_bid + no_bid
             if market.condition_id not in self._first_seen:
                 self._first_seen[market.condition_id] = now
 
             yes_avg, yes_qty = market.yes_bids.fillable_at(self.min_depth)
             no_avg,  no_qty  = market.no_bids.fillable_at(self.min_depth)
+            split_stake = 0.0
             if yes_avg > 0 and no_avg > 0:
                 depth_limited = min(yes_qty * yes_avg, no_qty * no_avg)
-                stake = min(self.max_stake, self.bankroll, depth_limited)
-                if stake >= 1.0:
-                    split_trade = compute_arb(yes_avg, no_avg, stake,
+                split_stake = min(self.max_stake, self.bankroll, depth_limited)
+                if split_stake >= 1.0:
+                    split_trade = compute_arb(yes_avg, no_avg, split_stake,
                                               self.max_fee_rate, self.slippage_bps)
 
             self._log_scan({
                 "ts": now, "slug": market.slug, "question": market.question,
                 "arb_type": "split",
-                "yes_bid": yes_bid, "no_bid": no_bid, "sum": round(yes_bid + no_bid, 4),
-                "yes_avg": round(yes_avg if yes_avg else 0, 4),
-                "no_avg":  round(no_avg  if no_avg  else 0, 4),
-                "stake": round(stake if 'stake' in dir() else 0, 2),
-                "profit": round(split_trade.profit, 4) if split_trade else 0,
+                "yes_bid": yes_bid, "no_bid": no_bid,
+                "sum": round(yes_bid + no_bid, 4),
+                "yes_avg": round(yes_avg, 4) if yes_avg else 0,
+                "no_avg":  round(no_avg,  4) if no_avg  else 0,
+                "stake":   round(split_stake, 2),
+                "profit":  round(split_trade.profit, 4) if split_trade else 0,
                 "triggered": split_trade is not None and split_trade.profit >= self.min_profit_cents / 100,
             })
 
         # -- Merge-buy: ask_sum < threshold -----------------------------------
         if yes_ask > 0 and no_ask > 0 and (yes_ask + no_ask) < self.merge_ask_threshold:
-            ask_sum = yes_ask + no_ask
             if market.condition_id not in self._first_seen:
                 self._first_seen[market.condition_id] = now
 
             yes_avg_a, yes_qty_a = market.yes_asks.fillable_at(self.min_depth)
             no_avg_a,  no_qty_a  = market.no_asks.fillable_at(self.min_depth)
-            stake_m = 0.0
+            merge_stake = 0.0
             if yes_avg_a > 0 and no_avg_a > 0:
                 depth_limited_m = min(yes_qty_a * yes_avg_a, no_qty_a * no_avg_a)
-                stake_m = min(self.max_stake, self.bankroll, depth_limited_m)
-                if stake_m >= 1.0:
-                    merge_trade = compute_merge_arb(yes_avg_a, no_avg_a, stake_m,
+                merge_stake = min(self.max_stake, self.bankroll, depth_limited_m)
+                if merge_stake >= 1.0:
+                    merge_trade = compute_merge_arb(yes_avg_a, no_avg_a, merge_stake,
                                                     self.max_fee_rate, self.slippage_bps)
 
             self._log_scan({
                 "ts": now, "slug": market.slug, "question": market.question,
                 "arb_type": "merge",
-                "yes_ask": yes_ask, "no_ask": no_ask, "ask_sum": round(ask_sum, 4),
-                "yes_avg": round(yes_avg_a if yes_avg_a else 0, 4),
-                "no_avg":  round(no_avg_a  if no_avg_a  else 0, 4),
-                "stake": round(stake_m, 2),
-                "profit": round(merge_trade.profit, 4) if merge_trade else 0,
+                "yes_ask": yes_ask, "no_ask": no_ask,
+                "ask_sum": round(yes_ask + no_ask, 4),
+                "yes_avg": round(yes_avg_a, 4) if yes_avg_a else 0,
+                "no_avg":  round(no_avg_a,  4) if no_avg_a  else 0,
+                "stake":   round(merge_stake, 2),
+                "profit":  round(merge_trade.profit, 4) if merge_trade else 0,
                 "triggered": merge_trade is not None and merge_trade.profit >= self.min_profit_cents / 100,
             })
 
@@ -970,9 +1039,9 @@ class PaperEngine:
         trade.market = market.slug
         trade.question = market.question
 
-        # Capture latency: ms from first sum>1.0 detection to this execution
+        # Capture latency: ms from first opportunity detection to this execution
         now = time.time()
-        first_seen = self._first_seen.get(market.condition_id, now)
+        first_seen = self._first_seen.pop(market.condition_id, now)
         trade.capture_latency_ms = round((now - first_seen) * 1000, 1)
 
         # Track multi-entry
@@ -1118,10 +1187,13 @@ async def run(cfg: dict, cfg_path: str = "config.toml"):
     logging.info("Initial snapshots loaded for %d tokens", len(all_tokens))
 
     # -- Phase 3: Start WebSocket book feed + optimizer (parallel tasks) ------
-    book_feed = BookFeed(clob_ws_url, tracked)
+    book_feed   = BookFeed(clob_ws_url, tracked)
+    route_queue = asyncio.Queue()   # optimizer pushes pre-arb slugs; discovery loop subscribes them
+
     ws_task  = asyncio.create_task(book_feed.run(), name="book-feed")
     opt_task = asyncio.create_task(
-        run_optimizer_task(_Path(cfg_path), dry_run=False, interval=300, window=600),
+        run_optimizer_task(_Path(cfg_path), dry_run=False, interval=300, window=600,
+                           route_queue=route_queue),
         name="optimizer",
     )
     logging.info("Optimizer running as parallel async task (interval=300s)")
@@ -1167,6 +1239,18 @@ async def run(cfg: dict, cfg_path: str = "config.toml"):
                         tracked[m.condition_id] = m
                         new_tokens.extend([m.token_yes, m.token_no])
                         logging.info("NEW window: %s", m.slug)
+
+                # Drain optimizer's pre-arb route queue — subscribe before they cross 1.0
+                route_slugs = []
+                while not route_queue.empty():
+                    route_slugs.append(route_queue.get_nowait())
+                if route_slugs:
+                    route_batch = await client.discover_markets_by_slugs(route_slugs)
+                    for m in route_batch:
+                        if m.condition_id not in tracked and len(tracked) < max_markets:
+                            tracked[m.condition_id] = m
+                            new_tokens.extend([m.token_yes, m.token_no])
+                            logging.info("PRE-ARB route subscribed: %s", m.slug)
 
                 if new_tokens:
                     logging.info("Discovery: +%d new markets (%d total)", len(new_tokens) // 2, len(tracked))

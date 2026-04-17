@@ -123,20 +123,31 @@ class LogReader:
 # Metrics computation
 # ---------------------------------------------------------------------------
 
+def _scan_is_opportunity(s: dict) -> bool:
+    """True if this scan entry represents a real arb opportunity (either type)."""
+    arb_type = s.get("arb_type", "split")
+    if arb_type == "merge":
+        # Merge: opportunity when ask_sum < 1.0
+        return 0 < s.get("ask_sum", 0) < 1.0
+    else:
+        # Split: opportunity when bid_sum > 1.0
+        return s.get("sum", 0) > 1.0
+
+
 def compute_metrics(scans: list[dict], trades: list[dict], window_secs: int) -> PlacementMetrics:
     """
-    Classify each scan where sum > 1.0:
+    Classify each scan that represents an arb opportunity (split or merge):
       triggered      — executed (triggered=True)
       near_miss      — profit > 0 but below threshold
       depth_fail     — stake < 1.0 (depth check blocked)
       slippage_kill  — stake >= 1.0 but profit == 0 (fees killed margin)
-    Also compute capture latency from trade records.
+    Handles both arb_type="split" (sum field) and arb_type="merge" (ask_sum field).
     """
     opportunities = triggered = near_miss = depth_fail = slippage_kill = 0
     near_miss_profits: list[float] = []
 
     for s in scans:
-        if s.get("sum", 0) <= 1.0:
+        if not _scan_is_opportunity(s):
             continue
         opportunities += 1
         if s.get("triggered", False):
@@ -526,11 +537,13 @@ def _metrics_dict(m: PlacementMetrics) -> dict:
 # ---------------------------------------------------------------------------
 
 class Optimizer:
-    def __init__(self, config_path: Path, dry_run: bool, interval: int, window: int):
+    def __init__(self, config_path: Path, dry_run: bool, interval: int, window: int,
+                 route_queue: Optional[asyncio.Queue] = None):
         self.config_path = config_path
         self.dry_run     = dry_run
         self.interval    = interval
         self.window      = window
+        self.route_queue = route_queue  # bot drains this to add pre-arb markets
 
         cfg  = load_config(config_path)
         base = config_path.parent
@@ -617,6 +630,10 @@ class Optimizer:
                 len(candidates),
                 candidates[0].slug[:40], candidates[0].bid_sum, candidates[0].gap_to_arb,
             )
+            # Push top candidates into the shared queue so the bot pre-subscribes
+            if self.route_queue is not None:
+                for c in candidates[:10]:
+                    await self.route_queue.put(c.slug)
         else:
             logging.info("OPT [L3] no pre-arb routes found")
 
@@ -653,12 +670,15 @@ async def run_optimizer_task(
     dry_run: bool = False,
     interval: int = 300,
     window: int = 600,
+    route_queue: Optional[asyncio.Queue] = None,
 ):
     """
     Async entry point for embedding in bot.py's event loop:
-        asyncio.create_task(run_optimizer_task(Path("config.toml")))
+        queue = asyncio.Queue()
+        asyncio.create_task(run_optimizer_task(Path("config.toml"), route_queue=queue))
+        # then drain queue in the bot's discovery loop to subscribe pre-arb markets
     """
-    opt = Optimizer(config_path, dry_run, interval, window)
+    opt = Optimizer(config_path, dry_run, interval, window, route_queue)
     await opt.run()
 
 
