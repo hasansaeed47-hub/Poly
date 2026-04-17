@@ -86,9 +86,10 @@ class RouteCandidate:
 # ---------------------------------------------------------------------------
 
 class LogReader:
-    def __init__(self, scan_log: Path, trade_log: Path):
+    def __init__(self, scan_log: Path, trade_log: Path, exec_log: Optional[Path] = None):
         self.scan_log  = scan_log
         self.trade_log = trade_log
+        self.exec_log  = exec_log
 
     def read_window(self, window_secs: int) -> tuple[list[dict], list[dict]]:
         cutoff = time.time() - window_secs
@@ -96,6 +97,13 @@ class LogReader:
             self._read_jsonl(self.scan_log,  cutoff),
             self._read_jsonl(self.trade_log, cutoff),
         )
+
+    def read_exec_window(self, window_secs: int) -> list[dict]:
+        """Read exec_timings.jsonl for the given window."""
+        if not self.exec_log:
+            return []
+        cutoff = time.time() - window_secs
+        return self._read_jsonl(self.exec_log, cutoff)
 
     @staticmethod
     def _read_jsonl(path: Path, cutoff: float) -> list[dict]:
@@ -550,12 +558,15 @@ class Optimizer:
 
         scan_log  = Path(cfg["logging"]["scan_log"])
         trade_log = Path(cfg["logging"]["trade_log"])
+        exec_log  = Path(cfg["logging"].get("exec_log", "logs/exec_timings.jsonl"))
         if not scan_log.is_absolute():
             scan_log = base / scan_log
         if not trade_log.is_absolute():
             trade_log = base / trade_log
+        if not exec_log.is_absolute():
+            exec_log = base / exec_log
 
-        self.reader  = LogReader(scan_log, trade_log)
+        self.reader  = LogReader(scan_log, trade_log, exec_log)
         self.trend   = TrendAnalyzer()
         self.scanner = ProactiveRouteScanner(base / "logs" / "route_candidates.jsonl")
 
@@ -597,6 +608,33 @@ class Optimizer:
         cfg = load_config(self.config_path)
         scans, trades = self.reader.read_window(self.window)
         m = compute_metrics(scans, trades, self.window)
+
+        # Execution pipeline stats from exec_timings.jsonl
+        exec_records = self.reader.read_exec_window(self.window)
+        exec_stats: dict = {}
+        if exec_records:
+            def _stage_avg(key):
+                vals = [r[key] for r in exec_records if r.get(key, 0) > 0]
+                return round(sum(vals) / len(vals), 1) if vals else 0.0
+            exec_stats = {
+                "n": len(exec_records),
+                "sign_avg_ms":        _stage_avg("sign_ms"),
+                "post_yes_avg_ms":    _stage_avg("post_yes_ms"),
+                "post_no_avg_ms":     _stage_avg("post_no_ms"),
+                "confirm_yes_avg_ms": _stage_avg("confirm_yes_ms"),
+                "confirm_no_avg_ms":  _stage_avg("confirm_no_ms"),
+                "settle_avg_ms":      _stage_avg("settle_ms"),
+                "total_avg_ms":       _stage_avg("total_ms"),
+            }
+            logging.info(
+                "OPT [EXEC] n=%d | sign=%.0fms post_yes=%.0fms post_no=%.0fms "
+                "confirm_yes=%.0fms confirm_no=%.0fms settle=%.0fms total=%.0fms",
+                exec_stats["n"],
+                exec_stats["sign_avg_ms"],    exec_stats["post_yes_avg_ms"],
+                exec_stats["post_no_avg_ms"], exec_stats["confirm_yes_avg_ms"],
+                exec_stats["confirm_no_avg_ms"], exec_stats["settle_avg_ms"],
+                exec_stats["total_avg_ms"],
+            )
 
         logging.info(
             "OPT cycle=%d scans=%d opps=%d | triggered=%d near_miss=%d "
@@ -650,6 +688,7 @@ class Optimizer:
             ],
             "routes_pre_arb": len(candidates),
             "metrics": _metrics_dict(m),
+            "exec_pipeline": exec_stats,
         })
 
         if self.dry_run or not all_adjustments:

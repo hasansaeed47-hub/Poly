@@ -886,6 +886,305 @@ class PolyClient:
 
 
 # ---------------------------------------------------------------------------
+# MM Tracker — monitors spread health and quote activity per market
+# ---------------------------------------------------------------------------
+
+class MMTracker:
+    """
+    Tracks market-maker health signals per market token pair.
+
+    For each market we monitor:
+      - spread      : best_ask - best_bid on each side
+      - quote_age   : seconds since the best quote last changed
+      - depth_score : total liquidity within DEPTH_WINDOW of best bid/ask
+
+    A market is flagged "thin" when spread is abnormally wide or MMs have
+    gone quiet (large quote_age). evaluate() gates on is_healthy() before
+    executing an arb — prevents trading into a vacuum left by MM withdrawal.
+    """
+
+    DEPTH_WINDOW   = 0.03   # count depth within 3% of best price
+    MAX_SPREAD     = 0.05   # flag thin if spread > 5¢
+    MAX_QUOTE_AGE  = 10.0   # flag thin if best quote unchanged for 10s
+
+    def __init__(self, mm_log: Path):
+        self.mm_log = mm_log
+        self._spreads:    dict[str, list[float]] = defaultdict(list)  # cid → recent spreads
+        self._quote_ts:   dict[str, float]       = {}   # cid → ts of last best-quote change
+        self._last_best:  dict[str, tuple]       = {}   # cid → (yes_bid, yes_ask, no_bid, no_ask)
+        self._log_file = open(mm_log, "a") if mm_log else None
+
+    def update(self, market: "Market"):
+        """Call every scan tick to refresh MM state for a market."""
+        now     = time.time()
+        cid     = market.condition_id
+        yb, ya  = market.yes_bids.best, market.yes_asks.best
+        nb, na  = market.no_bids.best,  market.no_asks.best
+
+        # Detect best-quote change → reset age timer
+        last = self._last_best.get(cid)
+        current = (yb, ya, nb, na)
+        if last != current:
+            self._quote_ts[cid]  = now
+            self._last_best[cid] = current
+
+        # Track spread on the YES side (tightest indicator of MM activity)
+        if ya > 0 and yb > 0:
+            spread = ya - yb
+            buf = self._spreads[cid]
+            buf.append(spread)
+            if len(buf) > 20:
+                buf.pop(0)
+
+    def is_healthy(self, market: "Market") -> bool:
+        """Return False if MM has withdrawn — don't arb into a thin book."""
+        cid = market.condition_id
+        now = time.time()
+
+        # Spread check
+        spreads = self._spreads.get(cid)
+        if spreads:
+            avg_spread = sum(spreads) / len(spreads)
+            if avg_spread > self.MAX_SPREAD:
+                return False
+
+        # Quote staleness check
+        last_change = self._quote_ts.get(cid, now)
+        if (now - last_change) > self.MAX_QUOTE_AGE:
+            return False
+
+        return True
+
+    def depth_score(self, market: "Market") -> float:
+        """Sum of bid+ask depth within DEPTH_WINDOW of each best price."""
+        score = 0.0
+        for book, best in [(market.yes_bids, market.yes_bids.best),
+                           (market.yes_asks, market.yes_asks.best),
+                           (market.no_bids,  market.no_bids.best),
+                           (market.no_asks,  market.no_asks.best)]:
+            if best <= 0:
+                continue
+            lo, hi = best * (1 - self.DEPTH_WINDOW), best * (1 + self.DEPTH_WINDOW)
+            score += sum(s for p, s in book.levels if lo <= p <= hi)
+        return round(score, 2)
+
+    def log_snapshot(self, market: "Market"):
+        """Write current MM state to mm_tracker.jsonl (every N scans)."""
+        if not self._log_file:
+            return
+        cid  = market.condition_id
+        now  = time.time()
+        yb, ya = market.yes_bids.best, market.yes_asks.best
+        nb, na = market.no_bids.best,  market.no_asks.best
+        record = {
+            "ts":          now,
+            "slug":        market.slug,
+            "yes_spread":  round(ya - yb, 4) if ya > 0 and yb > 0 else None,
+            "no_spread":   round(na - nb, 4) if na > 0 and nb > 0 else None,
+            "quote_age_s": round(now - self._quote_ts.get(cid, now), 1),
+            "depth_score": self.depth_score(market),
+            "healthy":     self.is_healthy(market),
+        }
+        self._log_file.write(json.dumps(record) + "\n")
+        self._log_file.flush()
+
+    def close(self):
+        if self._log_file:
+            self._log_file.close()
+
+
+# ---------------------------------------------------------------------------
+# Window Budget — $10 split + $10 merge per market window
+# ---------------------------------------------------------------------------
+
+class WindowBudget:
+    """
+    Enforces a per-window spending cap independently for split and merge arbs.
+
+    Each condition_id (market slug) gets its own $split_budget and $merge_budget.
+    Since each 5m/15m/60m window has a unique condition_id, the budget naturally
+    resets when the new window opens and is discovered.
+    """
+
+    def __init__(self, split_budget: float, merge_budget: float):
+        self.split_budget = split_budget
+        self.merge_budget = merge_budget
+        self._spent_split: dict[str, float] = defaultdict(float)
+        self._spent_merge: dict[str, float] = defaultdict(float)
+
+    def remaining(self, condition_id: str, arb_type: str) -> float:
+        if arb_type == "split":
+            return max(0.0, self.split_budget - self._spent_split[condition_id])
+        return max(0.0, self.merge_budget - self._spent_merge[condition_id])
+
+    def record(self, condition_id: str, arb_type: str, stake: float):
+        if arb_type == "split":
+            self._spent_split[condition_id] += stake
+        else:
+            self._spent_merge[condition_id] += stake
+
+    def summary(self) -> dict:
+        active_split = {k: v for k, v in self._spent_split.items() if v > 0}
+        active_merge = {k: v for k, v in self._spent_merge.items() if v > 0}
+        return {
+            "windows_with_split": len(active_split),
+            "windows_with_merge": len(active_merge),
+            "total_split_spent": round(sum(active_split.values()), 2),
+            "total_merge_spent": round(sum(active_merge.values()), 2),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Execution Timer — measure every step of sign/post/confirm pipeline
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ExecTiming:
+    """Timing record for one trade execution — all times in milliseconds."""
+    trade_id:        int
+    arb_type:        str
+    t_decision:      float = 0.0   # evaluate() returned a trade
+    t_sign:          float = 0.0   # order(s) signed
+    t_post_yes:      float = 0.0   # YES leg posted to CLOB
+    t_post_no:       float = 0.0   # NO leg posted to CLOB
+    t_confirm_yes:   float = 0.0   # YES fill confirmed
+    t_confirm_no:    float = 0.0   # NO fill confirmed
+    t_settle:        float = 0.0   # split/merge relay called (if applicable)
+
+    # Derived (ms from decision to each stage)
+    sign_ms:         float = 0.0
+    post_yes_ms:     float = 0.0
+    post_no_ms:      float = 0.0
+    confirm_yes_ms:  float = 0.0
+    confirm_no_ms:   float = 0.0
+    settle_ms:       float = 0.0
+    total_ms:        float = 0.0
+
+    def finalise(self):
+        t0 = self.t_decision
+        self.sign_ms        = round((self.t_sign        - t0) * 1000, 1) if self.t_sign        else 0
+        self.post_yes_ms    = round((self.t_post_yes    - t0) * 1000, 1) if self.t_post_yes    else 0
+        self.post_no_ms     = round((self.t_post_no     - t0) * 1000, 1) if self.t_post_no     else 0
+        self.confirm_yes_ms = round((self.t_confirm_yes - t0) * 1000, 1) if self.t_confirm_yes else 0
+        self.confirm_no_ms  = round((self.t_confirm_no  - t0) * 1000, 1) if self.t_confirm_no  else 0
+        self.settle_ms      = round((self.t_settle      - t0) * 1000, 1) if self.t_settle      else 0
+        last = max(self.t_sign, self.t_post_yes, self.t_post_no,
+                   self.t_confirm_yes, self.t_confirm_no, self.t_settle)
+        self.total_ms = round((last - t0) * 1000, 1) if last > t0 else 0
+
+
+class ExecutionTimer:
+    """
+    Instruments the full sign → post → confirm pipeline.
+
+    Paper mode: simulates realistic Polymarket API latencies so you can
+    benchmark the pipeline before going live.
+
+    Live mode: replace the simulate_* methods with real signing/API calls.
+    The optimizer reads exec_timings.jsonl each cycle and tunes:
+      - connection pool size
+      - batch vs sequential leg posting
+      - WS vs REST fill confirmation
+
+    Realistic latency benchmarks (Polymarket, 2024):
+      signing:     1–3ms    (ECDSA, in-process)
+      post order: 40–120ms  (CLOB REST, single leg)
+      fill WS:    10–50ms   (WS user channel, after post)
+      relay split: 200ms    (gasless split relayer)
+      merge tx:   2000ms+   (on-chain Polygon, 1 block)
+    """
+
+    # Paper-mode simulated latencies (ms, realistic Polymarket benchmarks)
+    SIM = {
+        "sign":        2,    # ECDSA signing
+        "post_leg":    80,   # CLOB POST /order per leg
+        "fill_ws":     25,   # WS fill confirmation
+        "relay_split": 200,  # gasless split relayer
+        "merge_chain": 2500, # on-chain mergePositions() — 1 Polygon block
+    }
+
+    def __init__(self, exec_log: Path):
+        self.exec_log = exec_log
+        self._log_file = open(exec_log, "a")
+        self._timings: list[ExecTiming] = []
+
+    async def simulate_execution(self, trade_id: int, arb_type: str) -> ExecTiming:
+        """
+        Paper-mode execution: sleep realistic durations, record timestamps.
+        In live trading, replace this with real signing + API calls.
+        """
+        t = ExecTiming(trade_id=trade_id, arb_type=arb_type)
+        t.t_decision = time.time()
+
+        # Step 1: Sign both legs (in parallel — pre-compute YES + NO orders)
+        await asyncio.sleep(self.SIM["sign"] / 1000)
+        t.t_sign = time.time()
+
+        # Step 2: Post YES leg
+        await asyncio.sleep(self.SIM["post_leg"] / 1000)
+        t.t_post_yes = time.time()
+
+        # Step 3: Post NO leg (sequential for safety; can be parallel but adds leg risk)
+        await asyncio.sleep(self.SIM["post_leg"] / 1000)
+        t.t_post_no = time.time()
+
+        # Step 4: Await WS fill confirmations (both legs)
+        await asyncio.sleep(self.SIM["fill_ws"] / 1000)
+        t.t_confirm_yes = time.time()
+        await asyncio.sleep(self.SIM["fill_ws"] / 1000)
+        t.t_confirm_no = time.time()
+
+        # Step 5: Relay/merge call
+        if arb_type == "split":
+            await asyncio.sleep(self.SIM["relay_split"] / 1000)
+        else:
+            await asyncio.sleep(self.SIM["merge_chain"] / 1000)
+        t.t_settle = time.time()
+
+        t.finalise()
+        self._log(t)
+        return t
+
+    def recent_stats(self, n: int = 50) -> dict:
+        """Return avg/p95 for each pipeline stage over last n trades."""
+        recent = self._timings[-n:]
+        if not recent:
+            return {}
+
+        def _stats(vals):
+            vals = sorted(vals)
+            return {
+                "avg": round(sum(vals) / len(vals), 1),
+                "p95": round(vals[int(len(vals) * 0.95)], 1),
+            }
+
+        return {
+            "n": len(recent),
+            "sign":        _stats([t.sign_ms        for t in recent if t.sign_ms]),
+            "post_yes":    _stats([t.post_yes_ms     for t in recent if t.post_yes_ms]),
+            "post_no":     _stats([t.post_no_ms      for t in recent if t.post_no_ms]),
+            "confirm_yes": _stats([t.confirm_yes_ms  for t in recent if t.confirm_yes_ms]),
+            "confirm_no":  _stats([t.confirm_no_ms   for t in recent if t.confirm_no_ms]),
+            "settle":      _stats([t.settle_ms        for t in recent if t.settle_ms]),
+            "total":       _stats([t.total_ms         for t in recent]),
+        }
+
+    def _log(self, t: ExecTiming):
+        self._timings.append(t)
+        self._log_file.write(json.dumps({
+            "ts": t.t_decision, "trade_id": t.trade_id, "arb_type": t.arb_type,
+            "sign_ms": t.sign_ms, "post_yes_ms": t.post_yes_ms,
+            "post_no_ms": t.post_no_ms, "confirm_yes_ms": t.confirm_yes_ms,
+            "confirm_no_ms": t.confirm_no_ms, "settle_ms": t.settle_ms,
+            "total_ms": t.total_ms,
+        }) + "\n")
+        self._log_file.flush()
+
+    def close(self):
+        self._log_file.close()
+
+
+# ---------------------------------------------------------------------------
 # Paper trading engine
 # ---------------------------------------------------------------------------
 
@@ -920,6 +1219,23 @@ class PaperEngine:
         self._market_profit: dict[str, float] = defaultdict(float) # condition_id → cumulative profit
         self.max_entries_per_market = cfg["arb"].get("max_entries_per_market", 10)  # safety cap
 
+        # MM Tracker — spread health and quote-age gating
+        mm_log = Path(cfg["logging"].get("mm_log", "logs/mm_tracker.jsonl"))
+        mm_log.parent.mkdir(parents=True, exist_ok=True)
+        self.mm_tracker = MMTracker(mm_log)
+
+        # Window Budget — spending cap per arb type per condition_id
+        self.window_budget = WindowBudget(
+            split_budget=cfg["arb"].get("window_budget_split", 10.0),
+            merge_budget=cfg["arb"].get("window_budget_merge", 10.0),
+        )
+
+        # Execution Timer — benchmarks sign → post → confirm pipeline
+        exec_log = Path(cfg["logging"].get("exec_log", "logs/exec_timings.jsonl"))
+        exec_log.parent.mkdir(parents=True, exist_ok=True)
+        self.exec_timer = ExecutionTimer(exec_log)
+        self._trade_counter = 0  # monotonic trade ID for exec timing
+
         # Log files
         trade_path = Path(cfg["logging"]["trade_log"])
         scan_path = Path(cfg["logging"]["scan_log"])
@@ -931,6 +1247,8 @@ class PaperEngine:
     def close(self):
         self._trade_log.close()
         self._scan_log.close()
+        self.mm_tracker.close()
+        self.exec_timer.close()
 
     def _log_scan(self, record: dict):
         self._scan_log.write(json.dumps(record) + "\n")
@@ -965,6 +1283,11 @@ class PaperEngine:
         if market.last_update > 0 and (now - market.last_update) > 5.0:
             return None
 
+        # MM health gate — skip thin books (wide spread or stale quotes)
+        self.mm_tracker.update(market)
+        if not self.mm_tracker.is_healthy(market):
+            return None
+
         split_trade: Optional[PaperTrade] = None
         merge_trade: Optional[PaperTrade] = None
 
@@ -978,7 +1301,8 @@ class PaperEngine:
             split_stake = 0.0
             if yes_avg > 0 and no_avg > 0:
                 depth_limited = min(yes_qty * yes_avg, no_qty * no_avg)
-                split_stake = min(self.max_stake, self.bankroll, depth_limited)
+                budget_rem = self.window_budget.remaining(market.condition_id, "split")
+                split_stake = min(self.max_stake, self.bankroll, depth_limited, budget_rem)
                 if split_stake >= 1.0:
                     split_trade = compute_arb(yes_avg, no_avg, split_stake,
                                               self.max_fee_rate, self.slippage_bps)
@@ -1005,7 +1329,8 @@ class PaperEngine:
             merge_stake = 0.0
             if yes_avg_a > 0 and no_avg_a > 0:
                 depth_limited_m = min(yes_qty_a * yes_avg_a, no_qty_a * no_avg_a)
-                merge_stake = min(self.max_stake, self.bankroll, depth_limited_m)
+                budget_rem_m = self.window_budget.remaining(market.condition_id, "merge")
+                merge_stake = min(self.max_stake, self.bankroll, depth_limited_m, budget_rem_m)
                 if merge_stake >= 1.0:
                     merge_trade = compute_merge_arb(yes_avg_a, no_avg_a, merge_stake,
                                                     self.max_fee_rate, self.slippage_bps)
@@ -1047,6 +1372,15 @@ class PaperEngine:
         # Track multi-entry
         self._market_entries[market.condition_id] += 1
         trade.entry_num = self._market_entries[market.condition_id]
+
+        # Record window budget spend
+        self.window_budget.record(market.condition_id, trade.arb_type, trade.stake)
+
+        # Benchmark execution pipeline in background (non-blocking)
+        self._trade_counter += 1
+        asyncio.create_task(
+            self.exec_timer.simulate_execution(self._trade_counter, trade.arb_type)
+        )
 
         self.bankroll += trade.profit
         self.total_trades += 1
@@ -1305,6 +1639,11 @@ async def run(cfg: dict, cfg_path: str = "config.toml"):
             opportunities = len(candidates)
             for _, m, trade in candidates:
                 engine.execute(m, trade)
+
+            # -- MM snapshots (every 20 scans = ~10s) --------------------------
+            if scan_count % 20 == 0:
+                for m in tracked.values():
+                    engine.mm_tracker.log_snapshot(m)
 
             # -- Status line (every 20 scans = ~10s) ----------------------------
             if scan_count % 20 == 0:

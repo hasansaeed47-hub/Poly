@@ -59,11 +59,19 @@ max_entries_per_market = 10
 # Merge-buy arb threshold: fire when YES_ask + NO_ask < this value
 # Arb profit = $1.00 - YES_ask - NO_ask - fees. At 0.98 the gross is ~2¢ before fees.
 merge_ask_threshold = 0.98
+# Per-window spend cap: how much USDC to deploy per arb type per condition_id
+# Each 5m/15m/60m window has its own condition_id → budget resets on new window open
+window_budget_split = 10.0
+window_budget_merge = 10.0
 
 [logging]
 # JSONL trade log
 trade_log = "logs/trades.jsonl"
 # JSONL scan log (all opportunities seen)
 scan_log = "logs/scans.jsonl"
+# MM tracker snapshots (spread, quote_age, depth_score per market every 10s)
+mm_log = "logs/mm_tracker.jsonl"
+# Execution pipeline timing (sign/post/confirm latency per trade)
+exec_log = "logs/exec_timings.jsonl"
 # Console log level: DEBUG, INFO, WARN, ERROR
 level = "INFO"
