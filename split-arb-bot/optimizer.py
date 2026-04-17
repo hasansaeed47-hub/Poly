@@ -2,13 +2,15 @@
 """
 Arb Bot Placement Optimizer
 
-Three layers of intelligence running every cycle:
-  1. Reactive tuner    — log-based parameter adjustment (was already here)
-  2. Trend analyzer    — cross-cycle trend detection for preemptive changes
-  3. Route scanner     — proactive Gamma+CLOB sweep for new arb-prone markets
+Runs as an asyncio task inside the bot's event loop (parallel, zero overhead),
+or standalone via CLI for testing.
 
-Run alongside the arb bot:
-    python optimizer.py [config.toml] [--dry-run] [--interval 300]
+Three layers per cycle:
+  1. Reactive tuner    — log-based parameter adjustment
+  2. Trend analyzer    — cross-cycle preemptive adjustment (fires before breach)
+  3. Route scanner     — proactive Gamma+CLOB sweep for pre-arb markets (sum < 0.95)
+                         These are markets approaching arb territory so the bot
+                         can pre-subscribe before the opportunity opens.
 """
 
 import argparse
@@ -46,6 +48,8 @@ class PlacementMetrics:
     total_trades: int
     total_profit: float
     avg_profit_per_trade: float
+    avg_capture_latency_ms: float = 0.0   # mean ms from first-seen to execute
+    p95_capture_latency_ms: float = 0.0   # 95th percentile latency
     capture_rate: float = 0.0
     near_miss_rate: float = 0.0
     depth_fail_rate: float = 0.0
@@ -74,7 +78,7 @@ class RouteCandidate:
     yes_bid: float
     no_bid: float
     bid_sum: float
-    gap_to_arb: float  # 1.0 - bid_sum (negative = already in arb)
+    gap_to_arb: float   # 1.0 - bid_sum (positive = below arb, negative = in arb)
 
 
 # ---------------------------------------------------------------------------
@@ -83,13 +87,13 @@ class RouteCandidate:
 
 class LogReader:
     def __init__(self, scan_log: Path, trade_log: Path):
-        self.scan_log = scan_log
+        self.scan_log  = scan_log
         self.trade_log = trade_log
 
     def read_window(self, window_secs: int) -> tuple[list[dict], list[dict]]:
         cutoff = time.time() - window_secs
         return (
-            self._read_jsonl(self.scan_log, cutoff),
+            self._read_jsonl(self.scan_log,  cutoff),
             self._read_jsonl(self.trade_log, cutoff),
         )
 
@@ -121,11 +125,12 @@ class LogReader:
 
 def compute_metrics(scans: list[dict], trades: list[dict], window_secs: int) -> PlacementMetrics:
     """
-    Classify every scan where YES+NO > 1.0 into one of four outcomes:
-      triggered      — arb was executed (triggered=True)
-      near_miss      — profit > 0 but below min_profit_cents
-      depth_fail     — stake < 1.0 (depth check blocked entry)
-      slippage_kill  — stake >= 1.0 but profit == 0 (fees/slip erased margin)
+    Classify each scan where sum > 1.0:
+      triggered      — executed (triggered=True)
+      near_miss      — profit > 0 but below threshold
+      depth_fail     — stake < 1.0 (depth check blocked)
+      slippage_kill  — stake >= 1.0 but profit == 0 (fees killed margin)
+    Also compute capture latency from trade records.
     """
     opportunities = triggered = near_miss = depth_fail = slippage_kill = 0
     near_miss_profits: list[float] = []
@@ -147,6 +152,12 @@ def compute_metrics(scans: list[dict], trades: list[dict], window_secs: int) -> 
     total_profit = sum(t.get("profit", 0) for t in trades)
     total_trades = len(trades)
 
+    # Capture latency from trade records (added by bot.py execute())
+    latencies = [t["capture_latency_ms"] for t in trades if "capture_latency_ms" in t]
+    latencies.sort()
+    avg_lat = sum(latencies) / len(latencies) if latencies else 0.0
+    p95_lat = latencies[int(len(latencies) * 0.95)] if latencies else 0.0
+
     return PlacementMetrics(
         window_secs=window_secs,
         total_scans=len(scans),
@@ -160,11 +171,13 @@ def compute_metrics(scans: list[dict], trades: list[dict], window_secs: int) -> 
         total_trades=total_trades,
         total_profit=total_profit,
         avg_profit_per_trade=total_profit / total_trades if total_trades > 0 else 0.0,
+        avg_capture_latency_ms=round(avg_lat, 1),
+        p95_capture_latency_ms=round(p95_lat, 1),
     )
 
 
 # ---------------------------------------------------------------------------
-# Reactive tuner — per-cycle rule-based adjustments
+# Reactive tuner
 # ---------------------------------------------------------------------------
 
 PARAM_BOUNDS: dict[str, tuple[float, float]] = {
@@ -196,7 +209,6 @@ def reactive_diagnose(m: PlacementMetrics, arb_cfg: dict) -> list[Adjustment]:
     cur_slip   = float(arb_cfg["slippage_bps"])
     cur_depth  = float(arb_cfg["min_depth_usd"])
 
-    # R1: Near-miss rate high → threshold is too tight
     if m.near_miss_rate > 0.50 and m.near_miss_profit_avg > 0:
         new_val = _adjust(cur_profit, -1.0, "min_profit_cents")
         if new_val < cur_profit - 0.01:
@@ -204,40 +216,35 @@ def reactive_diagnose(m: PlacementMetrics, arb_cfg: dict) -> list[Adjustment]:
                 f"near_miss_rate={m.near_miss_rate:.0%} "
                 f"(avg near-miss={m.near_miss_profit_avg*100:.2f}¢ vs threshold={cur_profit:.1f}¢)"))
 
-    # R2: Good capture with no near-misses → tighten slightly
     elif m.near_miss_rate < 0.10 and m.capture_rate > 0.80 and m.avg_profit_per_trade > 0:
         new_val = _adjust(cur_profit, +1.0, "min_profit_cents", step_scale=0.5)
         if new_val > cur_profit + 0.01:
             changes.append(Adjustment("min_profit_cents", cur_profit, round(new_val, 2),
-                f"capture_rate={m.capture_rate:.0%}, near_miss_rate={m.near_miss_rate:.0%} — tightening threshold"))
+                f"capture_rate={m.capture_rate:.0%}, near_miss_rate={m.near_miss_rate:.0%} — tightening"))
 
-    # R3: Depth failures blocking arbs
     if m.depth_fail_rate > 0.40:
         new_val = _adjust(cur_depth, -1.0, "min_depth_usd")
         if new_val < cur_depth - 0.1:
             changes.append(Adjustment("min_depth_usd", cur_depth, round(new_val, 1),
-                f"depth_fail_rate={m.depth_fail_rate:.0%} — {m.depth_fail} arbs blocked by depth check"))
+                f"depth_fail_rate={m.depth_fail_rate:.0%} — {m.depth_fail} arbs blocked"))
 
-    # R4: No depth failures + profitable → raise depth for fill quality
     elif m.depth_fail_rate < 0.05 and m.total_trades >= 5 and m.avg_profit_per_trade > 0:
         new_val = _adjust(cur_depth, +1.0, "min_depth_usd", step_scale=0.3)
         if new_val > cur_depth + 0.1:
             changes.append(Adjustment("min_depth_usd", cur_depth, round(new_val, 1),
-                f"no depth failures, raising requirement for better fill quality"))
+                "no depth failures — raising requirement for fill quality"))
 
-    # R5: Slippage eating margin
     if m.slippage_kill_rate > 0.30 and cur_slip > 2:
         new_val = _adjust(cur_slip, -1.0, "slippage_bps")
         if new_val < cur_slip - 0.5:
             changes.append(Adjustment("slippage_bps", cur_slip, round(new_val, 0),
-                f"slippage_kill_rate={m.slippage_kill_rate:.0%} — {cur_slip}bps erasing margins"))
+                f"slippage_kill_rate={m.slippage_kill_rate:.0%} — erasing margins"))
 
-    # R6: Slippage has headroom
     elif m.slippage_kill_rate < 0.05 and m.capture_rate > 0.70 and m.total_trades >= 3:
         new_val = _adjust(cur_slip, +1.0, "slippage_bps", step_scale=0.3)
         if new_val > cur_slip + 0.5:
             changes.append(Adjustment("slippage_bps", cur_slip, round(new_val, 0),
-                f"slippage kills rare, raising estimate for realism"))
+                "slippage kills rare — raising for realism"))
 
     return changes
 
@@ -247,11 +254,7 @@ def reactive_diagnose(m: PlacementMetrics, arb_cfg: dict) -> list[Adjustment]:
 # ---------------------------------------------------------------------------
 
 class TrendAnalyzer:
-    """
-    Keeps a rolling history of PlacementMetrics across cycles.
-    When a metric shows a consistent worsening trend over 3+ cycles,
-    fires a smaller preemptive adjustment before the reactive threshold is hit.
-    """
+    """Fires half-step preemptive adjustments when metrics show 3-cycle worsening trends."""
 
     def __init__(self, history_len: int = 10):
         self._history: deque[PlacementMetrics] = deque(maxlen=history_len)
@@ -269,84 +272,77 @@ class TrendAnalyzer:
         cur_depth  = float(arb_cfg["min_depth_usd"])
         cur_slip   = float(arb_cfg["slippage_bps"])
 
-        # Rising near-miss rate (worsening) — act before it hits 50%
         nm = [m.near_miss_rate for m in recent]
         if nm[2] > nm[1] > nm[0] and nm[2] > 0.25:
             new_val = _adjust(cur_profit, -1.0, "min_profit_cents", step_scale=0.5)
             if new_val < cur_profit - 0.01:
                 changes.append(Adjustment("min_profit_cents", cur_profit, round(new_val, 2),
-                    f"[TREND] near_miss_rate rising {nm[0]:.0%}→{nm[1]:.0%}→{nm[2]:.0%} "
-                    f"— preemptive threshold cut before 50% breach"))
+                    f"[TREND] near_miss rising {nm[0]:.0%}→{nm[1]:.0%}→{nm[2]:.0%} — preemptive cut"))
 
-        # Rising depth-fail rate
         df = [m.depth_fail_rate for m in recent]
         if df[2] > df[1] > df[0] and df[2] > 0.20:
             new_val = _adjust(cur_depth, -1.0, "min_depth_usd", step_scale=0.5)
             if new_val < cur_depth - 0.1:
                 changes.append(Adjustment("min_depth_usd", cur_depth, round(new_val, 1),
-                    f"[TREND] depth_fail_rate rising {df[0]:.0%}→{df[1]:.0%}→{df[2]:.0%} "
-                    f"— preemptive depth reduction"))
+                    f"[TREND] depth_fail rising {df[0]:.0%}→{df[1]:.0%}→{df[2]:.0%} — preemptive depth cut"))
 
-        # Falling capture rate
         cr = [m.capture_rate for m in recent]
-        if cr[2] < cr[1] < cr[0] and cr[2] < 0.55:
+        if cr[2] < cr[1] < cr[0] and cr[2] < 0.55 and cur_slip > 2:
             new_val = _adjust(cur_slip, -1.0, "slippage_bps", step_scale=0.5)
-            if new_val < cur_slip - 0.5 and cur_slip > 2:
+            if new_val < cur_slip - 0.5:
                 changes.append(Adjustment("slippage_bps", cur_slip, round(new_val, 0),
-                    f"[TREND] capture_rate falling {cr[0]:.0%}→{cr[1]:.0%}→{cr[2]:.0%} "
-                    f"— reducing slippage buffer"))
+                    f"[TREND] capture falling {cr[0]:.0%}→{cr[1]:.0%}→{cr[2]:.0%} — reducing slip buffer"))
 
         return changes
 
 
 # ---------------------------------------------------------------------------
-# Proactive route scanner — finds new arb-prone markets via Gamma + CLOB
+# Proactive route scanner — finds pre-arb markets (sum < 0.95)
 # ---------------------------------------------------------------------------
 
 class ProactiveRouteScanner:
     """
-    Every cycle, independently queries Gamma and CLOB REST APIs to find
-    binary markets outside the current tracked set that are approaching
-    YES+NO > 1.0 arb territory.
+    Every cycle, sweeps Gamma + CLOB for markets where YES+NO bid sum is
+    between 0.80 and 0.95 — BELOW arb threshold but approaching it.
 
-    Results are ranked by bid_sum and written to logs/route_candidates.jsonl.
-    The top candidates are logged so you can see which NEW markets to add
-    to the bot's discovery list.
+    These are candidates to pre-subscribe to so the bot already has fresh
+    book data when the market crosses into arb territory.
+
+    Results written to logs/route_candidates.jsonl ranked by sum descending
+    (closest to arb = most urgent to pre-subscribe).
     """
 
     GAMMA_API = "https://gamma-api.polymarket.com"
     CLOB_REST = "https://clob.polymarket.com"
-    PROXIMITY_THRESHOLD = 0.05  # flag markets where YES+NO > 0.95
+
+    # Only flag markets in this sum range: approaching arb but not yet there
+    SUM_MIN = 0.80   # don't bother with markets too far out
+    SUM_MAX = 0.95   # below arb threshold (>= 0.95 = already near arb, main bot handles it)
 
     def __init__(self, route_log: Path, max_markets: int = 200):
         self.route_log = route_log
         self.max_markets = max_markets
 
-    def scan_sync(self) -> list[RouteCandidate]:
-        """Synchronous entry point — runs the async scan in a fresh event loop."""
+    async def scan(self) -> list[RouteCandidate]:
+        """Async scan — awaitable directly inside the optimizer task."""
+        timeout = aiohttp.ClientTimeout(total=20)
         try:
-            return asyncio.run(self._scan())
+            async with aiohttp.ClientSession(
+                timeout=timeout,
+                headers={"Accept": "application/json"},
+            ) as session:
+                markets = await self._discover(session)
+                if not markets:
+                    return []
+                candidates = await self._rank(session, markets)
+
+            self._write(candidates)
+            return candidates
         except Exception as e:
-            logging.warning("[ROUTE] Scan failed: %s", e)
+            logging.warning("[ROUTE] Scan error: %s", e)
             return []
 
-    async def _scan(self) -> list[RouteCandidate]:
-        timeout = aiohttp.ClientTimeout(total=20)
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            headers={"Accept": "application/json"},
-        ) as session:
-            markets = await self._discover(session)
-            if not markets:
-                logging.info("[ROUTE] No markets discovered from Gamma")
-                return []
-            candidates = await self._rank(session, markets)
-
-        self._write(candidates)
-        return candidates
-
     async def _discover(self, session: aiohttp.ClientSession) -> list[dict]:
-        """Fetch top active binary markets by volume."""
         try:
             async with session.get(
                 f"{self.GAMMA_API}/markets",
@@ -360,7 +356,7 @@ class ProactiveRouteScanner:
                     return []
                 data = await resp.json()
         except Exception as e:
-            logging.warning("[ROUTE] Gamma fetch error: %s", e)
+            logging.warning("[ROUTE] Gamma error: %s", e)
             return []
 
         markets = []
@@ -403,15 +399,15 @@ class ProactiveRouteScanner:
         return markets
 
     async def _rank(self, session: aiohttp.ClientSession, markets: list[dict]) -> list[RouteCandidate]:
-        """Batch-fetch best bids, rank markets by YES+NO bid sum."""
-        token_map: dict[str, tuple[dict, str]] = {}  # token_id → (market_dict, "yes"/"no")
+        all_tokens = []
+        token_map: dict[str, tuple[dict, str]] = {}
         for m in markets:
+            all_tokens.append(m["token_yes"])
+            all_tokens.append(m["token_no"])
             token_map[m["token_yes"]] = (m, "yes")
             token_map[m["token_no"]]  = (m, "no")
 
-        all_tokens = list(token_map.keys())
         best_bid: dict[str, float] = {}
-
         for i in range(0, len(all_tokens), 100):
             batch = all_tokens[i:i + 100]
             try:
@@ -433,11 +429,10 @@ class ProactiveRouteScanner:
                             except (ValueError, TypeError):
                                 pass
             except Exception as e:
-                logging.warning("[ROUTE] Book batch error: %s", e)
+                logging.warning("[ROUTE] Books batch error: %s", e)
 
         seen: set[str] = set()
         candidates: list[RouteCandidate] = []
-
         for m in markets:
             slug = m["slug"]
             if slug in seen:
@@ -450,7 +445,9 @@ class ProactiveRouteScanner:
                 continue
 
             bid_sum = yb + nb
-            if bid_sum < (1.0 - self.PROXIMITY_THRESHOLD):
+
+            # Only flag markets in the pre-arb window: sum < 0.95 and sum > 0.80
+            if not (self.SUM_MIN <= bid_sum < self.SUM_MAX):
                 continue
 
             candidates.append(RouteCandidate(
@@ -473,7 +470,7 @@ class ProactiveRouteScanner:
             "routes": [
                 {"slug": c.slug, "question": c.question,
                  "yes_bid": c.yes_bid, "no_bid": c.no_bid,
-                 "sum": c.bid_sum, "gap": c.gap_to_arb}
+                 "sum": c.bid_sum, "gap_to_arb": c.gap_to_arb}
                 for c in candidates[:20]
             ],
         }
@@ -519,22 +516,23 @@ def _metrics_dict(m: PlacementMetrics) -> dict:
         "total_trades": m.total_trades,
         "total_profit": round(m.total_profit, 4),
         "avg_profit_per_trade": round(m.avg_profit_per_trade, 6),
+        "avg_capture_latency_ms": m.avg_capture_latency_ms,
+        "p95_capture_latency_ms": m.p95_capture_latency_ms,
     }
 
 
 # ---------------------------------------------------------------------------
-# Optimizer — orchestrates all three layers
+# Optimizer — async, runs as a task inside bot.py's event loop
 # ---------------------------------------------------------------------------
 
 class Optimizer:
     def __init__(self, config_path: Path, dry_run: bool, interval: int, window: int):
         self.config_path = config_path
-        self.dry_run = dry_run
-        self.interval = interval
-        self.window = window
-        self._stop = False
+        self.dry_run     = dry_run
+        self.interval    = interval
+        self.window      = window
 
-        cfg = load_config(config_path)
+        cfg  = load_config(config_path)
         base = config_path.parent
 
         scan_log  = Path(cfg["logging"]["scan_log"])
@@ -552,105 +550,79 @@ class Optimizer:
         opt_log.parent.mkdir(parents=True, exist_ok=True)
         self._opt_log = open(opt_log, "a")
 
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        signal.signal(signal.SIGINT, self._handle_signal)
-
-    def _handle_signal(self, sig, _frame):
-        logging.info("Signal received — stopping optimizer")
-        self._stop = True
-
     def _log(self, record: dict):
         self._opt_log.write(json.dumps(record) + "\n")
         self._opt_log.flush()
 
-    def run(self):
+    async def run(self):
+        """Async run loop — safe to run as asyncio.create_task() alongside the bot."""
         logging.info("=" * 60)
-        logging.info("Placement Optimizer — 3-layer mode")
-        logging.info("  Layer 1: Reactive tuner (per-cycle rules)")
-        logging.info("  Layer 2: Trend analyzer (cross-cycle preemptive)")
-        logging.info("  Layer 3: Route scanner (proactive Gamma+CLOB sweep)")
-        logging.info("Config: %s | interval=%ds | window=%ds | dry=%s",
-                     self.config_path, self.interval, self.window, self.dry_run)
+        logging.info("OPT Placement Optimizer started (parallel async task)")
+        logging.info("OPT Layers: reactive | trend | route-scan (sum 0.80-0.95)")
+        logging.info("OPT interval=%ds window=%ds dry=%s", self.interval, self.window, self.dry_run)
         logging.info("=" * 60)
 
         cycle = 0
-        while not self._stop:
-            cycle += 1
-            t0 = time.time()
-            try:
-                self._run_cycle(cycle)
-            except Exception as e:
-                logging.error("Cycle %d error: %s", cycle, e, exc_info=True)
+        try:
+            while True:
+                cycle += 1
+                t0 = time.time()
+                try:
+                    await self._run_cycle(cycle)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logging.error("OPT Cycle %d error: %s", cycle, e, exc_info=True)
 
-            sleep_time = max(0, self.interval - (time.time() - t0))
-            logging.info("Next cycle in %.0fs", sleep_time)
-            for _ in range(int(sleep_time)):
-                if self._stop:
-                    break
-                time.sleep(1)
+                sleep_time = max(0.0, self.interval - (time.time() - t0))
+                await asyncio.sleep(sleep_time)
+        finally:
+            self._opt_log.close()
+            logging.info("OPT Optimizer stopped after %d cycles", cycle)
 
-        self._opt_log.close()
-        logging.info("Optimizer stopped")
-
-    def _run_cycle(self, cycle: int):
+    async def _run_cycle(self, cycle: int):
         cfg = load_config(self.config_path)
         scans, trades = self.reader.read_window(self.window)
         m = compute_metrics(scans, trades, self.window)
 
         logging.info(
-            "Cycle %d | scans=%d opps=%d triggered=%d | "
-            "near_miss=%d depth_fail=%d slip_kill=%d | "
-            "capture=%.0f%% profit=$%.4f",
-            cycle, m.total_scans, m.opportunities, m.triggered,
-            m.near_miss, m.depth_fail, m.slippage_kill,
-            m.capture_rate * 100, m.total_profit,
+            "OPT cycle=%d scans=%d opps=%d | triggered=%d near_miss=%d "
+            "depth_fail=%d slip_kill=%d | capture=%.0f%% "
+            "lat_avg=%.0fms lat_p95=%.0fms | profit=$%.4f",
+            cycle, m.total_scans, m.opportunities,
+            m.triggered, m.near_miss, m.depth_fail, m.slippage_kill,
+            m.capture_rate * 100,
+            m.avg_capture_latency_ms, m.p95_capture_latency_ms,
+            m.total_profit,
         )
 
-        # --- Layer 2: Record in trend history before adjusting ----------------
         self.trend.record(m)
 
-        # --- Layer 1 + 2: Collect all adjustments ----------------------------
         all_adjustments: list[Adjustment] = []
-
         if m.opportunities >= 15:
             reactive = reactive_diagnose(m, cfg["arb"])
             trend    = self.trend.trend_adjustments(cfg["arb"])
-
-            # Trend fires first (smaller step), reactive overrides if both target
-            # the same param — deduplicate by param, keeping last (reactive wins)
             seen_params: dict[str, Adjustment] = {}
-            for a in trend + reactive:
+            for a in trend + reactive:   # reactive wins on same param
                 seen_params[a.param] = a
             all_adjustments = list(seen_params.values())
         else:
-            logging.info("  [L1/L2] Only %d opportunities — skipping param tuning", m.opportunities)
+            logging.info("OPT [L1/L2] only %d opportunities — skipping param tuning", m.opportunities)
 
-        # --- Layer 3: Proactive route scan ------------------------------------
-        logging.info("  [L3] Scanning Gamma+CLOB for new arb routes...")
-        candidates = self.scanner.scan_sync()
-
+        # Route scanner runs every cycle regardless of opportunity count
+        candidates = await self.scanner.scan()
         if candidates:
-            in_arb   = [c for c in candidates if c.gap_to_arb <= 0]
-            near_arb = [c for c in candidates if 0 < c.gap_to_arb <= 0.02]
             logging.info(
-                "  [L3] %d routes near arb: %d already in arb, %d within 2¢",
-                len(candidates), len(in_arb), len(near_arb),
+                "OPT [L3] %d pre-arb routes (sum 0.80-0.95) | top: %s sum=%.4f gap=%.4f",
+                len(candidates),
+                candidates[0].slug[:40], candidates[0].bid_sum, candidates[0].gap_to_arb,
             )
-            for c in candidates[:5]:
-                logging.info(
-                    "       %s | YES=%.3f NO=%.3f sum=%.4f gap=%+.4f",
-                    c.slug[:45], c.yes_bid, c.no_bid, c.bid_sum, c.gap_to_arb,
-                )
         else:
-            logging.info("  [L3] No near-arb routes found this cycle")
+            logging.info("OPT [L3] no pre-arb routes found")
 
-        # --- Apply adjustments -----------------------------------------------
-        if all_adjustments:
-            for a in all_adjustments:
-                logging.info("  ADJUST %s: %.3f → %.3f | %s",
-                             a.param, a.old_val, a.new_val, a.reason)
-        else:
-            logging.info("  Placement healthy — no parameter changes")
+        for a in all_adjustments:
+            logging.info("OPT ADJUST %s: %.3f → %.3f | %s",
+                         a.param, a.old_val, a.new_val, a.reason)
 
         self._log({
             "ts": time.time(), "cycle": cycle,
@@ -659,8 +631,7 @@ class Optimizer:
                 {"param": a.param, "old": a.old_val, "new": a.new_val, "reason": a.reason}
                 for a in all_adjustments
             ],
-            "routes_found": len(candidates),
-            "routes_in_arb": len([c for c in candidates if c.gap_to_arb <= 0]),
+            "routes_pre_arb": len(candidates),
             "metrics": _metrics_dict(m),
         })
 
@@ -669,25 +640,35 @@ class Optimizer:
 
         new_cfg = apply_adjustments(cfg, all_adjustments)
         save_config(new_cfg, self.config_path)
-        logging.info("  Wrote %d changes to %s", len(all_adjustments), self.config_path)
-        logging.warning("  Restart the arb bot for changes to take effect")
+        logging.info("OPT wrote %d changes to %s — restart bot to apply",
+                     len(all_adjustments), self.config_path)
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry points
 # ---------------------------------------------------------------------------
+
+async def run_optimizer_task(
+    config_path: Path,
+    dry_run: bool = False,
+    interval: int = 300,
+    window: int = 600,
+):
+    """
+    Async entry point for embedding in bot.py's event loop:
+        asyncio.create_task(run_optimizer_task(Path("config.toml")))
+    """
+    opt = Optimizer(config_path, dry_run, interval, window)
+    await opt.run()
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Arb bot placement optimizer")
+    parser = argparse.ArgumentParser(description="Arb placement optimizer (standalone)")
     parser.add_argument("config", nargs="?", default="config.toml")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Analyse without writing config changes")
-    parser.add_argument("--interval", type=int, default=300,
-                        help="Seconds between cycles (default: 300)")
-    parser.add_argument("--window", type=int, default=600,
-                        help="Seconds of log history per cycle (default: 600)")
-    parser.add_argument("--once", action="store_true",
-                        help="Run one cycle then exit")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--interval", type=int, default=300)
+    parser.add_argument("--window",   type=int, default=600)
+    parser.add_argument("--once", action="store_true", help="One cycle then exit")
     args = parser.parse_args()
 
     config_path = Path(args.config)
@@ -703,10 +684,23 @@ def main():
 
     opt = Optimizer(config_path, args.dry_run, args.interval, args.window)
 
-    if args.once:
-        opt._run_cycle(1)
-    else:
-        opt.run()
+    async def _run():
+        if args.once:
+            await opt._run_cycle(1)
+        else:
+            loop = asyncio.get_event_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                loop.add_signal_handler(sig, lambda: asyncio.create_task(_shutdown()))
+
+            async def _shutdown():
+                raise KeyboardInterrupt
+
+            await opt.run()
+
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

@@ -116,6 +116,7 @@ class PaperTrade:
     net: float            # gross - stake
     profit: float         # net - fees
     entry_num: int = 0    # which entry this is on this market (1st, 2nd, etc.)
+    capture_latency_ms: float = 0.0  # ms from first sum>1.0 detection to execution
 
 # ---------------------------------------------------------------------------
 # Fee model — Polymarket's actual fee curve
@@ -799,6 +800,9 @@ class PaperEngine:
         self.cooldown_secs = cfg["arb"].get("cooldown_secs", 5.0)
         self._last_trade_ts: dict[str, float] = {}  # condition_id → last trade time
 
+        # Capture latency: track when sum first exceeded 1.0 per market
+        self._first_seen: dict[str, float] = {}  # condition_id → ts of first arb signal
+
         # Multi-entry tracking per market
         self._market_entries: dict[str, int] = defaultdict(int)    # condition_id → entry count
         self._market_profit: dict[str, float] = defaultdict(float) # condition_id → cumulative profit
@@ -844,6 +848,10 @@ class PaperEngine:
 
         if raw_sum <= 1.0:
             return None
+
+        # Record first time this market showed sum > 1.0 — used for latency tracking
+        if market.condition_id not in self._first_seen:
+            self._first_seen[market.condition_id] = time.time()
 
         # Check fillable depth
         yes_avg, yes_qty = market.yes_bids.fillable_at(self.min_depth)
@@ -891,6 +899,11 @@ class PaperEngine:
         trade.market = market.slug
         trade.question = market.question
 
+        # Capture latency: ms from first sum>1.0 detection to this execution
+        now = time.time()
+        first_seen = self._first_seen.get(market.condition_id, now)
+        trade.capture_latency_ms = round((now - first_seen) * 1000, 1)
+
         # Track multi-entry
         self._market_entries[market.condition_id] += 1
         trade.entry_num = self._market_entries[market.condition_id]
@@ -900,13 +913,13 @@ class PaperEngine:
         self.total_profit += trade.profit
         self.total_volume += trade.stake
         self._market_profit[market.condition_id] += trade.profit
-        self._last_trade_ts[market.condition_id] = time.time()
+        self._last_trade_ts[market.condition_id] = now
 
         self._log_trade(trade)
 
         logging.info(
             "TRADE #%d | %s | entry=%d | stake=$%.2f | YES@%.3f NO@%.3f | "
-            "profit=$%.4f (mkt_total=$%.4f) | bankroll=$%.2f",
+            "profit=$%.4f (mkt_total=$%.4f) | bankroll=$%.2f | latency=%.0fms",
             self.total_trades,
             market.slug[:50],
             trade.entry_num,
@@ -916,6 +929,7 @@ class PaperEngine:
             trade.profit,
             self._market_profit[market.condition_id],
             self.bankroll,
+            trade.capture_latency_ms,
         )
 
 
@@ -944,7 +958,10 @@ def _slug_end_ts(slug: str) -> int:
 # Main loop — 500ms scan tick with WebSocket book feed
 # ---------------------------------------------------------------------------
 
-async def run(cfg: dict):
+async def run(cfg: dict, cfg_path: str = "config.toml"):
+    from optimizer import run_optimizer_task
+    from pathlib import Path as _Path
+
     client = PolyClient(cfg)
     engine = PaperEngine(cfg)
 
@@ -1028,9 +1045,14 @@ async def run(cfg: dict):
 
     logging.info("Initial snapshots loaded for %d tokens", len(all_tokens))
 
-    # -- Phase 3: Start WebSocket book feed ------------------------------------
+    # -- Phase 3: Start WebSocket book feed + optimizer (parallel tasks) ------
     book_feed = BookFeed(clob_ws_url, tracked)
-    ws_task = asyncio.create_task(book_feed.run())
+    ws_task  = asyncio.create_task(book_feed.run(), name="book-feed")
+    opt_task = asyncio.create_task(
+        run_optimizer_task(_Path(cfg_path), dry_run=False, interval=300, window=600),
+        name="optimizer",
+    )
+    logging.info("Optimizer running as parallel async task (interval=300s)")
 
     # -- Graceful shutdown on SIGTERM/SIGINT ------------------------------------
     shutdown_event = asyncio.Event()
@@ -1175,11 +1197,12 @@ async def run(cfg: dict):
     except KeyboardInterrupt:
         logging.info("Shutting down...")
     finally:
-        ws_task.cancel()
-        try:
-            await ws_task
-        except asyncio.CancelledError:
-            pass
+        for task in (ws_task, opt_task):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         engine.close()
         await client.close()
         if book_feed._session and not book_feed._session.closed:
@@ -1235,7 +1258,7 @@ def main():
         datefmt="%H:%M:%S",
     )
 
-    asyncio.run(run(cfg))
+    asyncio.run(run(cfg, cfg_path))
 
 
 if __name__ == "__main__":
