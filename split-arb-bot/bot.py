@@ -103,20 +103,20 @@ class Market:
 
 @dataclass
 class PaperTrade:
-    """Record of a simulated split-sell arbitrage."""
     ts: float
     market: str
     question: str
-    stake: float          # USDC split
-    yes_sell_price: float  # avg fill price
+    stake: float
+    yes_sell_price: float   # split: avg bid fill  |  merge: avg ask fill
     no_sell_price: float
     yes_fee: float
     no_fee: float
-    gross: float          # yes_proceeds + no_proceeds
-    net: float            # gross - stake
-    profit: float         # net - fees
-    entry_num: int = 0    # which entry this is on this market (1st, 2nd, etc.)
-    capture_latency_ms: float = 0.0  # ms from first sum>1.0 detection to execution
+    gross: float
+    net: float
+    profit: float
+    arb_type: str = "split"          # "split" or "merge"
+    entry_num: int = 0
+    capture_latency_ms: float = 0.0
 
 # ---------------------------------------------------------------------------
 # Fee model — Polymarket's actual fee curve
@@ -162,8 +162,7 @@ def compute_arb(
 
     return PaperTrade(
         ts=time.time(),
-        market="",
-        question="",
+        market="", question="",
         stake=stake,
         yes_sell_price=yes_fill,
         no_sell_price=no_fill,
@@ -172,6 +171,53 @@ def compute_arb(
         gross=gross,
         net=net,
         profit=profit,
+        arb_type="split",
+    )
+
+
+def compute_merge_arb(
+    yes_ask: float,
+    no_ask: float,
+    stake: float,
+    max_fee_rate: float,
+    slippage_bps: int,
+) -> Optional[PaperTrade]:
+    """
+    Merge-buy arb: buy YES at ask + buy NO at ask → merge → $1.00 USDC.
+    Profitable when YES_ask + NO_ask < $1.00 after fees and slippage.
+    """
+    if yes_ask <= 0 or no_ask <= 0:
+        return None
+
+    slip = slippage_bps / 10000
+    yes_fill = yes_ask * (1 + slip)   # slippage increases cost when buying
+    no_fill  = no_ask  * (1 + slip)
+
+    cost     = stake * (yes_fill + no_fill)
+    revenue  = stake * 1.0             # merge: 1 YES + 1 NO → $1.00
+
+    yes_fee  = stake * taker_fee(yes_fill, max_fee_rate)
+    no_fee   = stake * taker_fee(no_fill,  max_fee_rate)
+    total_fees = yes_fee + no_fee
+
+    gross  = revenue - cost
+    profit = gross - total_fees
+
+    if profit <= 0:
+        return None
+
+    return PaperTrade(
+        ts=time.time(),
+        market="", question="",
+        stake=stake,
+        yes_sell_price=yes_fill,   # used as yes_buy_price for merge trades
+        no_sell_price=no_fill,
+        yes_fee=yes_fee,
+        no_fee=no_fee,
+        gross=gross,
+        net=gross,
+        profit=profit,
+        arb_type="merge",
     )
 
 # ---------------------------------------------------------------------------
@@ -790,6 +836,8 @@ class PaperEngine:
         self.slippage_bps = cfg["arb"]["slippage_bps"]
         self.exec_delay = cfg["arb"]["exec_delay_secs"]
         self.min_depth = cfg["scan"]["min_depth_usd"]
+        # Merge-buy arb: fire when YES_ask + NO_ask < this threshold
+        self.merge_ask_threshold = cfg["arb"].get("merge_ask_threshold", 0.98)
 
         self.total_trades = 0
         self.total_profit = 0.0
@@ -837,57 +885,80 @@ class PaperEngine:
         return False
 
     def evaluate(self, market: Market) -> Optional[PaperTrade]:
-        """Check a market for split-sell arb. Returns trade if profitable."""
+        """
+        Check a market for either arb type:
+          split: YES_bid + NO_bid > $1.00  → split USDC, sell both sides
+          merge: YES_ask + NO_ask < threshold → buy both sides, merge → $1.00
+        Returns the more profitable trade, or None.
+        """
+        now = time.time()
         yes_bid = market.yes_bids.best
-        no_bid = market.no_bids.best
+        no_bid  = market.no_bids.best
+        yes_ask = market.yes_asks.best
+        no_ask  = market.no_asks.best
 
-        if yes_bid <= 0 or no_bid <= 0:
+        split_trade: Optional[PaperTrade] = None
+        merge_trade: Optional[PaperTrade] = None
+
+        # -- Split-sell: bid_sum > 1.0 ----------------------------------------
+        if yes_bid > 0 and no_bid > 0 and (yes_bid + no_bid) > 1.0:
+            bid_sum = yes_bid + no_bid
+            if market.condition_id not in self._first_seen:
+                self._first_seen[market.condition_id] = now
+
+            yes_avg, yes_qty = market.yes_bids.fillable_at(self.min_depth)
+            no_avg,  no_qty  = market.no_bids.fillable_at(self.min_depth)
+            if yes_avg > 0 and no_avg > 0:
+                depth_limited = min(yes_qty * yes_avg, no_qty * no_avg)
+                stake = min(self.max_stake, self.bankroll, depth_limited)
+                if stake >= 1.0:
+                    split_trade = compute_arb(yes_avg, no_avg, stake,
+                                              self.max_fee_rate, self.slippage_bps)
+
+            self._log_scan({
+                "ts": now, "slug": market.slug, "question": market.question,
+                "arb_type": "split",
+                "yes_bid": yes_bid, "no_bid": no_bid, "sum": round(yes_bid + no_bid, 4),
+                "yes_avg": round(yes_avg if yes_avg else 0, 4),
+                "no_avg":  round(no_avg  if no_avg  else 0, 4),
+                "stake": round(stake if 'stake' in dir() else 0, 2),
+                "profit": round(split_trade.profit, 4) if split_trade else 0,
+                "triggered": split_trade is not None and split_trade.profit >= self.min_profit_cents / 100,
+            })
+
+        # -- Merge-buy: ask_sum < threshold -----------------------------------
+        if yes_ask > 0 and no_ask > 0 and (yes_ask + no_ask) < self.merge_ask_threshold:
+            ask_sum = yes_ask + no_ask
+            if market.condition_id not in self._first_seen:
+                self._first_seen[market.condition_id] = now
+
+            yes_avg_a, yes_qty_a = market.yes_asks.fillable_at(self.min_depth)
+            no_avg_a,  no_qty_a  = market.no_asks.fillable_at(self.min_depth)
+            stake_m = 0.0
+            if yes_avg_a > 0 and no_avg_a > 0:
+                depth_limited_m = min(yes_qty_a * yes_avg_a, no_qty_a * no_avg_a)
+                stake_m = min(self.max_stake, self.bankroll, depth_limited_m)
+                if stake_m >= 1.0:
+                    merge_trade = compute_merge_arb(yes_avg_a, no_avg_a, stake_m,
+                                                    self.max_fee_rate, self.slippage_bps)
+
+            self._log_scan({
+                "ts": now, "slug": market.slug, "question": market.question,
+                "arb_type": "merge",
+                "yes_ask": yes_ask, "no_ask": no_ask, "ask_sum": round(ask_sum, 4),
+                "yes_avg": round(yes_avg_a if yes_avg_a else 0, 4),
+                "no_avg":  round(no_avg_a  if no_avg_a  else 0, 4),
+                "stake": round(stake_m, 2),
+                "profit": round(merge_trade.profit, 4) if merge_trade else 0,
+                "triggered": merge_trade is not None and merge_trade.profit >= self.min_profit_cents / 100,
+            })
+
+        # Return whichever arb is more profitable (could be both on same tick)
+        candidates = [t for t in (split_trade, merge_trade)
+                      if t is not None and t.profit >= self.min_profit_cents / 100]
+        if not candidates:
             return None
-
-        raw_sum = yes_bid + no_bid
-
-        if raw_sum <= 1.0:
-            return None
-
-        # Record first time this market showed sum > 1.0 — used for latency tracking
-        if market.condition_id not in self._first_seen:
-            self._first_seen[market.condition_id] = time.time()
-
-        # Check fillable depth
-        yes_avg, yes_qty = market.yes_bids.fillable_at(self.min_depth)
-        no_avg, no_qty = market.no_bids.fillable_at(self.min_depth)
-
-        if yes_avg <= 0 or no_avg <= 0:
-            return None
-
-        depth_limited = min(yes_qty * yes_avg, no_qty * no_avg)
-        stake = min(self.max_stake, self.bankroll, depth_limited)
-        if stake < 1.0:
-            return None
-
-        trade = compute_arb(yes_avg, no_avg, stake, self.max_fee_rate, self.slippage_bps)
-
-        self._log_scan({
-            "ts": time.time(),
-            "slug": market.slug,
-            "question": market.question,
-            "yes_bid": yes_bid,
-            "no_bid": no_bid,
-            "sum": round(raw_sum, 4),
-            "yes_avg": round(yes_avg, 4),
-            "no_avg": round(no_avg, 4),
-            "stake": round(stake, 2),
-            "profit": round(trade.profit, 4) if trade else 0,
-            "triggered": trade is not None and trade.profit >= self.min_profit_cents / 100,
-        })
-
-        if trade is None:
-            return None
-
-        if trade.profit < self.min_profit_cents / 100:
-            return None
-
-        return trade
+        return max(candidates, key=lambda t: t.profit)
 
     def execute(self, market: Market, trade: PaperTrade):
         """
@@ -918,10 +989,11 @@ class PaperEngine:
         self._log_trade(trade)
 
         logging.info(
-            "TRADE #%d | %s | entry=%d | stake=$%.2f | YES@%.3f NO@%.3f | "
+            "TRADE #%d [%s] | %s | entry=%d | stake=$%.2f | YES@%.3f NO@%.3f | "
             "profit=$%.4f (mkt_total=$%.4f) | bankroll=$%.2f | latency=%.0fms",
             self.total_trades,
-            market.slug[:50],
+            trade.arb_type.upper(),
+            market.slug[:45],
             trade.entry_num,
             trade.stake,
             trade.yes_sell_price,

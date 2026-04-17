@@ -56,6 +56,9 @@ cooldown_secs = 5.0
 # 60m market swinging 3-5 times = 3-5 arb entries on the same market
 # Set high to not cap artificially; the cooldown + depth check are the real limits
 max_entries_per_market = 10
+# Merge-buy arb threshold: fire when YES_ask + NO_ask < this value
+# Arb profit = $1.00 - YES_ask - NO_ask - fees. At 0.98 the gross is ~2¢ before fees.
+merge_ask_threshold = 0.98
 
 [logging]
 # JSONL trade log
